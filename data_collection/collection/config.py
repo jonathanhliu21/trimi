@@ -10,6 +10,7 @@ RAW_EEF_FIELDS = ("x", "y", "z", "roll", "pitch", "yaw")
 QUEST_PACKET_FIELDS = ("seq", "px", "py", "pz", "qx", "qy", "qz", "qw")
 DEFAULT_QUEST_HOST = "0.0.0.0"
 DEFAULT_QUEST_PORT = 5005
+DEFAULT_QUEST_JUMP_THRESHOLD = 0.05
 DEFAULT_QUEST_STARTUP_TIMEOUT_S = 5.0
 FOLLOWER_PROFILE_VELOCITY_RAD_S = 3.0
 FOLLOWER_PROFILE_ACCELERATION_RAD_S2 = 50.0
@@ -19,15 +20,19 @@ TASK_CAMERA_FPS = 30
 # One of: "none", "horizontal", "vertical", "both", or "180".
 # "180" is the readable alias for flipping both axes.
 TASK_CAMERA_FLIP = "both"
-# DepthAI brightness compensation, in the device-supported range -10..10.
-TASK_CAMERA_BRIGHTNESS = -1
-# Match the room's AC mains frequency to prevent exposure/flicker banding.
-TASK_CAMERA_ANTI_BANDING_HZ = "60"
+# Fixed exposure, sensitivity and white balance (auto-exposure and auto white
+# balance are off). Measured from the auto values under the lab lighting on
+# 2026-11-01; no frame-to-frame flicker at this exposure.
+TASK_CAMERA_EXPOSURE_US = 5829
+TASK_CAMERA_ISO = 100
+TASK_CAMERA_WHITE_BALANCE_K = 2634
 TASK_VIEW_WINDOW_NAME = "trimorph_task_view"
 VIDEO_CODEC = "mp4v"
 
 
 DEFAULT_DATASET_ROOT = Path("data_trimorph")
+# Each collection run saves to the next free <name>_<n> folder (n = 0, 1, 2, ...).
+DEFAULT_DATASET_NAME = "data_collection_1"
 PIPER_JOINT_FIELDS = tuple(f"joint_{joint}" for joint in range(1, 7))
 
 
@@ -44,6 +49,57 @@ DEFAULT_PIPER_CHANNEL = "can0"
 DEFAULT_PIPER_FIRMWARE = "v183"
 DEFAULT_PIPER_INSTALLATION_POS = "right"
 DEFAULT_PIPER_PAYLOAD = "half"
+# Named Piper start configurations (J1..J6 degrees), each the IK solution of a
+# dataset's median start flange pose. quest_0: data_trimorph_hand_mocap_quest_0,
+# flange about (144, -202, 270) mm. data_trimorph_hand_mocap_quest_4 starts form
+# two groups: home_4a, mostly episodes 0-94, flange (230, -170, 349) mm; home_4b,
+# episodes 95-220, flange (434, -224, 221) mm. home_4c and home_4d are executor
+# starts #1 and #6 of 2026-11-03 (random offsets around home_4b) that worked for
+# the policy: flange (418, -232, 198) mm, Euler xyz (165, 33, 97) deg, and
+# (453, -229, 203) mm, (157, 27, 88) deg. home_cube1: data_trimorph_hand_mocap_quest_5
+# (Vicon poses, one start group), median flange (370, -198, 245) mm, mean Euler xyz
+# (-175, 53, 103) deg; starts spread ~30 mm / ~10 deg around it. home_unscrew1:
+# data_trimorph_unscrew_cap_0 (Vicon poses, one start group), median flange
+# (229, -249, 130) mm, mean Euler xyz (163, -1, 84) deg; starts spread ~20 mm / ~6 deg.
+PIPER_START_JOINTS_DEG = {
+    "quest_0": (-59.0, 73.0, -49.0, 20.0, 39.0, 19.0),
+    "home_4a": (-34.6, 78.6, -72.0, -7.4, 52.9, 57.4),
+    "home_4b": (-24.0, 124.9, -106.4, -24.7, 47.8, 72.2),
+    "home_4c": (-25.59, 123.74, -98.71, -27.68, 41.75, 69.21),
+    "home_4d": (-24.49, 129.76, -111.17, -18.44, 45.25, 71.11),
+    # "home_cube1": (-19.14, 111.94, -85.65, -58.96, 57.24, 89.30),
+    # Captured from passive can0 joint feedback, 2026-11-06 17:06:24 PST.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    "home_cube1": (-26.452, 116.559, -78.024, -45.641, 50.068, 76.868),
+    # Previous home_unscrew1:
+    # "home_unscrew1": (-50.73, 108.65, -58.83, 22.08, 36.01, 28.63),
+    # Previous measured start: flange XYZ m (0.227855, -0.244662, 0.176002),
+    # RPY rad (2.742192, 0.222076, 1.525819); joint radians converted to degrees.
+    # "home_unscrew1": (-49.281017, 99.637991, -56.605022, 17.635011, 28.350983, 26.896988),
+    # Captured from passive can0 joint feedback, 2026-11-05 16:26:01 PST.
+    # J1..J6 degrees; FK flange XYZ m (0.223944, -0.248475, 0.134394),
+    # RPY rad (2.782407, -0.008860, 1.643781).
+    # "home_unscrew1": (-52.634, 107.729, -58.056, 29.162, 37.810, 11.204),
+    # Manually repositioned closer to the cap; supplied J1..J6 radians:
+    # (-0.768416, 1.874920, -1.088108, -0.096604, 0.440364, 0.641827).
+    # Converted to J1..J6 degrees.
+    # "home_unscrew1": (-44.026994, 107.425003, -62.343996, -5.535001, 25.230999, 36.773978),
+    # Captured from passive can0 joint feedback, 2026-11-05 20:14:41 PST.
+    # J1..J6 degrees.
+    # (-56.611, 123.110, -91.104, 17.215, 61.315, 31.695)
+    "home_unscrew1": (-52.563, 115.735, -75.717, 10.739, 48.295, 34.348),
+}
+# Median first processed_encoder_t row (motors 0..12, leader radians) of the same episodes.
+HAND_START_POSITIONS_RAD = {
+    "quest_0": (0.005, -0.027, 0.663, 0.263, 0.013, -1.217, -0.117, 0.016, -0.225, 0.109, 0.018, 0.013, 0.235),
+    "home_4a": (0.009, -0.004, 0.658, 0.368, 0.012, -0.420, 0.103, 0.018, -0.067, 0.025, 0.022, 0.004, 0.094),
+    "home_4b": (-0.004, -0.005, 0.628, 0.374, 0.012, -0.292, 0.050, 0.018, -0.017, -0.037, 0.021, -0.028, 0.030),
+    "home_cube1": (-0.019, -0.005, 0.730, 0.238, 0.013, -0.213, 0.077, 0.018, -0.159, 0.025, 0.018, -0.070, 0.100),
+    "home_unscrew1": (-0.029, -0.137, 0.889, 0.406, 0.015, -1.039, 0.039, 0.013, -0.473, 0.007, -0.152, -0.400, 0.410),
+}
+# home_4c and home_4d were tested with the home_4b hand start.
+HAND_START_POSITIONS_RAD["home_4c"] = HAND_START_POSITIONS_RAD["home_4d"] = HAND_START_POSITIONS_RAD["home_4b"]
+DEFAULT_EXECUTOR_START = "home_4c"
 DEFAULT_TEACHER_MODE_POLL_HZ = 20.0
 DEFAULT_HOLD_DELETE_S = 2.0
 DEFAULT_READY_SECONDS = 0.2
@@ -87,8 +143,9 @@ class HandRuntimeConfig:
     task_camera_height: int = TASK_CAMERA_HEIGHT
     task_camera_fps: int = TASK_CAMERA_FPS
     task_camera_flip: str = TASK_CAMERA_FLIP
-    task_camera_brightness: int = TASK_CAMERA_BRIGHTNESS
-    task_camera_anti_banding_hz: str = TASK_CAMERA_ANTI_BANDING_HZ
+    task_camera_exposure_us: int = TASK_CAMERA_EXPOSURE_US
+    task_camera_iso: int = TASK_CAMERA_ISO
+    task_camera_white_balance_k: int = TASK_CAMERA_WHITE_BALANCE_K
     video_codec: str = VIDEO_CODEC
     active_motors: list[int] = field(
         default_factory=lambda: list(TRIMORPH_MOTOR_IDS)
@@ -152,8 +209,19 @@ class HandOnlyCollectionConfig(HandRuntimeConfig):
     add_camera: bool = False
     use_piper: bool = False
     use_quest: bool = False
+    use_mocap: bool = False
+    mocap_topics: tuple[str, ...] = ()
+    # Live 3D Quest/Vicon view with signal status; the calibration maps both to Piper axes.
+    show_tracking_monitor: bool = False
+    monitor_calibration: Path | None = None
+    mocap_ik_calibration: Path | None = None
+    mocap_ik_topic: str = '/vicon/Yori/Yori'
+    mocap_ik_seed_deg: tuple[float, ...] = (0., 45., -45., 0., 30., 0.)
+    mocap_ik_start: str = DEFAULT_EXECUTOR_START
+    mocap_ik_start_tolerance_deg: float = 5.
     quest_host: str = DEFAULT_QUEST_HOST
     quest_port: int = DEFAULT_QUEST_PORT
+    quest_jump_threshold: float = DEFAULT_QUEST_JUMP_THRESHOLD
     quest_startup_timeout_s: float = DEFAULT_QUEST_STARTUP_TIMEOUT_S
     piper_joint_level: bool = False
     piper_rate_hz: float = DEFAULT_PIPER_RATE_HZ
@@ -162,6 +230,10 @@ class HandOnlyCollectionConfig(HandRuntimeConfig):
     piper_firmware: str = DEFAULT_PIPER_FIRMWARE
     piper_installation_pos: str | None = DEFAULT_PIPER_INSTALLATION_POS
     piper_payload: str | None = DEFAULT_PIPER_PAYLOAD
+    # Commanded joint start pose (deg) and the flange pose measured there (m, rad).
+    piper_start_joints_deg: tuple[float, ...] | None = None
+    piper_start_speed_deg_s: float = 10.0
+    piper_start_pose: tuple[float, ...] | None = None
     teacher_mode_poll_hz: float = DEFAULT_TEACHER_MODE_POLL_HZ
     add_tactile: bool = False
     paxini_port: str | None = None
@@ -227,11 +299,13 @@ def validate_camera_settings(config) -> None:
         raise ValueError(
             "TASK_CAMERA_FLIP must be one of: none, horizontal, vertical, both, 180"
         )
-    if not -10 <= config.task_camera_brightness <= 10:
-        raise ValueError("TASK_CAMERA_BRIGHTNESS must be in range -10..10")
-    if config.task_camera_anti_banding_hz not in {"off", "50", "60", "auto"}:
+    if not 0 < config.task_camera_exposure_us <= 1_000_000 / config.task_camera_fps:
         raise ValueError(
-            "TASK_CAMERA_ANTI_BANDING_HZ must be one of: off, 50, 60, auto"
+            "TASK_CAMERA_EXPOSURE_US must be greater than 0 and fit in one frame"
         )
+    if not 100 <= config.task_camera_iso <= 1600:
+        raise ValueError("TASK_CAMERA_ISO must be in range 100..1600")
+    if not 1000 <= config.task_camera_white_balance_k <= 12000:
+        raise ValueError("TASK_CAMERA_WHITE_BALANCE_K must be in range 1000..12000")
     if len(config.video_codec) != 4:
         raise ValueError("VIDEO_CODEC must be a 4-character fourcc")

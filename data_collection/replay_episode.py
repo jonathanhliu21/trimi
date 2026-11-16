@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import sys
 import threading
@@ -18,6 +19,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from data_collection.collection.config import (
     DEFAULT_HAND_CONFIG,
@@ -37,6 +39,7 @@ from data_collection.collection.depthai_utils import (
     warmup_color_queue,
 )
 from data_collection.collection.episode import raw_root
+from data_collection.collection.mocap_worker import ReplayMocapRecorder
 from data_collection.collection.hand_common import (
     load_follower_config,
     load_hand_config,
@@ -129,12 +132,14 @@ class ReplayVideoRecorder:
             dai = import_depthai()
             require_depthai_device(dai)
             with dai.Pipeline() as pipeline:
-                camera = pipeline.create(dai.node.Camera).build()
+                camera = pipeline.create(dai.node.Camera).build(
+                    sensorFps=self.config.task_camera_fps
+                )
                 apply_camera_control(
-                    dai,
                     camera,
-                    brightness=self.config.task_camera_brightness,
-                    anti_banding_hz=self.config.task_camera_anti_banding_hz,
+                    exposure_us=self.config.task_camera_exposure_us,
+                    iso=self.config.task_camera_iso,
+                    white_balance_k=self.config.task_camera_white_balance_k,
                 )
                 camera_output = camera.requestOutput(
                     (
@@ -142,6 +147,7 @@ class ReplayVideoRecorder:
                         self.config.task_camera_height,
                     ),
                     dai.ImgFrame.Type.NV12,
+                    fps=self.config.task_camera_fps,
                 )
                 queue = camera_output.createOutputQueue()
                 pipeline.start()
@@ -288,12 +294,21 @@ def output_current_csv(recorder: ReplayCurrentRecorder, output: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay one raw PiperX/TRIMORPH episode (latest by default)."
+        description="Replay a TRIMORPH episode with processed Piper poses (latest by default)."
     )
     parser.add_argument(
         "episode",
         nargs="?",
         help="Episode directory, numeric index, or episode_XXXXXX name.",
+    )
+    parser.add_argument(
+        "--loop",
+        nargs="?",
+        const=None,
+        default=1,
+        type=int,
+        metavar="N",
+        help="Replay N times total, or indefinitely when N is omitted (Ctrl-C stops).",
     )
     parser.add_argument("--dataset-root", default=str(DATASET_ROOT))
     parser.add_argument("--hand-config", "--leader-config", dest="hand_config")
@@ -329,9 +344,13 @@ def parse_args() -> argparse.Namespace:
         help="Piper replay rate in Hz, independent of the hand (default: %(default)s).",
     )
     parser.add_argument(
+        "--read-piper-raw", action="store_true",
+        help="Read raw/episode_XXXXXX/piper.csv instead of the postprocessed Piper CSV.",
+    )
+    parser.add_argument(
         "--joint-level",
         action="store_true",
-        help="Replay recorded Piper joints with smooth move_j; requires joint_1..joint_6 in piper.csv.",
+        help="Replay recorded Piper joints with smooth move_j; requires --read-piper-raw and joint_1..joint_6 in raw piper.csv.",
     )
     parser.add_argument(
         "--max-joint-step-rad",
@@ -354,8 +373,18 @@ def parse_args() -> argparse.Namespace:
         default=PIPER_REPLAY_SPEED_PERCENT,
         help="Piper speed during replay (default: %(default)s%%).",
     )
+    parser.add_argument(
+        "--playback-speed", "--replay-speed",
+        dest="playback_speed",
+        type=float,
+        default=1.0,
+        help="Replay time scale for hand and arm together (speed > 0): 1 = recorded speed, 0.5 = half speed, 2 = double speed.",
+    )
     parser.add_argument("--hand-only", action="store_true")
     parser.add_argument("--arm-only", action="store_true")
+    parser.add_argument("--use-mocap", action="store_true", help="Record live ROS 2 Vicon data during replay.")
+    parser.add_argument("--mocap-output", type=Path, help="Destination CSV; required with --use-mocap.")
+    parser.add_argument("--mocap-topic", dest="mocap_topics", action="append", default=[], help="Select a Vicon topic (repeatable); default: discover all supported topics.")
     parser.add_argument(
         "--output-current",
         type=Path,
@@ -393,7 +422,10 @@ def parse_args() -> argparse.Namespace:
         default=PIPER_DIAG_INTERVAL_S,
         help="Seconds between --arm-diag samples (default: %(default)s).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.loop is not None and args.loop < 1:
+        parser.error("--loop must be a positive integer")
+    return args
 
 
 def resolve_episode(dataset_root: Path, episode: str | None) -> Path:
@@ -579,6 +611,41 @@ def load_piper_stream(
     )
 
 
+def resolve_piper_source(episode_dir: Path, *, read_piper_raw=False) -> tuple[Path, str]:
+    """Keep the original raw logger untouched; processed CSVs declare their frame."""
+    if read_piper_raw:
+        return episode_dir / "piper.csv", "piper_base"
+    from data_collection.postprocess_dataset import processed_episode_dir
+
+    processed = processed_episode_dir(episode_dir)
+    path = processed / "piper.csv"
+    metadata_path = processed / "metadata.json"
+    if not path.exists() or not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Processed Piper poses missing under {processed}. Run data_collection/postprocess_dataset.py "
+            "first, or use --read-piper-raw for the original raw CSV."
+        )
+    metadata = json.loads(metadata_path.read_text())
+    frame = metadata.get("pose_frame")
+    if frame not in ("piper_base", "relative_to_episode_start"):
+        raise ValueError(f"Unknown pose_frame {frame!r} in {metadata_path}")
+    return path, frame
+
+
+def anchor_relative_piper_stream(stream, start_pose):
+    """Anchor mapped spatial deltas at a measured Piper XYZ/RPY pose."""
+    times, values = stream
+    start = np.asarray(start_pose, dtype=float)
+    if start.shape != (6,) or not np.isfinite(start).all():
+        raise ValueError("Relative replay requires a finite measured Piper XYZ/RPY starting pose")
+    rotations = Rotation.from_euler("xyz", values[:, 3:])
+    spatial_delta = rotations * rotations[0].inv()
+    target_rotations = spatial_delta * Rotation.from_euler("xyz", start[3:])
+    result = np.column_stack((start[:3] + values[:, :3] - values[0, :3],
+                              np.unwrap(target_rotations.as_euler("xyz"), axis=0)))
+    return times, result
+
+
 def sample_stream(times: np.ndarray, values: np.ndarray, query_t: float) -> np.ndarray:
     return np.asarray(
         [np.interp(query_t, times, values[:, column]) for column in range(values.shape[1])],
@@ -599,6 +666,7 @@ def replay_piper_commands(
 
     period_s = 1.0 / args.piper_rate_hz
     duration_s = end_s - start_s
+    playback_speed = getattr(args, "playback_speed", 1.0)
     tick = 0
     next_arm_diag_s = 0.0
     if args.joint_level:
@@ -609,7 +677,7 @@ def replay_piper_commands(
         wait_s = deadline - time.monotonic()
         if wait_s > 0 and stop_event.wait(wait_s):
             return
-        elapsed_s = min(max(time.monotonic() - wall_start, 0.0), duration_s)
+        elapsed_s = min(max(time.monotonic() - wall_start, 0.0) * playback_speed, duration_s)
         piper_target = sample_stream(*piper_stream, start_s + elapsed_s)
         if args.joint_level:
             command_bounded_joint_step(api, piper_target, args.max_joint_step_rad)
@@ -762,6 +830,10 @@ def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, arg
 
 def main() -> int:
     args = parse_args()
+    if args.use_mocap and args.mocap_output is None:
+        raise ValueError("--use-mocap requires --mocap-output")
+    if not args.use_mocap and (args.mocap_output is not None or args.mocap_topics):
+        raise ValueError("--mocap-output and --mocap-topic require --use-mocap")
     if not math.isfinite(args.rate_hz) or args.rate_hz <= 0:
         raise ValueError("--rate-hz must be finite and greater than 0")
     if not math.isfinite(args.piper_rate_hz) or args.piper_rate_hz <= 0:
@@ -775,10 +847,15 @@ def main() -> int:
     for name in ("preposition_speed_percent", "replay_speed_percent"):
         if not 0 <= getattr(args, name) <= 100:
             raise ValueError(f"--{name.replace('_', '-')} must be between 0 and 100")
+    if not math.isfinite(args.playback_speed) or args.playback_speed <= 0:
+        raise ValueError("--playback-speed / --replay-speed must be finite and greater than 0")
     if args.hand_only and args.arm_only:
         raise ValueError("--hand-only and --arm-only are mutually exclusive")
     if args.output_current is not None and args.arm_only:
         raise ValueError("--output-current cannot be used with --arm-only")
+
+    if args.joint_level and not args.read_piper_raw:
+        raise ValueError("--joint-level requires --read-piper-raw; processed poses contain EEF coordinates")
 
     replay_hand = not args.arm_only
     replay_arm = not args.hand_only
@@ -786,9 +863,11 @@ def main() -> int:
     hand_path = resolve_leader_hand_path(episode_dir)
     active_motors = hand_motor_ids(hand_path) if replay_hand else None
     hand_stream = load_hand_stream(hand_path) if replay_hand else None
+    piper_path, piper_frame = (resolve_piper_source(episode_dir, read_piper_raw=args.read_piper_raw)
+                               if replay_arm else (None, None))
     piper_stream = (
         load_piper_stream(
-            episode_dir / "piper.csv",
+            piper_path,
             allow_empty=args.no_piper_enable,
             joint_level=args.joint_level,
         )
@@ -797,7 +876,7 @@ def main() -> int:
     )
     if replay_arm and piper_stream is None:
         replay_arm = False
-        print("piper.csv is empty; replaying hand only.")
+        print(f"{piper_path} is empty; replaying hand only.")
     if args.joint_level and piper_stream is not None:
         from scripts.piper_api.replay_trajectory import validate_joint_continuity
 
@@ -844,6 +923,7 @@ def main() -> int:
     arm_thread: threading.Thread | None = None
     arm_errors: list[Exception] = []
     video_recorder: ReplayVideoRecorder | None = None
+    mocap_recorder: ReplayMocapRecorder | None = None
     try:
         if replay_hand:
             from midas_hand_api import MidasHand
@@ -903,114 +983,160 @@ def main() -> int:
                 if args.arm_diag:
                     log_piper_diagnostics(api, "after-position-mode")
 
-        move_to_first_pose(hand, api, hand_stream, piper_stream, start_s, args)
-        if args.joint_level and api is not None and piper_stream is not None:
-            from scripts.piper_api.replay_trajectory import verify_joint_start
+        if api is not None and piper_frame == "relative_to_episode_start" and piper_stream is not None:
+            measured_start = api.get_eef_pose()
+            piper_stream = anchor_relative_piper_stream(piper_stream, measured_start)
+            print(f"Anchored processed relative motion at measured Piper pose: {measured_start}")
+        iteration = 1
 
-            verify_joint_start(api, sample_stream(*piper_stream, start_s))
-        if args.arm_diag and api is not None and piper_stream is not None:
-            log_piper_diagnostics(
-                api,
-                "after-preposition",
-                None if args.joint_level else sample_stream(*piper_stream, start_s),
+        def loop_output(path: Path) -> Path:
+            if args.loop == 1:
+                return path
+            return path.with_name(f"{path.stem}_loop_{iteration:04d}{path.suffix}")
+
+        while args.loop is None or iteration <= args.loop:
+            if args.loop != 1:
+                total = "indefinite" if args.loop is None else str(args.loop)
+                print(f"Replay iteration {iteration} ({total} total); Ctrl-C stops.")
+            if args.output_current is not None:
+                current_recorder = ReplayCurrentRecorder(tuple(hand.motor_ids))
+            move_to_first_pose(hand, api, hand_stream, piper_stream, start_s, args)
+            if args.joint_level and api is not None and piper_stream is not None:
+                from scripts.piper_api.replay_trajectory import verify_joint_start
+
+                verify_joint_start(api, sample_stream(*piper_stream, start_s))
+            if args.arm_diag and api is not None and piper_stream is not None:
+                log_piper_diagnostics(
+                    api,
+                    "after-preposition",
+                    None if args.joint_level else sample_stream(*piper_stream, start_s),
+                )
+            if api is not None:
+                api.set_speed_percent(args.replay_speed_percent)
+
+            if args.output_video is not None:
+                video_recorder = ReplayVideoRecorder(loop_output(args.output_video), config)
+                video_recorder.prepare()
+
+            if args.use_mocap:
+                mocap_recorder = ReplayMocapRecorder(loop_output(args.mocap_output), args.mocap_topics)
+                mocap_recorder.prepare()
+
+            hand_period_s = 1.0 / args.rate_hz
+            current_sample_period_s = 1.0 / CURRENT_TELEMETRY_HZ
+            next_current_sample_s = 0.0
+            wall_start = time.monotonic()
+            wall_duration_s = (end_s - start_s) / args.playback_speed
+            if mocap_recorder is not None:
+                mocap_recorder.start(wall_start, wall_duration_s)
+            if video_recorder is not None:
+                video_recorder.start(wall_start, wall_duration_s)
+            print(
+                f"Replaying {episode_dir} from {start_s:.3f}s to {end_s:.3f}s "
+                f"(hand {args.rate_hz:.1f} Hz, Piper {args.piper_rate_hz:.1f} Hz"
+                + (f", {args.playback_speed:g}x speed over {wall_duration_s:.1f}s" if args.playback_speed != 1 else "")
+                + ")."
             )
-        if api is not None:
-            api.set_speed_percent(args.replay_speed_percent)
+            if api is not None and piper_stream is not None:
+                def run_arm() -> None:
+                    try:
+                        replay_piper_commands(
+                            api, piper_stream, start_s, end_s, wall_start, args, arm_stop
+                        )
+                    except Exception as exc:
+                        arm_errors.append(exc)
+                        arm_stop.set()
 
-        if args.output_video is not None:
-            video_recorder = ReplayVideoRecorder(args.output_video, config)
-            video_recorder.prepare()
+                arm_thread = threading.Thread(target=run_arm, name="piper-replay")
+                arm_thread.start()
 
-        hand_period_s = 1.0 / args.rate_hz
-        current_sample_period_s = 1.0 / CURRENT_TELEMETRY_HZ
-        next_current_sample_s = 0.0
-        wall_start = time.monotonic()
-        if video_recorder is not None:
-            video_recorder.start(wall_start, end_s - start_s)
-        print(
-            f"Replaying {episode_dir} from {start_s:.3f}s to {end_s:.3f}s "
-            f"(hand {args.rate_hz:.1f} Hz, Piper {args.piper_rate_hz:.1f} Hz)."
-        )
-        if api is not None and piper_stream is not None:
-            def run_arm() -> None:
-                try:
-                    replay_piper_commands(
-                        api, piper_stream, start_s, end_s, wall_start, args, arm_stop
+            if hand is not None and hand_stream is not None:
+                tick = 0
+                duration_s = end_s - start_s
+                while True:
+                    if mocap_recorder is not None:
+                        mocap_recorder.raise_if_failed()
+                    if video_recorder is not None:
+                        video_recorder.raise_if_failed()
+                    if arm_errors:
+                        raise arm_errors[0]
+                    deadline = wall_start + tick * hand_period_s
+                    sleep_s = deadline - time.monotonic()
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    if arm_errors:
+                        raise arm_errors[0]
+                    replay_elapsed_s = min(
+                        max(time.monotonic() - wall_start, 0.0) * args.playback_speed, duration_s
                     )
-                except Exception as exc:
-                    arm_errors.append(exc)
-                    arm_stop.set()
-
-            arm_thread = threading.Thread(target=run_arm, name="piper-replay")
-            arm_thread.start()
-
-        if hand is not None and hand_stream is not None:
-            tick = 0
-            duration_s = end_s - start_s
-            while True:
-                if video_recorder is not None:
-                    video_recorder.raise_if_failed()
+                    episode_t = start_s + replay_elapsed_s
+                    hand_target = hand.clip_positions(
+                        sample_stream(*hand_stream, episode_t)
+                    )
+                    hand.set_positions(hand_target, clip=True)
+                    sample_current, next_current_sample_s = (
+                        advance_current_sample_schedule(
+                            replay_elapsed_s,
+                            next_current_sample_s,
+                            current_sample_period_s,
+                        )
+                    )
+                    if current_recorder is not None and sample_current:
+                        current_recorder.sample(
+                            hand,
+                            hand_target,
+                            elapsed_s=replay_elapsed_s,
+                        )
+                    if replay_elapsed_s >= duration_s:
+                        break
+                    tick = max(
+                        tick + 1,
+                        math.floor((time.monotonic() - wall_start) / hand_period_s) + 1,
+                    )
+            if arm_thread is not None:
+                while arm_thread.is_alive():
+                    arm_thread.join(timeout=0.05)
+                    if mocap_recorder is not None:
+                        mocap_recorder.raise_if_failed()
+                    if video_recorder is not None:
+                        video_recorder.raise_if_failed()
                 if arm_errors:
                     raise arm_errors[0]
-                deadline = wall_start + tick * hand_period_s
-                sleep_s = deadline - time.monotonic()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-                if arm_errors:
-                    raise arm_errors[0]
-                replay_elapsed_s = min(max(time.monotonic() - wall_start, 0.0), duration_s)
-                episode_t = start_s + replay_elapsed_s
-                hand_target = hand.clip_positions(
-                    sample_stream(*hand_stream, episode_t)
-                )
-                hand.set_positions(hand_target, clip=True)
-                sample_current, next_current_sample_s = (
-                    advance_current_sample_schedule(
-                        replay_elapsed_s,
-                        next_current_sample_s,
-                        current_sample_period_s,
-                    )
-                )
-                if current_recorder is not None and sample_current:
-                    current_recorder.sample(
-                        hand,
-                        hand_target,
-                        elapsed_s=replay_elapsed_s,
-                    )
-                if replay_elapsed_s >= duration_s:
-                    break
-                tick = max(
-                    tick + 1,
-                    math.floor((time.monotonic() - wall_start) / hand_period_s) + 1,
-                )
-        if arm_thread is not None:
-            while arm_thread.is_alive():
-                arm_thread.join(timeout=0.05)
-                if video_recorder is not None:
-                    video_recorder.raise_if_failed()
-            if arm_errors:
-                raise arm_errors[0]
-        if video_recorder is not None:
-            video_recorder.finish()
-        if current_recorder is not None:
-            output_current_csv(current_recorder, args.output_current)
-        print("Replay complete.")
+            if video_recorder is not None:
+                video_recorder.finish()
+            if current_recorder is not None:
+                output_current_csv(current_recorder, loop_output(args.output_current))
+                current_recorder = None
+            if mocap_recorder is not None:
+                mocap_recorder.raise_if_failed()
+            if mocap_recorder is not None:
+                mocap_recorder.stop()
+                mocap_recorder = None
+            if video_recorder is not None:
+                video_recorder.stop()
+                video_recorder = None
+            print("Replay complete.")
+            iteration += 1
         return 0
     except KeyboardInterrupt:
         if current_recorder is not None and current_recorder.rows:
-            output_current_csv(current_recorder, args.output_current)
+            output_current_csv(current_recorder, loop_output(args.output_current))
         print("\nReplay interrupted.")
         return 130
     finally:
         arm_stop.set()
-        if video_recorder is not None:
-            video_recorder.stop()
-        if arm_thread is not None:
-            arm_thread.join()
-        if api is not None:
-            api.disconnect()
-        if hand is not None:
-            hand.shutdown()
+        try:
+            if mocap_recorder is not None:
+                mocap_recorder.stop()
+        finally:
+            if video_recorder is not None:
+                video_recorder.stop()
+            if arm_thread is not None:
+                arm_thread.join()
+            if api is not None:
+                api.disconnect()
+            if hand is not None:
+                hand.shutdown()
 
 
 if __name__ == "__main__":

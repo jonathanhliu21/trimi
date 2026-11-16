@@ -5,7 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from data_collection.collection.quest_worker import _decode_packet, run_quest_worker
+from data_collection.collection.quest_worker import QUEST_TRACKER_NAME, _decode_packet, run_quest_worker
+from data_collection.collection.shared_state import SharedState
 
 
 VALID_PACKET = {
@@ -29,8 +30,8 @@ class QuestWorkerTests(unittest.TestCase):
         )
 
     def test_valid_packet_is_recorded_without_pose_transforms(self):
-        shutdown = threading.Event()
-        shared = SimpleNamespace(shutdown=shutdown)
+        shared = SharedState()
+        shutdown = shared.shutdown
         rows = []
         session = SimpleNamespace(
             elapsed_s=lambda sample_ns: sample_ns / 1e9,
@@ -64,6 +65,10 @@ class QuestWorkerTests(unittest.TestCase):
         self.assertEqual(rows[0]["elapsed_s"], "2.000000000")
         for field, value in VALID_PACKET.items():
             self.assertEqual(rows[0][field], value)
+        live = shared.latest_tracker_poses()[QUEST_TRACKER_NAME]
+        self.assertEqual(live.position, (0.1, -0.2, 1.25))
+        self.assertEqual(live.quaternion, (0.0, 0.5, -0.5, 0.707))
+        self.assertEqual((live.monotonic_ns, live.lost, live.count), (2_000_000_000, False, 1))
 
     def test_startup_fails_when_no_packet_arrives_before_timeout(self):
         fake_socket = MagicMock()
@@ -75,7 +80,7 @@ class QuestWorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(TimeoutError, "No valid Quest UDP data"):
                 run_quest_worker(
                     self.make_config(timeout_s=0.05),
-                    SimpleNamespace(shutdown=threading.Event()),
+                    SimpleNamespace(set_tracker_pose=lambda *a, **k: None, shutdown=threading.Event()),
                     SimpleNamespace(current=lambda: None),
                     init_done=threading.Event(),
                 )
@@ -99,13 +104,73 @@ class QuestWorkerTests(unittest.TestCase):
             init_done = threading.Event()
             run_quest_worker(
                 self.make_config(),
-                SimpleNamespace(shutdown=shutdown),
+                SimpleNamespace(set_tracker_pose=lambda *a, **k: None, shutdown=shutdown),
                 SimpleNamespace(current=lambda: None),
                 init_done=init_done,
             )
 
         self.assertTrue(init_done.is_set())
         self.assertEqual(calls, 2)
+
+    def test_indefinite_startup_accepts_late_packet_or_clean_shutdown(self):
+        for receive_packet in (True, False):
+            with self.subTest(receive_packet=receive_packet):
+                shared = SharedState()
+                ready = threading.Event()
+                sock = MagicMock()
+                calls = 0
+
+                def receive(_size):
+                    nonlocal calls
+                    calls += 1
+                    if calls < 40:  # More than five seconds of 0.2s polls.
+                        raise socket.timeout
+                    shared.shutdown.set()
+                    if receive_packet:
+                        return json.dumps(VALID_PACKET).encode(), ("127.0.0.1", 1)
+                    raise socket.timeout
+
+                sock.recvfrom.side_effect = receive
+                with patch("data_collection.collection.quest_worker.socket.socket") as factory:
+                    factory.return_value.__enter__.return_value = sock
+                    run_quest_worker(self.make_config(timeout_s=None), shared,
+                                     SimpleNamespace(current=lambda: None), init_done=ready)
+                self.assertEqual(calls, 40)
+                self.assertEqual(ready.is_set(), receive_packet)
+                sock.settimeout.assert_called_with(.2)
+
+    def test_jump_warnings_include_idle_packets_and_preserve_recorded_positions(self):
+        shutdown = threading.Event()
+        config = self.make_config()
+        config.quest_jump_threshold = .05
+        rows = []
+        session = SimpleNamespace(elapsed_s=lambda ns: ns / 1e9, append_quest=rows.append)
+        recorder = SimpleNamespace(current=MagicMock(side_effect=[None, session, session, session]))
+        packets = [dict(VALID_PACKET, seq=i, px=x) for i, x in enumerate((0., .02, .2, 0.))]
+        received = iter(packets)
+        fake_socket = MagicMock()
+
+        def receive(_size):
+            packet = next(received)
+            if packet['seq'] == 3:
+                shutdown.set()
+            return json.dumps(packet).encode(), ('127.0.0.1', 1234)
+
+        fake_socket.recvfrom.side_effect = receive
+        with (patch('data_collection.collection.quest_worker.socket.socket') as socket_type,
+              patch('data_collection.collection.quest_worker.time.monotonic_ns',
+                    side_effect=[1_000_000_000, 1_020_000_000, 1_040_000_000, 1_060_000_000]),
+              patch('builtins.print') as log):
+            socket_type.return_value.__enter__.return_value = fake_socket
+            run_quest_worker(config, SimpleNamespace(set_tracker_pose=lambda *a, **k: None, shutdown=shutdown), recorder, init_done=threading.Event())
+        warnings = [call for call in log.call_args_list if 'POSITION JUMP' in str(call)]
+        self.assertEqual(len(warnings), 2)
+        self.assertIn('POSITION JUMP #1', warnings[0].args[0])
+        self.assertIn('step=0.1800', warnings[0].args[0])
+        self.assertIn('dt=0.0200s', warnings[0].args[0])
+        self.assertIn('seq=2', warnings[0].args[0])
+        self.assertTrue(warnings[0].kwargs['flush'])
+        self.assertEqual([row['px'] for row in rows], [.02, .2, 0.])
 
     def test_malformed_and_incomplete_packets_fail(self):
         with self.assertRaisesRegex(ValueError, "Invalid Quest UDP JSON"):

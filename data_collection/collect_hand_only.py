@@ -1,11 +1,12 @@
 import argparse
+import math
 import queue
 import shutil
 import sys
 import threading
 import time
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # Support both direct execution and package imports.
@@ -27,11 +28,14 @@ from data_collection.collection.config import (
     DEFAULT_TEACHER_MODE_POLL_HZ,
     DEFAULT_HAND_CONFIG,
     DEFAULT_HAND_PORT,
+    DEFAULT_QUEST_JUMP_THRESHOLD,
+    DEFAULT_EXECUTOR_START,
+    PIPER_START_JOINTS_DEG,
     DATA_COLLECTION_MODE,
     RETARGET_ONLY_MODE,
     DEFAULT_THUMB_MODEL,
     HandOnlyCollectionConfig,
-    DEFAULT_DATASET_ROOT,
+    DEFAULT_DATASET_NAME,
     TASK_VIEW_WINDOW_NAME,
     TRIMORPH_MOTOR_IDS,
     validate_camera_settings,
@@ -41,6 +45,7 @@ from data_collection.collection.episode import (
     EpisodeBuffer,
     RecordingManager,
     episode_paths,
+    next_dataset_root,
     next_episode_index,
     raw_root,
 )
@@ -48,6 +53,7 @@ from data_collection.collection.follower_hand_worker import run_follower_hand_wo
 from data_collection.collection.leader_hand_worker import run_leader_hand_worker
 from data_collection.collection.piper_worker import run_piper_worker
 from data_collection.collection.quest_worker import run_quest_worker
+from data_collection.collection.mocap_worker import run_mocap_worker
 from data_collection.collection.shared_state import SharedState
 from data_collection.collection.tactile_worker import run_tactile_worker
 from data_collection.collection.utils import WorkerError, import_cv2, worker_wrapper
@@ -80,7 +86,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.set_defaults(mode=DATA_COLLECTION_MODE)
-    parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
+    dataset_group = parser.add_mutually_exclusive_group()
+    dataset_group.add_argument(
+        "--dataset-name",
+        type=Path,
+        default=Path(DEFAULT_DATASET_NAME),
+        help=(
+            "Save this run to the next free NAME_n folder (n = 0, 1, 2, ...); NAME "
+            "may include parent directories (default: %(default)s)."
+        ),
+    )
+    dataset_group.add_argument(
+        "--dataset-root",
+        type=Path,
+        help="Save to exactly this folder, adding episodes after any already there.",
+    )
     parser.add_argument("--hand-config", type=Path, default=DEFAULT_HAND_CONFIG)
     parser.add_argument(
         "--hand-port", default=DEFAULT_HAND_PORT
@@ -92,27 +112,80 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show the read-only follower MIDAS live-contact visualization.",
     )
+    # The leader hand, camera, Quest and mocap are recorded by default; disable
+    # them with --no-camera, --no-quest and --no-mocap.
     parser.add_argument(
         "--add-camera",
-        action="store_true",
-        help="record the DepthAI wrist camera and show its live feed",
+        "--camera",
+        dest="add_camera",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="record the DepthAI wrist camera and show its live feed (default: on)",
     )
-    pose_source_group = parser.add_mutually_exclusive_group()
-    pose_source_group.add_argument(
+    parser.add_argument(
+        "--use-mocap",
+        "--mocap",
+        dest="use_mocap",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "record ROS 2 Vicon poses/markers to each episode's mocap.csv "
+            "(default: on, off with --retarget-only)"
+        ),
+    )
+    parser.add_argument("--mocap-topic", dest="mocap_topics", action="append", default=[], help="Select a Vicon topic (repeatable); default: discover all supported topics. Requires mocap.")
+    parser.add_argument(
         "--use-piper",
         action="store_true",
         help=(
-            "passively record Piper EEF and drag-teach state alongside the hand; "
-            "the collector never commands or enables the arm"
+            "passively record Piper EEF and drag-teach state alongside the hand "
+            "instead of the Quest; the collector never commands or enables the arm"
         ),
     )
-    pose_source_group.add_argument(
+    parser.add_argument(
         "--use-quest",
-        action="store_true",
+        "--quest",
+        dest="use_quest",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "record raw Quest position and quaternion packets received over UDP "
-            "alongside the hand"
+            "alongside the hand (default: on, off with --use-piper or --retarget-only)"
         ),
+    )
+    parser.add_argument(
+        "--monitor",
+        dest="show_tracking_monitor",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "show a live 3D view of the Quest and Vicon poses with green/red signal "
+            "status boxes (default: on when Quest or mocap is recorded)"
+        ),
+    )
+    parser.add_argument(
+        "--monitor-calibration",
+        type=Path,
+        help=(
+            "calibration JSON whose linear_matrix / vicon_reference map the monitor's "
+            "Quest / Vicon motion to Piper axes (default: each tracker's own axes)"
+        ),
+    )
+    parser.add_argument('--mocap-ik-calibration', type=Path,
+                        help='Open a live Piper IK warning window using this Vicon-reference calibration; requires mocap')
+    parser.add_argument('--mocap-ik-topic', default='/vicon/Yori/Yori',
+                        help='Marker plate topic to check for IK (default: /vicon/Yori/Yori)')
+    parser.add_argument('--mocap-ik-seed-deg', type=float, nargs=6,
+                        default=(0., 45., -45., 0., 30., 0.),
+                        help='Initial offline IK branch seed in degrees; no arm connection')
+    parser.add_argument('--mocap-ik-start', choices=sorted(PIPER_START_JOINTS_DEG), default=DEFAULT_EXECUTOR_START,
+                        help='Executor start pose marked on each IK joint plot; the window turns blue '
+                             'when every joint is within --mocap-ik-start-tolerance-deg (default: %(default)s)')
+    parser.add_argument('--mocap-ik-start-tolerance-deg', type=float, default=5.,
+                        help='Per-joint tolerance for the start marker (default: %(default)s)')
+    parser.add_argument(
+        "--quest-jump-threshold", type=float, default=DEFAULT_QUEST_JUMP_THRESHOLD,
+        help="Warn when consecutive Quest packets move farther than this distance in native position units (default: 0.05).",
     )
     parser.add_argument(
         "--piper-joint-level", "--joint-level", "--joint-position",
@@ -148,6 +221,29 @@ def parse_args() -> argparse.Namespace:
         "--piper-payload",
         choices=("unchanged", "empty", "half", "full"),
         default=DEFAULT_PIPER_PAYLOAD,
+    )
+    start_group = parser.add_mutually_exclusive_group()
+    start_group.add_argument(
+        "--piper-start-joints-deg",
+        type=float,
+        nargs=6,
+        metavar="DEG",
+        help=(
+            "Before collecting, enable Piper and move it in joint space to these "
+            "angles, leaving it holding there; its measured flange pose is saved "
+            "in every episode's metadata as the postprocessing start pose."
+        ),
+    )
+    start_group.add_argument(
+        "--piper-start-home",
+        action="store_true",
+        help="Like --piper-start-joints-deg, using the teleop home (config/teleop_home.json).",
+    )
+    parser.add_argument(
+        "--piper-start-speed-deg-s",
+        type=float,
+        default=10.0,
+        help="Joint speed of the move to the start pose (default: %(default)s).",
     )
     parser.add_argument(
         "--add-tactile",
@@ -231,6 +327,31 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    # Quest and mocap only record, so retarget-only mode leaves them off unless asked.
+    recording = args.mode == DATA_COLLECTION_MODE
+    if args.use_quest and args.use_piper:
+        parser.error("--use-piper and --use-quest are mutually exclusive pose sources")
+    if args.use_quest is None:
+        args.use_quest = recording and not args.use_piper
+    if args.use_mocap is None:
+        args.use_mocap = recording
+    if args.mocap_topics and not args.use_mocap:
+        parser.error("--mocap-topic requires mocap (remove --no-mocap)")
+    if args.mocap_ik_calibration is not None:
+        if not args.use_mocap:
+            parser.error('--mocap-ik-calibration requires mocap (remove --no-mocap)')
+        if args.mocap_topics and args.mocap_ik_topic not in args.mocap_topics:
+            parser.error('--mocap-ik-topic must be included in the selected --mocap-topic values')
+        if not all(math.isfinite(value) for value in args.mocap_ik_seed_deg):
+            parser.error('--mocap-ik-seed-deg requires six finite values')
+        if not math.isfinite(args.mocap_ik_start_tolerance_deg) or args.mocap_ik_start_tolerance_deg <= 0:
+            parser.error('--mocap-ik-start-tolerance-deg must be finite and positive')
+    if args.show_tracking_monitor is None:
+        args.show_tracking_monitor = args.use_quest or args.use_mocap
+    elif args.show_tracking_monitor and not (args.use_quest or args.use_mocap):
+        parser.error("--monitor requires Quest or mocap")
+    if args.monitor_calibration is not None and not args.show_tracking_monitor:
+        parser.error("--monitor-calibration requires the tracking monitor")
     if args.episode_time is not None:
         args.use_foot_pedal = False
     return args
@@ -244,6 +365,8 @@ def worker_specs(config: HandOnlyCollectionConfig):
         specs.append(("piper", run_piper_worker))
     if config.use_quest:
         specs.append(("quest", run_quest_worker))
+    if config.use_mocap:
+        specs.append(("mocap", run_mocap_worker))
     specs.append(("leader_hand", run_leader_hand_worker))
     if config.follower_hand_config is not None:
         specs.append(("follower", run_follower_hand_worker))
@@ -334,7 +457,8 @@ def stop_episode(recorder: RecordingManager, reason: str) -> EpisodeBuffer | Non
         f"{len(session.follower_rows)} follower samples, "
         f"{len(session.camera_rows)} camera frames, "
         f"{len(session.piper_rows)} Piper samples, "
-        f"{len(session.quest_rows)} Quest samples"
+        f"{len(session.quest_rows)} Quest samples, "
+        f"{len(session.mocap_rows)} mocap rows"
     )
     return session
 
@@ -405,8 +529,13 @@ def run_follower_contact_ui(
     show_camera: bool = False,
     camera_window_name: str = TASK_VIEW_WINDOW_NAME,
     on_tick=None,
+    poll_windows: bool = False,
 ) -> str:
-    """Run the read-only follower contact view until close or shutdown."""
+    """Run the read-only follower contact view until close or shutdown.
+
+    poll_windows services OpenCV windows (such as the tracking monitor) even
+    without the camera view.
+    """
 
     import tkinter as tk
 
@@ -417,7 +546,7 @@ def run_follower_contact_ui(
     root.minsize(1000, 500)
     widget = LiveContactWidget(root)
     widget.pack(fill="both", expand=True, padx=12, pady=12)
-    cv2 = import_cv2() if show_camera else None
+    cv2 = import_cv2() if show_camera or poll_windows else None
     deadline = None if duration_s is None else time.monotonic() + duration_s
     exit_reason = "ui_closed"
 
@@ -442,7 +571,7 @@ def run_follower_contact_ui(
         elif tactile_contacts is not None:
             widget.show(tactile_contacts=tactile_contacts)
         if cv2 is not None:
-            frame = shared.latest_task_frame()
+            frame = shared.latest_task_frame() if show_camera else None
             if frame is not None:
                 cv2.imshow(camera_window_name, frame)
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
@@ -465,7 +594,7 @@ def run_follower_contact_ui(
         root.mainloop()
     finally:
         shared.shutdown.set()
-        if cv2 is not None:
+        if show_camera:
             try:
                 cv2.destroyWindow(camera_window_name)
             except Exception:
@@ -479,8 +608,13 @@ def run_camera_view(
     duration_s: float | None,
     window_name: str,
     on_tick=None,
+    show_camera: bool = True,
 ) -> str:
-    """Show camera frames until the duration expires, shutdown, or q/Escape."""
+    """Show camera frames until the duration expires, shutdown, or q/Escape.
+
+    With show_camera=False it only services other OpenCV windows (such as the
+    tracking monitor drawn by on_tick) and their q/Escape keys.
+    """
 
     cv2 = import_cv2()
     deadline = None if duration_s is None else time.monotonic() + duration_s
@@ -489,7 +623,7 @@ def run_camera_view(
         while not shared.shutdown.is_set():
             if on_tick is not None:
                 on_tick()
-            frame = shared.latest_task_frame()
+            frame = shared.latest_task_frame() if show_camera else None
             if frame is not None:
                 cv2.imshow(window_name, frame)
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
@@ -500,21 +634,81 @@ def run_camera_view(
                 break
             time.sleep(0.005)
     finally:
-        try:
-            cv2.destroyWindow(window_name)
-        except Exception:
-            pass
+        if show_camera:
+            try:
+                cv2.destroyWindow(window_name)
+            except Exception:
+                pass
     return reason
 
 
+def move_piper_to_start(config: HandOnlyCollectionConfig) -> tuple[float, ...]:
+    """Enable Piper, ramp it in joint space to the start joints and leave it holding.
+
+    Returns the measured flange pose [x, y, z, roll, pitch, yaw] (m, rad).
+    """
+
+    import numpy as np
+
+    from scripts.piper_api.piper_api import PiperAPI
+    from scripts.teleop.quest_teleop import POSITION_MODE_SETTLE_S, go_home, home_warnings
+
+    for warning in home_warnings(config.piper_start_joints_deg):
+        print(f"WARNING: start pose {warning}")
+    api = PiperAPI(
+        firmware=config.piper_firmware,
+        interface=config.piper_interface,
+        channel=config.piper_channel,
+        installation_pos=config.piper_installation_pos,
+        payload=config.piper_payload,
+    )
+    api.connect()
+    try:
+        if not api.is_ok():
+            raise RuntimeError("Piper is not responding on the CAN bus")
+        input(
+            "Clear the workspace, keep a hand near the e-stop, and press Enter to "
+            "move Piper to the start pose..."
+        )
+        if not api.enable():
+            raise RuntimeError("Timed out while enabling Piper")
+        api.set_position_mode()
+        time.sleep(POSITION_MODE_SETTLE_S)
+        api.set_speed_percent(100)
+        go_home(
+            api,
+            np.radians(config.piper_start_joints_deg),
+            config.piper_start_speed_deg_s,
+            50.0,
+        )
+        pose = tuple(float(value) for value in api.get_eef_pose())
+    finally:
+        # Disconnecting does not disable the arm: it keeps holding the start pose.
+        api.disconnect()
+    return pose
+
+
 def run_hand_only(config: HandOnlyCollectionConfig) -> int:
+    if config.mocap_ik_calibration is not None and not config.use_mocap:
+        raise ValueError('Mocap IK monitoring requires mocap')
     shared = SharedState()
     recorder = RecordingManager()
     errors: queue.Queue[WorkerError] = queue.Queue()
     pedal: FootPedalTrigger | None = None
     pedal_controller: FootPedalCollectionController | None = None
 
+    if getattr(config, "piper_start_joints_deg", None) is not None:
+        pose = move_piper_to_start(config)
+        config = replace(config, piper_start_pose=pose)
+        print(
+            "Piper is holding the start pose; postprocessing uses it from each "
+            "episode's metadata (--piper-start-pose "
+            + " ".join(f"{value:.4f}" for value in pose)
+            + ")."
+        )
+
     if config.mode == DATA_COLLECTION_MODE:
+        print(f"Saving episodes to {config.dataset_root}")
         print(f"Warming up for {config.warmup_time}s")
         time.sleep(config.warmup_time)
         print("Warmup done, starting data collection...")
@@ -551,70 +745,72 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
     if isinstance(threads, threading.Thread) or hasattr(threads, "join"):
         threads = [threads]
     reason = "duration_complete"
+    monitor = ik_monitor = None
     try:
+        if config.mocap_ik_calibration is not None:
+            from data_collection.collection.mocap_ik_monitor import MocapIKMonitor
+
+            ik_monitor = MocapIKMonitor(shared, config.mocap_ik_calibration,
+                                        topic=config.mocap_ik_topic, seed_deg=config.mocap_ik_seed_deg,
+                                        recorder=recorder, start_name=config.mocap_ik_start,
+                                        start_tolerance_deg=config.mocap_ik_start_tolerance_deg)
+        if config.show_tracking_monitor:
+            from data_collection.collection.tracking_monitor import (
+                TrackingMonitor,
+                load_monitor_calibration,
+            )
+
+            monitor = TrackingMonitor(
+                shared,
+                show_quest=config.use_quest,
+                show_vicon=config.use_mocap,
+                recorder=recorder,
+                calibration=load_monitor_calibration(config.monitor_calibration),
+            )
+        ticks = [
+            tick
+            for tick in (
+                pedal_controller.poll if pedal_controller is not None else None,
+                monitor.update if monitor is not None else None,
+                ik_monitor.update if ik_monitor is not None else None,
+            )
+            if tick is not None
+        ]
+
+        def on_tick() -> None:
+            for tick in ticks:
+                tick()
+
+        duration_s = None
         if config.mode == RETARGET_ONLY_MODE:
             print("Retarget-only mode active. Press Ctrl-C to stop.")
-            if config.show_ui:
-                if config.add_camera:
-                    reason = run_follower_contact_ui(
-                        shared,
-                        duration_s=None,
-                        show_camera=True,
-                        camera_window_name=config.task_view_window_name,
-                    )
-                else:
-                    reason = run_follower_contact_ui(shared, duration_s=None)
-            elif config.add_camera:
-                reason = run_camera_view(
-                    shared,
-                    duration_s=None,
-                    window_name=config.task_view_window_name,
-                )
-            else:
-                shared.shutdown.wait()
         elif config.use_foot_pedal:
             print("Foot-pedal collection active. Press q or Ctrl-C to stop.")
-            if config.show_ui:
-                reason = run_follower_contact_ui(
-                    shared,
-                    duration_s=None,
-                    show_camera=config.add_camera,
-                    camera_window_name=config.task_view_window_name,
-                    on_tick=pedal_controller.poll,
-                )
-            elif config.add_camera:
-                reason = run_camera_view(
-                    shared,
-                    duration_s=None,
-                    window_name=config.task_view_window_name,
-                    on_tick=pedal_controller.poll,
-                )
-            else:
-                while not shared.shutdown.wait(0.005):
-                    pedal_controller.poll()
         else:
+            duration_s = config.episode_time
             start_episode(config, recorder)
-            if config.show_ui:
-                if config.add_camera:
-                    reason = run_follower_contact_ui(
-                        shared,
-                        duration_s=config.episode_time,
-                        show_camera=True,
-                        camera_window_name=config.task_view_window_name,
-                    )
-                else:
-                    reason = run_follower_contact_ui(
-                        shared,
-                        duration_s=config.episode_time,
-                    )
-            elif config.add_camera:
-                reason = run_camera_view(
-                    shared,
-                    duration_s=config.episode_time,
-                    window_name=config.task_view_window_name,
-                )
-            else:
-                shared.shutdown.wait(config.episode_time)
+        if config.show_ui:
+            reason = run_follower_contact_ui(
+                shared,
+                duration_s=duration_s,
+                show_camera=config.add_camera,
+                camera_window_name=config.task_view_window_name,
+                on_tick=on_tick if ticks else None,
+                poll_windows=monitor is not None or ik_monitor is not None,
+            )
+        elif config.add_camera or monitor is not None or ik_monitor is not None:
+            reason = run_camera_view(
+                shared,
+                duration_s=duration_s,
+                window_name=config.task_view_window_name,
+                on_tick=on_tick if ticks else None,
+                show_camera=config.add_camera,
+            )
+        elif ticks:
+            while not shared.shutdown.wait(0.005):
+                on_tick()
+        else:
+            shared.shutdown.wait(duration_s)
         if not errors.empty():
             error = errors.get_nowait()
             session = recorder.current()
@@ -632,6 +828,10 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
         shared.shutdown.set()
         if pedal is not None:
             pedal.stop()
+        if monitor is not None:
+            monitor.close()
+        if ik_monitor is not None:
+            ik_monitor.close()
         for thread in threads:
             thread.join(timeout=3.0)
         if config.mode == DATA_COLLECTION_MODE:
@@ -657,8 +857,24 @@ def main() -> int:
         or args.paxini_port is not None
         or args.tactile_debug_log is not None
     )
+    piper_start_joints_deg = args.piper_start_joints_deg
+    if args.piper_start_home:
+        from scripts.teleop.quest_teleop import saved_home_deg
+
+        piper_start_joints_deg = saved_home_deg()
+    if piper_start_joints_deg is not None:
+        piper_start_joints_deg = tuple(piper_start_joints_deg)
+        if not all(math.isfinite(value) for value in piper_start_joints_deg):
+            raise ValueError("--piper-start-joints-deg must be finite")
+        if not math.isfinite(args.piper_start_speed_deg_s) or args.piper_start_speed_deg_s <= 0:
+            raise ValueError("--piper-start-speed-deg-s must be finite and greater than 0")
+    dataset_root = (
+        args.dataset_root.expanduser()
+        if args.dataset_root is not None
+        else next_dataset_root(args.dataset_name.expanduser())
+    )
     config = HandOnlyCollectionConfig(
-        dataset_root=args.dataset_root.expanduser(),
+        dataset_root=dataset_root,
         hand_config=args.hand_config.expanduser(),
         hand_port=args.hand_port,
         hand_measure_rate_hz=DEFAULT_HAND_MEASURE_RATE_HZ,
@@ -674,6 +890,21 @@ def main() -> int:
         add_camera=args.add_camera,
         use_piper=args.use_piper,
         use_quest=args.use_quest,
+        use_mocap=args.use_mocap,
+        mocap_topics=tuple(args.mocap_topics),
+        mocap_ik_calibration=(args.mocap_ik_calibration.expanduser()
+                              if args.mocap_ik_calibration is not None else None),
+        mocap_ik_topic=args.mocap_ik_topic,
+        mocap_ik_seed_deg=tuple(args.mocap_ik_seed_deg),
+        mocap_ik_start=args.mocap_ik_start,
+        mocap_ik_start_tolerance_deg=args.mocap_ik_start_tolerance_deg,
+        show_tracking_monitor=args.show_tracking_monitor,
+        monitor_calibration=(
+            args.monitor_calibration.expanduser()
+            if args.monitor_calibration is not None
+            else None
+        ),
+        quest_jump_threshold=args.quest_jump_threshold,
         piper_joint_level=args.piper_joint_level,
         piper_rate_hz=args.piper_rate_hz,
         teacher_mode_poll_hz=args.piper_teacher_mode_poll_hz,
@@ -682,6 +913,8 @@ def main() -> int:
         piper_firmware=args.piper_firmware,
         piper_installation_pos=args.piper_installation_pos,
         piper_payload=args.piper_payload,
+        piper_start_joints_deg=piper_start_joints_deg,
+        piper_start_speed_deg_s=args.piper_start_speed_deg_s,
         add_tactile=add_tactile,
         paxini_port=args.paxini_port,
         tactile_debug_log=(
@@ -723,6 +956,8 @@ def main() -> int:
         if config.piper_firmware not in {"default", "v183", "v188"}:
             raise ValueError("PIPER_FIRMWARE must be one of: default, v183, v188")
     if config.use_quest:
+        if not math.isfinite(config.quest_jump_threshold) or config.quest_jump_threshold <= 0:
+            raise ValueError("--quest-jump-threshold must be finite and greater than 0")
         if not config.quest_host:
             raise ValueError("QUEST_HOST must not be empty")
         if not 1 <= config.quest_port <= 65535:

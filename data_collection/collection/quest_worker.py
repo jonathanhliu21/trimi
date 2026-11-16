@@ -14,6 +14,8 @@ from .shared_state import SharedState
 QUEST_POSE_FIELDS = QUEST_PACKET_FIELDS[1:]
 QUEST_MAX_DATAGRAM_BYTES = 2048
 QUEST_SOCKET_POLL_TIMEOUT_S = 0.2
+# Name of the Quest pose in SharedState.latest_tracker_poses().
+QUEST_TRACKER_NAME = "quest"
 
 
 def _decode_packet(data: bytes) -> dict[str, int | float]:
@@ -57,9 +59,20 @@ def run_quest_worker(
     *,
     init_done,
 ) -> None:
-    """Receive raw Quest poses over UDP and record them with host timestamps."""
+    """Receive poses; a None startup timeout waits until data or shutdown."""
 
-    startup_deadline = time.monotonic() + config.quest_startup_timeout_s
+    # Collection enables this; standalone tools can keep their own jump reporting.
+    jump_threshold = getattr(config, "quest_jump_threshold", None)
+    if jump_threshold is not None and (not math.isfinite(jump_threshold) or jump_threshold <= 0):
+        raise ValueError("quest_jump_threshold must be finite and positive")
+    previous_position = None
+    previous_sample_ns = None
+    first_sample_ns = None
+    jump_count = 0
+    startup_deadline = (
+        None if config.quest_startup_timeout_s is None
+        else time.monotonic() + config.quest_startup_timeout_s
+    )
     initialized = False
     sample_idx = 0
     sample_session: EpisodeBuffer | None = None
@@ -72,7 +85,7 @@ def run_quest_worker(
         )
 
         while not shared.shutdown.is_set():
-            if initialized:
+            if initialized or startup_deadline is None:
                 timeout_s = QUEST_SOCKET_POLL_TIMEOUT_S
             else:
                 remaining_s = startup_deadline - time.monotonic()
@@ -92,7 +105,33 @@ def run_quest_worker(
             sample_ns = time.monotonic_ns()
             wall_time_s = time.time()
             packet = _decode_packet(data)
+            if jump_threshold is not None:
+                position = tuple(float(packet[key]) for key in ("px", "py", "pz"))
+                if first_sample_ns is None:
+                    first_sample_ns = sample_ns
+                if previous_position is not None:
+                    delta = tuple(value - previous for value, previous in zip(position, previous_position))
+                    distance = math.hypot(*delta)
+                    if distance > jump_threshold:
+                        jump_count += 1
+                        print(
+                            f"WARNING: [quest_worker] POSITION JUMP #{jump_count} "
+                            f"t={(sample_ns - first_sample_ns) / 1e9:.3f}s "
+                            f"seq={packet['seq']} step={distance:.4f} units "
+                            f"dt={(sample_ns - previous_sample_ns) / 1e9:.4f}s "
+                            f"delta=({delta[0]:+.4f}, {delta[1]:+.4f}, {delta[2]:+.4f}) "
+                            f"threshold={jump_threshold:g}",
+                            flush=True,
+                        )
+                previous_position = position
+                previous_sample_ns = sample_ns
 
+            shared.set_tracker_pose(
+                QUEST_TRACKER_NAME,
+                sample_ns,
+                (packet["px"], packet["py"], packet["pz"]),
+                (packet["qx"], packet["qy"], packet["qz"], packet["qw"]),
+            )
             if not initialized:
                 initialized = True
                 init_done.set()
@@ -114,7 +153,7 @@ def run_quest_worker(
             session.append_quest(row)
             sample_idx += 1
 
-        if not initialized:
+        if not initialized and startup_deadline is not None:
             raise RuntimeError(
                 "Quest worker stopped before receiving a valid UDP packet"
             )
