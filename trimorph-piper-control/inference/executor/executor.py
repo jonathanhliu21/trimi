@@ -59,7 +59,7 @@ HAND_ACTION_SCALE = 1.03
 # for any of this many recent replies (the paper's conservative max).
 RTC_DELAY_HISTORY = 10
 # TriMi on the bench rig; the collection defaults are placeholders for the glove.
-DEFAULT_HAND_API_REPO = CONTROL_ROOT.parent / "trimorph-hand-api"
+DEFAULT_HAND_API_REPO = CONTROL_ROOT.parent / "trimorph_hand_api"
 DEFAULT_HAND_CONFIG = CONTROL_ROOT / "config" / "xl330_test_config.yaml"
 # Every start the executor reaches, one JSON object per line; --start-id repeats one.
 DEFAULT_START_LOG = CONTROL_ROOT / "output" / "executor_starts.jsonl"
