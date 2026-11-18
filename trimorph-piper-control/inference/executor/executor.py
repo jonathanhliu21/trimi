@@ -718,18 +718,24 @@ def refresh_views(robot, camera, view):
         view.update(robot.eef_pose())
 
 
+def wait_for_policy_start(robot, camera, pedal, view=None, *, resume=False):
+    """Hold for a fresh pedal press, keeping camera and trajectory views live."""
+    pedal.poll()  # Discard presses made while moving to the start.
+    verb = "resume" if resume else "start"
+    print(f"At start. Press the pedal to {verb} the policy (Ctrl-C to quit).", flush=True)
+    while not pedal_pressed(pedal):
+        refresh_views(robot, camera, view)
+        time.sleep(0.02)
+    print(f"Pedal: {'resuming' if resume else 'starting'} the policy.", flush=True)
+
+
 def pause_at_start(args, robot, camera, pedal, view=None):
     """Return to the start pose, then hold until the next pedal press."""
     print("Pedal: stopping the policy and returning the arm and hand to the start.", flush=True)
     if view is not None:
         view.set_chunk(None)
     robot.return_to_start(args)
-    pedal.poll()  # Discard presses made during the return.
-    print("At start. Press the pedal to resume the policy (Ctrl-C to quit).", flush=True)
-    while not pedal_pressed(pedal):
-        refresh_views(robot, camera, view)
-        time.sleep(0.02)
-    print("Pedal: resuming the policy.", flush=True)
+    wait_for_policy_start(robot, camera, pedal, view, resume=True)
 
 
 def ema_alphas():
@@ -1402,6 +1408,8 @@ def main():
             view.update()
         camera = FakeCamera() if args.fake else OakCamera(args)
         robot = FakeRobot() if args.fake else RobotIO(args)
+        if pedal is not None:
+            wait_for_policy_start(robot, camera, pedal, view)
         if args.record_video:
             directory = log.directory if log is not None else RunLog(args.log_root).directory
             camera.start_recording(directory / "wrist.mp4")

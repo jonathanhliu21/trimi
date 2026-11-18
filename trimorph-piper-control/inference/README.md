@@ -64,6 +64,10 @@ The hand defaults are the bench TriMi: `../trimorph_hand_api`,
 adapter is shared with the glove, so confirm TriMi is on it, or pass
 `--hand-api-repo`, `--hand-config`, and `--hand-port`.
 
+Press Enter to move to the start pose, then press the foot pedal to start the
+policy. Camera preview stays live while waiting. With `--no-pedal`, execution
+starts as soon as setup finishes.
+
 This enables and commands the actual hand and arm. Before the first observation
 the arm ramps in joint space (10 deg/s, after an Enter prompt) to a named start
 from `PIPER_START_JOINTS_DEG` in `data_collection/collection/config.py`:

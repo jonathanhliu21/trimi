@@ -18,7 +18,7 @@ from data_collection.collection import config
 from inference import protocol
 from inference.executor.executor import (
     FakeCamera, FakeRobot, MAX_EEF_JUMP_M, OakCamera, RobotIO, jitter_start_joints,
-    parse_args, pose_to_piper, pose_to_policy, run, run_rtc,
+    main, parse_args, pose_to_piper, pose_to_policy, run, run_rtc,
 )
 
 
@@ -486,6 +486,33 @@ class InferenceTests(unittest.TestCase):
             expected = scaled_target * (1 - (1 - action_alpha) ** step)
             np.testing.assert_allclose(call.args[0], expected, atol=1e-7)
         np.testing.assert_allclose(robot.read_state(), expected, atol=1e-7)
+
+    def test_startup_waits_for_fresh_pedal_press_after_robot_setup(self):
+        args = parse_args(['--predictor', 'localhost', '--no-log'])
+        pedal = Mock()
+        # Discard a press during setup; wait through idle, then accept a fresh press.
+        pedal.poll.side_effect = [[1], [], [1]]
+        robot, camera = Mock(), Mock()
+        with patch('inference.executor.executor.parse_args', return_value=args), \
+             patch('inference.executor.executor.socket.create_connection'), \
+             patch('inference.executor.executor.protocol.set_low_latency'), \
+             patch('scripts.piper_api.foot_pedal.FootPedalTrigger', return_value=pedal), \
+             patch('inference.executor.executor.OakCamera', return_value=camera), \
+             patch('inference.executor.executor.RobotIO', return_value=robot) as setup_robot, \
+             patch('inference.executor.executor.run') as run_policy, \
+             patch('inference.executor.executor.time.sleep'), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            def preview():
+                setup_robot.assert_called_once_with(args)
+                run_policy.assert_not_called()
+            camera.preview.side_effect = preview
+            main()
+        self.assertEqual(pedal.poll.call_count, 3)
+        camera.preview.assert_called_once()
+        run_policy.assert_called_once()
+        self.assertIn('Press the pedal to start the policy', output.getvalue())
+        robot.close.assert_called_once()
+        pedal.stop.assert_called_once()
 
     def test_pedal_interrupts_chunk_returns_to_start_and_resumes(self):
         # Polls: setup drain, cycle 0 start, action 0, action 1 (press), drain after
