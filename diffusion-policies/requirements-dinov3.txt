@@ -1,0 +1,8 @@
+-r requirements-train.txt
+
+# Meta's current Torch Hub entry point also imports evaluation/data modules.
+torchmetrics
+scikit-learn
+submitit
+ftfy
+regex

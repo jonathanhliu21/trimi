@@ -1,0 +1,23 @@
+defaults:
+  - train_unet_image_midas_hand_cond_dinov2_policy
+  - override /tasks: trimi_image_hand_cond
+  - _self_
+
+name: train_diffusion_trimi_image_hand_cond_dinov2_${num_inference_steps}
+exp_name: "trimi_hand_cond_dinov2_JUN"
+
+logging:
+  project: trimi_training
+  mode: online
+
+device: "cuda:0"
+
+horizon: 16
+num_obs_steps: 1
+num_action_steps: 8
+num_inference_steps: 16
+num_latency_steps: 0
+dataset_obs_steps: ${num_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+global_obs_cond: True

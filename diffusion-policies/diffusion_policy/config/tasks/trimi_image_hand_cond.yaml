@@ -1,0 +1,42 @@
+# Define observations here without inheriting MIDAS observation keys.
+# Uncomment hand_pose_abs below to condition on hand joints as well as RGB.
+name: trimi_image_hand_cond
+
+image_shape: [3, 240, 320]
+shape_meta:
+  obs:
+    camera_0:
+      shape: ${tasks.image_shape}
+      type: rgb
+    # hand_pose_abs:
+    #   shape: [13]
+    #   type: low_dim
+  action:
+    shape: [19]
+
+# Adding sensors also requires loading their data and supplying them at inference.
+# The reused MIDAS adapters currently support one RGB camera and 13 hand joints.
+# Reuse MIDAS loading, relative actions, normalization, and runner.
+# Hand state/targets use Trimi motor order 0..12 consistently.
+# EEF arrays contain calibrated Piper-frame XYZ + rotation vector, not Euler angles.
+# Camera-enabled postprocessing must provide frame_idx/encoder_idx/pose_idx.
+env_runner:
+  _target_: shared.env.midas.midas_runner.MidasRunner
+  output_dir: ${hydra:runtime.output_dir}
+
+dataset:
+  _target_: shared.env.midas.midas_image_dataset.MidasImageDataset
+  dataset_path: data/data_trimorph_unscrew_cap_0
+  shape_meta: ${tasks.shape_meta}
+  horizon: ${horizon}
+  pad_before: ${eval:'${num_obs_steps}-1'}
+  pad_after: ${eval:'${num_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.15
+  max_train_episodes: null
+  num_obs_steps: ${dataset_obs_steps}
+  num_latency_steps: ${num_latency_steps}
+  first_cut: 0
+  encoder_window: 0
+  sync_downsample_stride: 2
+  use_cache: False
