@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+"""Replay synchronized PiperX EEF and TRIMORPH leader-hand streams."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import sys
+import threading
+import time
+from dataclasses import replace
+from pathlib import Path
+from typing import Mapping
+
+# Support both direct execution and package imports.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from data_collection.collection.config import (
+    DEFAULT_HAND_CONFIG,
+    DEFAULT_HAND_MEASURE_RATE_HZ,
+    DEFAULT_HAND_PORT,
+    DEFAULT_PIPER_RATE_HZ,
+    DEFAULT_THUMB_MODEL,
+    HandRuntimeConfig,
+    RAW_EEF_FIELDS,
+    PIPER_JOINT_FIELDS,
+)
+from data_collection.collection.depthai_task_camera_worker import flip_frame
+from data_collection.collection.depthai_utils import (
+    apply_camera_control,
+    import_depthai,
+    require_depthai_device,
+    warmup_color_queue,
+)
+from data_collection.collection.episode import raw_root
+from data_collection.collection.mocap_worker import ReplayMocapRecorder
+from data_collection.collection.hand_common import (
+    load_follower_config,
+    load_hand_config,
+    verify_connected_hand,
+)
+from data_collection.collection.thumb_retargeting import (
+    THUMB_RETARGET_MOTOR_IDS,
+    ThumbRetargetModel,
+    build_follower_target,
+    load_thumb_retarget_model,
+)
+from data_collection.collection.utils import import_cv2
+
+from data_collection.collection.replay_config import (
+    DATASET_ROOT,
+    REPLAY_HZ,
+    CURRENT_TELEMETRY_HZ,
+    PREPOSITION_SECONDS,
+    SETTLE_SECONDS,
+    PIPER_PREPOSITION_SPEED_PERCENT,
+    PIPER_REPLAY_SPEED_PERCENT,
+    PIPER_INTERFACE,
+    PIPER_CHANNEL,
+    PIPER_FIRMWARE,
+    PIPER_INSTALLATION_POS,
+    PIPER_PAYLOAD,
+    PIPER_DIAG_INTERVAL_S,
+    PURE_POSITION_OPERATING_MODE,
+    ACTION_SCALE,
+    JOINT_ACTION_SCALES,
+    CAMERA_WARMUP_ATTEMPTS,
+)
+
+
+class ReplayVideoRecorder:
+    """Keep an OAK pipeline warm and record frames during the replay interval."""
+
+    def __init__(self, output: Path, config: HandRuntimeConfig) -> None:
+        self.output = output.expanduser().resolve()
+        self.config = config
+        self._ready = threading.Event()
+        self._begin = threading.Event()
+        self._stop = threading.Event()
+        self._wall_start = 0.0
+        self._duration_s = 0.0
+        self._error: Exception | None = None
+        self._frames_written = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="oak-replay-video",
+        )
+
+    def prepare(self) -> None:
+        """Connect and warm up the camera without recording pre-replay frames."""
+
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self._thread.start()
+        self._ready.wait()
+        self.raise_if_failed()
+
+    def start(self, wall_start: float, duration_s: float) -> None:
+        self._wall_start = wall_start
+        self._duration_s = duration_s
+        self._begin.set()
+
+    def finish(self) -> None:
+        self._thread.join()
+        self.raise_if_failed()
+        print(
+            f"Saved replay OAK video to {self.output} "
+            f"({self._frames_written} frames)"
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._begin.set()
+        if self._thread.is_alive():
+            self._thread.join()
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(
+                f"OAK video recording failed: {self._error}"
+            ) from self._error
+
+    def _run(self) -> None:
+        writer = None
+        try:
+            cv2 = import_cv2()
+            dai = import_depthai()
+            require_depthai_device(dai)
+            with dai.Pipeline() as pipeline:
+                camera = pipeline.create(dai.node.Camera).build(
+                    sensorFps=self.config.task_camera_fps
+                )
+                apply_camera_control(
+                    camera,
+                    exposure_us=self.config.task_camera_exposure_us,
+                    iso=self.config.task_camera_iso,
+                    white_balance_k=self.config.task_camera_white_balance_k,
+                )
+                camera_output = camera.requestOutput(
+                    (
+                        self.config.task_camera_width,
+                        self.config.task_camera_height,
+                    ),
+                    dai.ImgFrame.Type.NV12,
+                    fps=self.config.task_camera_fps,
+                )
+                queue = camera_output.createOutputQueue()
+                pipeline.start()
+                size = warmup_color_queue(queue, CAMERA_WARMUP_ATTEMPTS)
+                if size is None:
+                    raise RuntimeError("OAK camera produced no frames during warmup")
+                actual_width, actual_height = size
+                fourcc = cv2.VideoWriter_fourcc(*self.config.video_codec)
+                writer = cv2.VideoWriter(
+                    str(self.output),
+                    fourcc,
+                    float(self.config.task_camera_fps),
+                    (actual_width, actual_height),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"Could not open video writer: {self.output}")
+                print(
+                    f"Replay camera (DepthAI/OAK): {actual_width}x{actual_height} "
+                    f"@{self.config.task_camera_fps}fps"
+                )
+                self._ready.set()
+                self._begin.wait()
+                end_time = self._wall_start + self._duration_s
+                while (
+                    not self._stop.is_set()
+                    and pipeline.isRunning()
+                    and time.monotonic() < end_time
+                ):
+                    frame = queue.get().getCvFrame()
+                    if frame is None:
+                        continue
+                    if time.monotonic() >= end_time:
+                        break
+                    frame = flip_frame(cv2, frame, self.config.task_camera_flip)
+                    writer.write(frame)
+                    self._frames_written += 1
+        except Exception as exc:
+            self._error = exc
+        finally:
+            if writer is not None:
+                writer.release()
+            self._ready.set()
+
+
+def advance_current_sample_schedule(
+    elapsed_s: float,
+    next_sample_s: float,
+    sample_period_s: float,
+) -> tuple[bool, float]:
+    """Return whether to sample now and the following fixed-rate deadline."""
+
+    if elapsed_s + 1e-12 < next_sample_s:
+        return False, next_sample_s
+    while next_sample_s <= elapsed_s + 1e-12:
+        next_sample_s += sample_period_s
+    return True, next_sample_s
+
+
+class ReplayCurrentRecorder:
+    """Collect replay telemetry in gen_graphs_from_csvs.py's native schema."""
+
+    def __init__(self, motor_ids: tuple[int, ...]) -> None:
+        self.motor_ids = tuple(int(motor_id) for motor_id in motor_ids)
+        self.rows: list[dict[str, float | int]] = []
+        self._previous_time_s: float | None = None
+        self._previous_targets: np.ndarray | None = None
+
+    def sample(
+        self,
+        hand,
+        target_positions_rad: np.ndarray,
+        *,
+        elapsed_s: float,
+    ) -> None:
+        targets = np.asarray(target_positions_rad, dtype=np.float64)
+        actual_positions, actual_velocities, currents = hand.read_pos_vel_cur()
+        actual_positions = np.asarray(actual_positions, dtype=np.float64)
+        actual_velocities = np.asarray(actual_velocities, dtype=np.float64)
+        currents = np.asarray(currents, dtype=np.float64)
+        expected_shape = (len(self.motor_ids),)
+        if any(
+            values.shape != expected_shape
+            for values in (targets, actual_positions, actual_velocities, currents)
+        ):
+            raise RuntimeError("Replay telemetry vectors do not match the motor count")
+        if not all(
+            np.isfinite(values).all()
+            for values in (targets, actual_positions, actual_velocities, currents)
+        ):
+            raise RuntimeError("Replay telemetry contains NaN or Inf")
+
+        if self._previous_time_s is None or self._previous_targets is None:
+            target_velocities = np.zeros_like(targets)
+        else:
+            delta_s = elapsed_s - self._previous_time_s
+            if delta_s <= 0.0:
+                raise RuntimeError("Replay telemetry timestamps must increase")
+            target_velocities = (targets - self._previous_targets) / delta_s
+
+        row: dict[str, float | int] = {"trial": 1, "elapsed_s": elapsed_s}
+        for index, motor_id in enumerate(self.motor_ids):
+            row.update(
+                {
+                    f"motor_{motor_id}_current_ma": float(currents[index]),
+                    f"motor_{motor_id}_target_position_rad": float(targets[index]),
+                    f"motor_{motor_id}_actual_position_rad": float(
+                        actual_positions[index]
+                    ),
+                    f"motor_{motor_id}_target_velocity_rad_s": float(
+                        target_velocities[index]
+                    ),
+                    f"motor_{motor_id}_actual_velocity_rad_s": float(
+                        actual_velocities[index]
+                    ),
+                }
+            )
+        self.rows.append(row)
+        self._previous_time_s = elapsed_s
+        self._previous_targets = targets.copy()
+
+
+def output_current_csv(recorder: ReplayCurrentRecorder, output: Path) -> None:
+    if not recorder.rows:
+        raise RuntimeError("No replay current samples were recorded")
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["trial", "elapsed_s"]
+    for motor_id in recorder.motor_ids:
+        fieldnames.extend(
+            (
+                f"motor_{motor_id}_current_ma",
+                f"motor_{motor_id}_target_position_rad",
+                f"motor_{motor_id}_actual_position_rad",
+                f"motor_{motor_id}_target_velocity_rad_s",
+                f"motor_{motor_id}_actual_velocity_rad_s",
+            )
+        )
+    with output.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(recorder.rows)
+    print(f"Saved replay current telemetry CSV to {output}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Replay a TRIMORPH episode with processed Piper poses (latest by default)."
+    )
+    parser.add_argument(
+        "episode",
+        nargs="?",
+        help="Episode directory, numeric index, or episode_XXXXXX name.",
+    )
+    parser.add_argument(
+        "--loop",
+        nargs="?",
+        const=None,
+        default=1,
+        type=int,
+        metavar="N",
+        help="Replay N times total, or indefinitely when N is omitted (Ctrl-C stops).",
+    )
+    parser.add_argument("--dataset-root", default=str(DATASET_ROOT))
+    parser.add_argument("--hand-config", "--leader-config", dest="hand_config")
+    parser.add_argument("--hand-port", "--leader-port", dest="hand_port")
+    parser.add_argument(
+        "--use-follower",
+        action="store_true",
+        help=(
+            "Treat --hand-config and --hand-port as a MIDAS follower, applying "
+            "normal action scaling plus the joints 2-3 thumb model."
+        ),
+    )
+    parser.add_argument(
+        "--thumb-model",
+        type=Path,
+        default=DEFAULT_THUMB_MODEL,
+        help=(
+            "Joints 2-3 TRIMORPH-to-MIDAS model used only with --use-follower "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--rate-hz",
+        type=float,
+        default=REPLAY_HZ,
+        help="Hand replay rate in Hz (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--piper-rate-hz",
+        "--arm-rate-hz",
+        type=float,
+        default=DEFAULT_PIPER_RATE_HZ,
+        help="Piper replay rate in Hz, independent of the hand (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--read-piper-raw", action="store_true",
+        help="Read raw/episode_XXXXXX/piper.csv instead of the postprocessed Piper CSV.",
+    )
+    parser.add_argument(
+        "--joint-level",
+        action="store_true",
+        help="Replay recorded Piper joints with smooth move_j; requires --read-piper-raw and joint_1..joint_6 in raw piper.csv.",
+    )
+    parser.add_argument(
+        "--max-joint-step-rad",
+        type=float,
+        default=1.0,
+        help="Maximum commanded joint change from measured feedback per joint-level command (default: %(default)s rad).",
+    )
+    parser.add_argument("--no-preposition", action="store_true")
+    parser.add_argument("--preposition-seconds", type=float, default=PREPOSITION_SECONDS)
+    parser.add_argument("--settle-seconds", type=float, default=SETTLE_SECONDS)
+    parser.add_argument(
+        "--preposition-speed-percent",
+        type=int,
+        default=PIPER_PREPOSITION_SPEED_PERCENT,
+        help="Piper speed during prepositioning (default: %(default)s%%).",
+    )
+    parser.add_argument(
+        "--replay-speed-percent",
+        type=int,
+        default=PIPER_REPLAY_SPEED_PERCENT,
+        help="Piper speed during replay (default: %(default)s%%).",
+    )
+    parser.add_argument(
+        "--playback-speed", "--replay-speed",
+        dest="playback_speed",
+        type=float,
+        default=1.0,
+        help="Replay time scale for hand and arm together (speed > 0): 1 = recorded speed, 0.5 = half speed, 2 = double speed.",
+    )
+    parser.add_argument("--hand-only", action="store_true")
+    parser.add_argument("--arm-only", action="store_true")
+    parser.add_argument("--use-mocap", action="store_true", help="Record live ROS 2 Vicon data during replay.")
+    parser.add_argument("--mocap-output", type=Path, help="Destination CSV; required with --use-mocap.")
+    parser.add_argument("--mocap-topic", dest="mocap_topics", action="append", default=[], help="Select a Vicon topic (repeatable); default: discover all supported topics.")
+    parser.add_argument(
+        "--output-current",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Measure hand motor current during replay and write graph-compatible "
+            "telemetry to PATH. No telemetry is saved when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--output-video",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Record the OAK camera view during replay and save the video to PATH. "
+            "No camera is opened when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--no-piper-enable",
+        action="store_true",
+        help="Do not enable Piper; also permits replay of episodes with an empty piper.csv.",
+    )
+    parser.add_argument(
+        "--arm-diag",
+        action="store_true",
+        help=(
+            "Print Piper controller status, limit faults, motor-enable state, "
+            "and commanded-versus-measured EEF error during replay."
+        ),
+    )
+    parser.add_argument(
+        "--arm-diag-interval-s",
+        type=float,
+        default=PIPER_DIAG_INTERVAL_S,
+        help="Seconds between --arm-diag samples (default: %(default)s).",
+    )
+    args = parser.parse_args()
+    if args.loop is not None and args.loop < 1:
+        parser.error("--loop must be a positive integer")
+    return args
+
+
+def resolve_episode(dataset_root: Path, episode: str | None) -> Path:
+    root = raw_root(dataset_root)
+    if episode is None:
+        episodes = sorted(path for path in root.glob("episode_*") if path.is_dir())
+        if not episodes:
+            raise FileNotFoundError(f"No raw episodes found under {root}")
+        return episodes[-1]
+
+    candidate = Path(episode).expanduser()
+    if candidate.is_dir():
+        return candidate
+    if episode.isdigit():
+        candidate = root / f"episode_{int(episode):06d}"
+    elif episode.startswith("episode_"):
+        candidate = root / episode
+    else:
+        candidate = root / f"episode_{episode}"
+    if not candidate.is_dir():
+        raise FileNotFoundError(f"Episode not found: {candidate}")
+    return candidate
+
+
+def resolve_leader_hand_path(episode_dir: Path) -> Path:
+    path = episode_dir / "leader_hand.csv"
+    legacy_path = episode_dir / "proprioception.csv"
+    if not path.exists() and legacy_path.exists():
+        return legacy_path
+    return path
+
+
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", newline="") as csv_file:
+        return list(csv.DictReader(csv_file))
+
+
+def hand_motor_ids(path: Path) -> tuple[int, ...]:
+    with path.open("r", newline="") as csv_file:
+        fieldnames = csv.DictReader(csv_file).fieldnames or []
+    motor_ids = tuple(
+        int(field.removeprefix("pos_"))
+        for field in fieldnames
+        if field.startswith("pos_")
+    )
+    if not motor_ids:
+        raise ValueError(f"No motor position columns in {path}")
+    return motor_ids
+
+
+def load_stream(
+    path: Path,
+    fields: tuple[str, ...],
+    *,
+    allow_empty: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    with path.open("r", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        fieldnames = set(reader.fieldnames or ())
+        rows = list(reader)
+    if not rows:
+        if allow_empty:
+            return None
+        raise ValueError(f"No samples in {path}")
+    missing = sorted({"elapsed_s", *fields} - fieldnames)
+    if missing:
+        raise ValueError(f"Missing columns in {path}: {', '.join(missing)}")
+    times = np.asarray([float(row["elapsed_s"]) for row in rows], dtype=np.float64)
+    values = np.asarray(
+        [[float(row[field]) for field in fields] for row in rows], dtype=np.float64
+    )
+    if not np.isfinite(times).all() or not np.isfinite(values).all():
+        raise ValueError(f"NaN or Inf in {path}")
+    order = np.argsort(times, kind="stable")
+    times = times[order]
+    values = values[order]
+    if np.any(np.diff(times) < 0):
+        raise ValueError(f"Non-monotonic timestamps in {path}")
+    return times, values
+
+
+def load_hand_stream(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    stream = load_stream(
+        path, tuple(f"pos_{motor_id}" for motor_id in hand_motor_ids(path))
+    )
+    assert stream is not None
+    return stream
+
+
+def scale_hand_stream(
+    stream: tuple[np.ndarray, np.ndarray], scale: float | np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    times, positions = stream
+    return times, positions * scale
+
+
+def prepare_hand_stream_for_replay(
+    stream: tuple[np.ndarray, np.ndarray],
+    motor_ids: tuple[int, ...],
+    *,
+    use_follower: bool,
+    command_scale: float,
+    joint_command_scales: np.ndarray,
+    thumb_model: ThumbRetargetModel | None,
+    joint_command_offsets: np.ndarray | None = None,
+    action_scale: float = 1.0,
+    joint_action_scales: Mapping[int, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build targets and apply global plus motor-ID-specific action scales."""
+
+    if not use_follower:
+        targets = stream
+    else:
+        times, positions = stream
+        retargeted_positions = np.asarray(
+            [
+                build_follower_target(
+                    position,
+                    motor_ids,
+                    command_scale=command_scale,
+                    joint_command_scales=joint_command_scales,
+                    joint_command_offsets=joint_command_offsets,
+                    thumb_model=thumb_model,
+                )
+                for position in positions
+            ],
+            dtype=np.float64,
+        )
+        targets = times, retargeted_positions
+    per_joint_scales = np.asarray(
+        [
+            action_scale * (
+                joint_action_scales.get(int(motor_id), 1.0)
+                if joint_action_scales is not None else 1.0
+            )
+            for motor_id in motor_ids
+        ],
+        dtype=np.float64,
+    )
+    return scale_hand_stream(targets, per_joint_scales)
+
+
+def config_values_for_motor_ids(
+    values_by_motor_id: dict[int, float],
+    motor_ids: tuple[int, ...],
+    *,
+    default: float,
+) -> np.ndarray:
+    """Resolve motor-ID keyed hand-only tuning in recorded column order."""
+
+    return np.asarray(
+        [values_by_motor_id.get(int(motor_id), default) for motor_id in motor_ids],
+        dtype=np.float64,
+    )
+
+
+def build_replay_config(
+    args: argparse.Namespace,
+    active_motors: tuple[int, ...] | None,
+) -> HandRuntimeConfig:
+    """Build replay settings from the shared hand runtime configuration."""
+
+    return HandRuntimeConfig(
+        dataset_root=Path(args.dataset_root).expanduser(),
+        hand_config=(
+            Path(args.hand_config).expanduser()
+            if args.hand_config is not None
+            else DEFAULT_HAND_CONFIG
+        ),
+        hand_port=args.hand_port or DEFAULT_HAND_PORT,
+        hand_measure_rate_hz=DEFAULT_HAND_MEASURE_RATE_HZ,
+        active_motors=list(active_motors or ()),
+    )
+
+
+def load_piper_stream(
+    path: Path, *, allow_empty: bool = False, joint_level: bool = False
+) -> tuple[np.ndarray, np.ndarray] | None:
+    return load_stream(
+        path,
+        PIPER_JOINT_FIELDS if joint_level else RAW_EEF_FIELDS,
+        allow_empty=allow_empty,
+    )
+
+
+def resolve_piper_source(episode_dir: Path, *, read_piper_raw=False) -> tuple[Path, str]:
+    """Keep the original raw logger untouched; processed CSVs declare their frame."""
+    if read_piper_raw:
+        return episode_dir / "piper.csv", "piper_base"
+    from data_collection.postprocess_dataset import processed_episode_dir
+
+    processed = processed_episode_dir(episode_dir)
+    path = processed / "piper.csv"
+    metadata_path = processed / "metadata.json"
+    if not path.exists() or not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Processed Piper poses missing under {processed}. Run data_collection/postprocess_dataset.py "
+            "first, or use --read-piper-raw for the original raw CSV."
+        )
+    metadata = json.loads(metadata_path.read_text())
+    frame = metadata.get("pose_frame")
+    if frame not in ("piper_base", "relative_to_episode_start"):
+        raise ValueError(f"Unknown pose_frame {frame!r} in {metadata_path}")
+    return path, frame
+
+
+def anchor_relative_piper_stream(stream, start_pose):
+    """Anchor mapped spatial deltas at a measured Piper XYZ/RPY pose."""
+    times, values = stream
+    start = np.asarray(start_pose, dtype=float)
+    if start.shape != (6,) or not np.isfinite(start).all():
+        raise ValueError("Relative replay requires a finite measured Piper XYZ/RPY starting pose")
+    rotations = Rotation.from_euler("xyz", values[:, 3:])
+    spatial_delta = rotations * rotations[0].inv()
+    target_rotations = spatial_delta * Rotation.from_euler("xyz", start[3:])
+    result = np.column_stack((start[:3] + values[:, :3] - values[0, :3],
+                              np.unwrap(target_rotations.as_euler("xyz"), axis=0)))
+    return times, result
+
+
+def sample_stream(times: np.ndarray, values: np.ndarray, query_t: float) -> np.ndarray:
+    return np.asarray(
+        [np.interp(query_t, times, values[:, column]) for column in range(values.shape[1])],
+        dtype=np.float64,
+    )
+
+
+def replay_piper_commands(
+    api,
+    piper_stream: tuple[np.ndarray, np.ndarray],
+    start_s: float,
+    end_s: float,
+    wall_start: float,
+    args: argparse.Namespace,
+    stop_event: threading.Event,
+) -> None:
+    """Command Piper on its own clock, skipping stale ticks if a command runs late."""
+
+    period_s = 1.0 / args.piper_rate_hz
+    duration_s = end_s - start_s
+    playback_speed = getattr(args, "playback_speed", 1.0)
+    tick = 0
+    next_arm_diag_s = 0.0
+    if args.joint_level:
+        from scripts.piper_api.replay_trajectory import command_bounded_joint_step
+
+    while not stop_event.is_set():
+        deadline = wall_start + tick * period_s
+        wait_s = deadline - time.monotonic()
+        if wait_s > 0 and stop_event.wait(wait_s):
+            return
+        elapsed_s = min(max(time.monotonic() - wall_start, 0.0) * playback_speed, duration_s)
+        piper_target = sample_stream(*piper_stream, start_s + elapsed_s)
+        if args.joint_level:
+            command_bounded_joint_step(api, piper_target, args.max_joint_step_rad)
+        else:
+            api.move_eef(piper_target)
+        if args.arm_diag and elapsed_s + 1e-12 >= next_arm_diag_s:
+            log_piper_diagnostics(
+                api,
+                f"replay-{elapsed_s:.3f}s",
+                None if args.joint_level else piper_target,
+            )
+            while next_arm_diag_s <= elapsed_s + 1e-12:
+                next_arm_diag_s += args.arm_diag_interval_s
+        if elapsed_s >= duration_s:
+            return
+        tick = max(tick + 1, math.floor((time.monotonic() - wall_start) / period_s) + 1)
+
+
+def decode_piper_error_code(err_code: int) -> tuple[list[int], list[int]]:
+    """Return joints reporting angle-limit and communication faults."""
+
+    angle_limits = [joint for joint in range(1, 7) if err_code & (1 << (joint + 7))]
+    communication = [joint for joint in range(1, 7) if err_code & (1 << (joint - 1))]
+    return angle_limits, communication
+
+
+def _format_piper_vector(values) -> str:
+    return "[" + ", ".join(f"{float(value):+.6f}" for value in values) + "]"
+
+
+def log_piper_diagnostics(api, label: str, target=None) -> None:
+    """Print actionable Piper feedback without interrupting replay."""
+
+    state = api.get_state()
+    try:
+        enabled = list(api.robot.get_joints_enable_status_list())
+    except Exception as exc:  # Diagnostics must not stop an otherwise valid replay.
+        enabled = [f"unavailable:{exc}"]
+
+    try:
+        err_code = int(state.get("err_code", 0))
+    except (TypeError, ValueError):
+        err_code = 0
+    angle_limits, communication = decode_piper_error_code(err_code)
+
+    alerts = []
+    if "CAN_CTRL" not in str(state.get("ctrl_mode", "")):
+        alerts.append("control_mode_not_CAN")
+    if "NORMAL" not in str(state.get("arm_status", "")):
+        alerts.append(f"arm_status={state.get('arm_status')}")
+    if "FAILED" in str(state.get("motion_status", "")):
+        alerts.append("target_not_reached")
+    if angle_limits:
+        alerts.append(f"joint_angle_limit={angle_limits}")
+    if communication:
+        alerts.append(f"joint_communication={communication}")
+
+    print(
+        f"[piper-diag:{label}] ok={state.get('is_ok')} "
+        f"fps={state.get('receive_fps')} ctrl={state.get('ctrl_mode')} "
+        f"arm={state.get('arm_status')} mode={state.get('mode_feedback')} "
+        f"teach={state.get('teach_status')} motion={state.get('motion_status')} "
+        f"err_code={err_code} enabled={enabled} "
+        f"alerts={alerts or ['none']}"
+    )
+
+    if target is None:
+        return
+    try:
+        measured = np.asarray(
+            [float(state[field]) for field in RAW_EEF_FIELDS], dtype=np.float64
+        )
+        commanded = np.asarray(target, dtype=np.float64)
+    except (KeyError, TypeError, ValueError):
+        print(f"[piper-diag:{label}] EEF feedback unavailable")
+        return
+
+    position_error_m = float(np.linalg.norm(commanded[:3] - measured[:3]))
+    rpy_error = (commanded[3:] - measured[3:] + math.pi) % (2.0 * math.pi) - math.pi
+    print(
+        f"[piper-diag:{label}] target={_format_piper_vector(commanded)} "
+        f"measured={_format_piper_vector(measured)} "
+        f"position_error_m={position_error_m:.6f} "
+        f"rpy_error_rad={_format_piper_vector(rpy_error)}"
+    )
+
+
+def replay_interval(*streams: tuple[np.ndarray, np.ndarray] | None) -> tuple[float, float]:
+    active = [stream for stream in streams if stream is not None]
+    if not active:
+        raise ValueError("Nothing selected for replay")
+    start_s = max(float(stream[0][0]) for stream in active)
+    end_s = min(float(stream[0][-1]) for stream in active)
+    if end_s < start_s:
+        raise ValueError("Selected streams do not overlap in episode time")
+    return start_s, end_s
+
+
+def build_replay_hand_config(
+    hand_config: Path,
+    hand_port: str,
+    active_motors: tuple[int, ...],
+    *,
+    use_follower: bool,
+):
+    """Load a narrowed hand configuration using pure position control.
+
+    Collection and teleoperation retain the configured operating mode, while
+    replay deliberately uses Dynamixel mode 3 so the recorded positions are
+    not softened by the goal-current limit used in mode 5.
+    """
+
+    loader = load_follower_config if use_follower else load_hand_config
+    config = loader(hand_config, hand_port, active_motors)
+    return replace(config, operating_mode=PURE_POSITION_OPERATING_MODE)
+
+
+def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, args) -> None:
+    if args.no_preposition:
+        return
+    print("Moving to first synchronized pose...")
+    if api is not None:
+        api.set_speed_percent(args.preposition_speed_percent)
+    first_hand = sample_stream(*hand_stream, start_s) if hand_stream is not None else None
+    first_eef = sample_stream(*piper_stream, start_s) if piper_stream is not None else None
+    if args.joint_level and api is not None and first_eef is not None:
+        from scripts.piper_api.replay_trajectory import preposition_joints_linearly
+
+        if hand is not None and first_hand is not None:
+            hand.set_positions(first_hand, clip=True)
+        preposition_joints_linearly(
+            api,
+            first_eef,
+            duration_s=args.preposition_seconds,
+            max_step_rad=args.max_joint_step_rad,
+        )
+        if args.settle_seconds > 0:
+            time.sleep(args.settle_seconds)
+        return
+    end_t = time.monotonic() + args.preposition_seconds
+    while time.monotonic() < end_t:
+        if hand is not None and first_hand is not None:
+            hand.set_positions(first_hand, clip=True)
+        if api is not None and first_eef is not None:
+            api.move_eef(first_eef)
+        time.sleep(0.05)
+    if args.settle_seconds > 0:
+        time.sleep(args.settle_seconds)
+
+
+def main() -> int:
+    args = parse_args()
+    if args.use_mocap and args.mocap_output is None:
+        raise ValueError("--use-mocap requires --mocap-output")
+    if not args.use_mocap and (args.mocap_output is not None or args.mocap_topics):
+        raise ValueError("--mocap-output and --mocap-topic require --use-mocap")
+    if not math.isfinite(args.rate_hz) or args.rate_hz <= 0:
+        raise ValueError("--rate-hz must be finite and greater than 0")
+    if not math.isfinite(args.piper_rate_hz) or args.piper_rate_hz <= 0:
+        raise ValueError("--piper-rate-hz must be finite and greater than 0")
+    if not math.isfinite(args.max_joint_step_rad) or args.max_joint_step_rad <= 0:
+        raise ValueError("--max-joint-step-rad must be finite and greater than 0")
+    if args.arm_diag_interval_s <= 0:
+        raise ValueError("--arm-diag-interval-s must be greater than 0")
+    if args.preposition_seconds < 0 or args.settle_seconds < 0:
+        raise ValueError("Preposition and settle durations must be non-negative")
+    for name in ("preposition_speed_percent", "replay_speed_percent"):
+        if not 0 <= getattr(args, name) <= 100:
+            raise ValueError(f"--{name.replace('_', '-')} must be between 0 and 100")
+    if not math.isfinite(args.playback_speed) or args.playback_speed <= 0:
+        raise ValueError("--playback-speed / --replay-speed must be finite and greater than 0")
+    if args.hand_only and args.arm_only:
+        raise ValueError("--hand-only and --arm-only are mutually exclusive")
+    if args.output_current is not None and args.arm_only:
+        raise ValueError("--output-current cannot be used with --arm-only")
+
+    if args.joint_level and not args.read_piper_raw:
+        raise ValueError("--joint-level requires --read-piper-raw; processed poses contain EEF coordinates")
+
+    replay_hand = not args.arm_only
+    replay_arm = not args.hand_only
+    episode_dir = resolve_episode(Path(args.dataset_root).expanduser(), args.episode)
+    hand_path = resolve_leader_hand_path(episode_dir)
+    active_motors = hand_motor_ids(hand_path) if replay_hand else None
+    hand_stream = load_hand_stream(hand_path) if replay_hand else None
+    piper_path, piper_frame = (resolve_piper_source(episode_dir, read_piper_raw=args.read_piper_raw)
+                               if replay_arm else (None, None))
+    piper_stream = (
+        load_piper_stream(
+            piper_path,
+            allow_empty=args.no_piper_enable,
+            joint_level=args.joint_level,
+        )
+        if replay_arm
+        else None
+    )
+    if replay_arm and piper_stream is None:
+        replay_arm = False
+        print(f"{piper_path} is empty; replaying hand only.")
+    if args.joint_level and piper_stream is not None:
+        from scripts.piper_api.replay_trajectory import validate_joint_continuity
+
+        validate_joint_continuity(piper_stream[1])
+    start_s, end_s = replay_interval(hand_stream, piper_stream)
+    config = build_replay_config(args, active_motors)
+    if hand_stream is not None:
+        replay_motor_ids = active_motors or ()
+        joint_scales = config_values_for_motor_ids(
+            config.follower_joint_command_scales,
+            replay_motor_ids,
+            default=1.0,
+        )
+        joint_offsets = config_values_for_motor_ids(
+            config.follower_joint_command_offsets,
+            replay_motor_ids,
+            default=0.0,
+        )
+        active_motor_set = set(active_motors or ())
+        needs_thumb_model = bool(
+            active_motor_set & set(THUMB_RETARGET_MOTOR_IDS)
+        )
+        thumb_model = (
+            load_thumb_retarget_model(args.thumb_model.expanduser())
+            if args.use_follower and needs_thumb_model
+            else None
+        )
+        hand_stream = prepare_hand_stream_for_replay(
+            hand_stream,
+            active_motors or (),
+            use_follower=args.use_follower,
+            command_scale=config.follower_command_scale,
+            joint_command_scales=joint_scales,
+            joint_command_offsets=joint_offsets,
+            thumb_model=thumb_model,
+            action_scale=ACTION_SCALE,
+            joint_action_scales=JOINT_ACTION_SCALES,
+        )
+
+    hand = None
+    api = None
+    current_recorder: ReplayCurrentRecorder | None = None
+    arm_stop = threading.Event()
+    arm_thread: threading.Thread | None = None
+    arm_errors: list[Exception] = []
+    video_recorder: ReplayVideoRecorder | None = None
+    mocap_recorder: ReplayMocapRecorder | None = None
+    try:
+        if replay_hand:
+            from midas_hand_api import MidasHand
+
+            replay_hand_config = build_replay_hand_config(
+                config.hand_config,
+                config.hand_port,
+                active_motors or (),
+                use_follower=args.use_follower,
+            )
+            hand = MidasHand(config=replay_hand_config, autoconnect=True)
+            verify_connected_hand(
+                hand, role="follower" if args.use_follower else "replay"
+            )
+            hand.configure(enable_torque=False)
+            print("Hand operating mode: pure position control (mode 3)")
+            hand.set_motion_profile(
+                profile_velocity_rad_s=config.follower_profile_velocity_rad_s,
+                profile_acceleration_rad_s2=(
+                    config.follower_profile_acceleration_rad_s2
+                ),
+            )
+            hand.set_positions(hand.read_pos(), clip=True)
+            hand.enable_torque()
+            if args.output_current is not None:
+                current_recorder = ReplayCurrentRecorder(tuple(hand.motor_ids))
+            if args.use_follower:
+                print(f"MIDAS hand connected on {hand.port}")
+            else:
+                print(f"TRIMORPH hand connected on {hand.port}")
+
+        if replay_arm:
+            from scripts.piper_api.piper_api import PiperAPI
+
+            api = PiperAPI(
+                firmware=PIPER_FIRMWARE,
+                interface=PIPER_INTERFACE,
+                channel=PIPER_CHANNEL,
+                installation_pos=PIPER_INSTALLATION_POS,
+                payload=PIPER_PAYLOAD,
+            )
+            api.connect()
+            print("Piper connected:", api.is_ok(), "receive FPS:", api.get_fps())
+            if not api.is_ok():
+                raise RuntimeError("Piper is not responding on the CAN bus")
+            if args.arm_diag:
+                log_piper_diagnostics(api, "connected")
+            if not args.no_piper_enable and not api.enable():
+                raise RuntimeError("Timed out while enabling Piper")
+            if args.arm_diag:
+                log_piper_diagnostics(api, "after-enable")
+            if args.joint_level:
+                from scripts.piper_api.replay_trajectory import POSITION_MODE_SETTLE_S
+
+                api.set_position_mode()
+                time.sleep(POSITION_MODE_SETTLE_S)
+                if args.arm_diag:
+                    log_piper_diagnostics(api, "after-position-mode")
+
+        if api is not None and piper_frame == "relative_to_episode_start" and piper_stream is not None:
+            measured_start = api.get_eef_pose()
+            piper_stream = anchor_relative_piper_stream(piper_stream, measured_start)
+            print(f"Anchored processed relative motion at measured Piper pose: {measured_start}")
+        iteration = 1
+
+        def loop_output(path: Path) -> Path:
+            if args.loop == 1:
+                return path
+            return path.with_name(f"{path.stem}_loop_{iteration:04d}{path.suffix}")
+
+        while args.loop is None or iteration <= args.loop:
+            if args.loop != 1:
+                total = "indefinite" if args.loop is None else str(args.loop)
+                print(f"Replay iteration {iteration} ({total} total); Ctrl-C stops.")
+            if args.output_current is not None:
+                current_recorder = ReplayCurrentRecorder(tuple(hand.motor_ids))
+            move_to_first_pose(hand, api, hand_stream, piper_stream, start_s, args)
+            if args.joint_level and api is not None and piper_stream is not None:
+                from scripts.piper_api.replay_trajectory import verify_joint_start
+
+                verify_joint_start(api, sample_stream(*piper_stream, start_s))
+            if args.arm_diag and api is not None and piper_stream is not None:
+                log_piper_diagnostics(
+                    api,
+                    "after-preposition",
+                    None if args.joint_level else sample_stream(*piper_stream, start_s),
+                )
+            if api is not None:
+                api.set_speed_percent(args.replay_speed_percent)
+
+            if args.output_video is not None:
+                video_recorder = ReplayVideoRecorder(loop_output(args.output_video), config)
+                video_recorder.prepare()
+
+            if args.use_mocap:
+                mocap_recorder = ReplayMocapRecorder(loop_output(args.mocap_output), args.mocap_topics)
+                mocap_recorder.prepare()
+
+            hand_period_s = 1.0 / args.rate_hz
+            current_sample_period_s = 1.0 / CURRENT_TELEMETRY_HZ
+            next_current_sample_s = 0.0
+            wall_start = time.monotonic()
+            wall_duration_s = (end_s - start_s) / args.playback_speed
+            if mocap_recorder is not None:
+                mocap_recorder.start(wall_start, wall_duration_s)
+            if video_recorder is not None:
+                video_recorder.start(wall_start, wall_duration_s)
+            print(
+                f"Replaying {episode_dir} from {start_s:.3f}s to {end_s:.3f}s "
+                f"(hand {args.rate_hz:.1f} Hz, Piper {args.piper_rate_hz:.1f} Hz"
+                + (f", {args.playback_speed:g}x speed over {wall_duration_s:.1f}s" if args.playback_speed != 1 else "")
+                + ")."
+            )
+            if api is not None and piper_stream is not None:
+                def run_arm() -> None:
+                    try:
+                        replay_piper_commands(
+                            api, piper_stream, start_s, end_s, wall_start, args, arm_stop
+                        )
+                    except Exception as exc:
+                        arm_errors.append(exc)
+                        arm_stop.set()
+
+                arm_thread = threading.Thread(target=run_arm, name="piper-replay")
+                arm_thread.start()
+
+            if hand is not None and hand_stream is not None:
+                tick = 0
+                duration_s = end_s - start_s
+                while True:
+                    if mocap_recorder is not None:
+                        mocap_recorder.raise_if_failed()
+                    if video_recorder is not None:
+                        video_recorder.raise_if_failed()
+                    if arm_errors:
+                        raise arm_errors[0]
+                    deadline = wall_start + tick * hand_period_s
+                    sleep_s = deadline - time.monotonic()
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    if arm_errors:
+                        raise arm_errors[0]
+                    replay_elapsed_s = min(
+                        max(time.monotonic() - wall_start, 0.0) * args.playback_speed, duration_s
+                    )
+                    episode_t = start_s + replay_elapsed_s
+                    hand_target = hand.clip_positions(
+                        sample_stream(*hand_stream, episode_t)
+                    )
+                    hand.set_positions(hand_target, clip=True)
+                    sample_current, next_current_sample_s = (
+                        advance_current_sample_schedule(
+                            replay_elapsed_s,
+                            next_current_sample_s,
+                            current_sample_period_s,
+                        )
+                    )
+                    if current_recorder is not None and sample_current:
+                        current_recorder.sample(
+                            hand,
+                            hand_target,
+                            elapsed_s=replay_elapsed_s,
+                        )
+                    if replay_elapsed_s >= duration_s:
+                        break
+                    tick = max(
+                        tick + 1,
+                        math.floor((time.monotonic() - wall_start) / hand_period_s) + 1,
+                    )
+            if arm_thread is not None:
+                while arm_thread.is_alive():
+                    arm_thread.join(timeout=0.05)
+                    if mocap_recorder is not None:
+                        mocap_recorder.raise_if_failed()
+                    if video_recorder is not None:
+                        video_recorder.raise_if_failed()
+                if arm_errors:
+                    raise arm_errors[0]
+            if video_recorder is not None:
+                video_recorder.finish()
+            if current_recorder is not None:
+                output_current_csv(current_recorder, loop_output(args.output_current))
+                current_recorder = None
+            if mocap_recorder is not None:
+                mocap_recorder.raise_if_failed()
+            if mocap_recorder is not None:
+                mocap_recorder.stop()
+                mocap_recorder = None
+            if video_recorder is not None:
+                video_recorder.stop()
+                video_recorder = None
+            print("Replay complete.")
+            iteration += 1
+        return 0
+    except KeyboardInterrupt:
+        if current_recorder is not None and current_recorder.rows:
+            output_current_csv(current_recorder, loop_output(args.output_current))
+        print("\nReplay interrupted.")
+        return 130
+    finally:
+        arm_stop.set()
+        try:
+            if mocap_recorder is not None:
+                mocap_recorder.stop()
+        finally:
+            if video_recorder is not None:
+                video_recorder.stop()
+            if arm_thread is not None:
+                arm_thread.join()
+            if api is not None:
+                api.disconnect()
+            if hand is not None:
+                hand.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
