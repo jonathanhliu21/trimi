@@ -1,0 +1,14 @@
+{
+  "folders": [
+    {
+      "path": "diffusion-policies"
+    },
+    {
+      "path": "trimorph-piper-control"
+    },
+    {
+      "path": "trimorph_hand_api"
+    }
+  ],
+  "settings": {}
+}
