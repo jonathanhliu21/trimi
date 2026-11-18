@@ -1,5 +1,6 @@
 import time
 from collections import deque
+from pathlib import Path
 from typing import Deque, Dict, Optional
 
 import cv2
@@ -43,7 +44,10 @@ class MidasPolicyInference:
             payload = torch.load(f, pickle_module=dill)
         cfg = payload["cfg"]
         workspace_cls = hydra.utils.get_class(cfg._target_)
-        workspace = workspace_cls(cfg)
+        # Standalone inference does not initialize HydraConfig. Some workspaces
+        # (notably the shortcut-policy trainer) resolve output_dir during
+        # construction, so give them an existing directory explicitly.
+        workspace = workspace_cls(cfg, output_dir=str(Path(checkpoint_path).parent))
         workspace.load_payload(payload, exclude_keys=None, include_keys=None)
 
         policy = workspace.model
