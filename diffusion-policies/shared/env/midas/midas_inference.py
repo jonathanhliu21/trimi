@@ -41,8 +41,15 @@ class MidasPolicyInference:
         self.checkpoint_path = checkpoint_path
 
         with open(checkpoint_path, "rb") as f:
-            payload = torch.load(f, pickle_module=dill)
+            payload = torch.load(f, pickle_module=dill, map_location="cpu")
         cfg = payload["cfg"]
+        backbone = cfg.policy.obs_encoder.get("vision_backbone")
+        if (backbone is not None and backbone.get("_target_") ==
+                "shared.vision.dinov3.model_getter.get_dinov3"):
+            # The policy state includes the fine-tuned backbone. Construct its
+            # architecture without reopening the training machine's weight file;
+            # load_payload below strictly restores all model/EMA parameters.
+            backbone.pretrained = False
         workspace_cls = hydra.utils.get_class(cfg._target_)
         # Standalone inference does not initialize HydraConfig. Some workspaces
         # (notably the shortcut-policy trainer) resolve output_dir during
