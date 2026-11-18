@@ -300,19 +300,38 @@ Only the first chunk after the start or a pedal reset is waited for.
 The predictor samples the new chunk with inpainting guidance toward the old
 one (`inference/predictor/rtc.py`): weight 1 on the observation and the d
 actions run before it arrives, exponentially decaying weights over the rest of
-the overlap, 0 after, applied with pseudoinverse guidance (PiGDM) at each of the
-DDIM steps. Each step then also back-propagates through the UNet, so expect a
-longer `infer`. `--rtc-max-guidance` clips the guidance, the paper's beta, and
-`0` disables it (asynchronous execution only). The default is 20. The paper's 5
-was tuned for 5 flow-matching steps; with this 16-step DDIM schedule, a smooth
-Gaussian-process stand-in policy (`tests/test_rtc.py`) shows weaker
-continuations at 5. PiGDM is approximate, so the new chunk follows the old one
+the overlap, 0 after, applied with pseudoinverse guidance (PiGDM) at each sampling
+step. Flow/shortcut policies guide the endpoint estimate `x_t + (1-t) v_t`
+inside the flow integrator, preserving its time and shortcut-distance inputs.
+Diffusion policies retain the DDIM/DDPM guidance path. Unsupported policy
+samplers fail explicitly. Each guided step back-propagates through the UNet,
+so expect a longer `infer`. `--rtc-max-guidance` clips the guidance and `0`
+disables it. The default remains 20 for existing diffusion deployments; start
+with `--rtc-max-guidance 5` when evaluating flow/shortcut policies, especially
+with few sampling steps. PiGDM is approximate, so the new chunk follows the old one
 closely but not exactly. Each takeover prints the delay (and the expected one),
 the step from the last old action to the first new one next to the old chunk's
 own step at that point ("old plan"), and how far the new chunk is from the old
 actions run while it was predicted; `events.csv` keeps the same numbers as
 `rtc_takeover`. In run plots the gray spans then mark inference in flight; the
 arm keeps moving during them.
+
+The executor checks the selected takeover action against the last commanded
+action and stops if the XYZ jump exceeds `MAX_EEF_JUMP_M`, even when all adjacent
+steps inside the new prediction pass validation. This check does not impose
+hand-joint or angular continuity limits.
+
+Deploy `inference/predictor/rtc.py` on the predictor machine together with the
+updated `shortcut_policy/shortcut_model.py` and
+`shortcut_policy/unet_shortcut/unet_image_shortcut_policy.py` from
+`diffusion-policies`. Restart the predictor; existing checkpoints need no
+retraining. Deploy `inference/executor/executor.py` on the robot machine for
+the takeover check. Use `--rtc` without `--async-inference`;
+`--inference-latency-ms` is only used in plain async mode.
+
+RTC still captures observations and performs socket I/O on the control thread;
+it can hold or miss motion deadlines under camera/network delays. The plain
+async mode uses a socket worker, but does not apply RTC guidance.
 
 No hardware performance or policy success is established by unit tests or the
 synthetic link test.

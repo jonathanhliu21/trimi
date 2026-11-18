@@ -1,4 +1,4 @@
-"""Real-time chunking (RTC) for the diffusion policy: each chunk is inpainted onto the previous one.
+"""Real-time chunking (RTC) for flow/shortcut and diffusion policies.
 
 Black, Galliker, Levine 2025, "Real-Time Execution of Action Chunking Flow
 Policies". The executor keeps executing the current chunk while the next one is
@@ -12,7 +12,9 @@ arrives, exponentially decaying weights over the rest of the overlap, and 0
 after it. The new chunk therefore takes over where the old one is, moving the
 same way, and follows its own observation beyond the overlap.
 
-DDIM/DDPM form of the paper's flow-matching guidance: at every denoising step
+Flow/shortcut policies guide endpoint x_t + (1-t) v_t during noise-to-data
+integration, using the policy's existing time and shortcut-distance conditioning.
+DDIM/DDPM policies use the noise-schedule form: at every denoising step
 the denoised chunk x0 is moved by gain * J^T W (target - x0), J = dx0/dx_t. The
 PiGDM gain is 1/sqrt(alpha_bar_t), clipped to max_guidance * sigma_t
 (sigma_t = sqrt(1 - alpha_bar_t)): the paper's guidance-weight clip beta,
@@ -23,6 +25,32 @@ from __future__ import annotations
 import functools
 
 import numpy as np
+
+
+def guided_flow_sample(policy, target, weights, max_guidance, **sample_kwargs):
+    """Guide noise-to-data flow/shortcut velocities using the RTC endpoint VJP.
+
+    Endpoint estimate is x_t + (1-t) v_t. The clipped PiGDM coefficient
+    follows https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/main/src/model.py.
+    Keep the sampler's step-size conditioning, including distance=0 for FM.
+    """
+    import torch
+
+    def velocity(z, t, **model_kwargs):
+        with torch.enable_grad():
+            noisy = z.detach().requires_grad_(True)
+            v = policy.shortcut_model.model(noisy, t, **model_kwargs)
+            time = t.reshape(t.shape[0], *([1] * (z.ndim - 1)))
+            endpoint = noisy + (1 - time) * v
+            (correction,) = torch.autograd.grad(
+                endpoint, noisy, grad_outputs=weights * (target - endpoint))
+        # Sampling never evaluates t=1; clamp only the t=0 singularity.
+        remaining = 1 - time
+        coefficient = (time.square() + remaining.square()) / (time * remaining).clamp_min(1e-8)
+        coefficient = coefficient.clamp(max=max_guidance)
+        return v.detach() + coefficient * correction.detach()
+
+    return policy.shortcut_model.sample_ode_shortcut(velocity_fn=velocity, **sample_kwargs)
 
 
 def guidance_weights(horizon, overlap, frozen):
@@ -81,6 +109,11 @@ class RealTimeChunker:
             raise NotImplementedError("RTC guidance needs a policy with global observation conditioning")
         self.wrapper = wrapper
         self.policy = wrapper.policy
+        self.flow_policy = hasattr(self.policy, "shortcut_model") and callable(
+            getattr(self.policy, "predict_action_shortcut", None))
+        if not self.flow_policy and not (callable(getattr(self.policy, "conditional_sample", None))
+                                         and hasattr(self.policy, "noise_scheduler")):
+            raise NotImplementedError("RTC requires a supported flow/shortcut or diffusion sampler")
         self.to_relative, self.to_absolute = to_relative, to_absolute
         self.policy.requires_grad_(False)  # guidance differentiates only with respect to the noisy chunk
 
@@ -106,13 +139,23 @@ class RealTimeChunker:
                     torch.from_numpy(target).to(policy.device, policy.dtype))
                 weights = torch.as_tensor(guidance_weights(horizon, overlap, min(int(delay) + 1, overlap)),
                                           device=policy.device, dtype=policy.dtype)
-                # predict_action keeps its observation encoding and unnormalization; only sampling changes.
-                policy.conditional_sample = functools.partial(
-                    guided_sample, policy, target[None], weights[None, :, None], float(max_guidance))
-                try:
-                    result = policy.predict_action(obs)
-                finally:
-                    del policy.conditional_sample
+                # Both paths retain the policy's observation encoder and normalizer.
+                sampler = functools.partial(
+                    guided_flow_sample if self.flow_policy else guided_sample,
+                    policy, target[None], weights[None, :, None], float(max_guidance))
+                if self.flow_policy:
+                    result = policy.predict_action_shortcut(obs, sampler=sampler)
+                else:
+                    original = vars(policy).get("conditional_sample")
+                    had_override = "conditional_sample" in vars(policy)
+                    policy.conditional_sample = sampler
+                    try:
+                        result = policy.predict_action(obs)
+                    finally:
+                        if had_override:
+                            policy.conditional_sample = original
+                        else:
+                            del policy.conditional_sample
             else:
                 result = policy.predict_action(obs)
         relative = result["action_pred"][0].detach().cpu().numpy().astype(np.float32)

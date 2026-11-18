@@ -51,7 +51,7 @@ class ShortcutModel:
 
     @torch.no_grad()
     def sample_ode_shortcut(self, z0=None, num_inference_steps=None,
-                            flow_only=False, **model_kwargs):
+                            flow_only=False, velocity_fn=None, **model_kwargs):
         steps = self.num_inference_steps if num_inference_steps is None else num_inference_steps
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
             raise ValueError("num_inference_steps must be a positive integer")
@@ -64,7 +64,8 @@ class ShortcutModel:
         traj = [z.clone()]
         for i in range(steps):
             t = z.new_full((z.shape[0],), i * dt)
-            pred = self.model(z, t, distance=distance, **model_kwargs)
+            velocity = self.model if velocity_fn is None else velocity_fn
+            pred = velocity(z, t, distance=distance, **model_kwargs)
             z = z + pred * dt
             traj.append(z.clone())
         return traj

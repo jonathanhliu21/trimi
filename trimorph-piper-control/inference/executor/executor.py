@@ -1173,6 +1173,9 @@ def run_rtc(args, robot, camera, sock, pedal=None, view=None, log=None):
                     return
                 new, header = reply
                 check_rtc_chunk(args, new, len(chunk))
+                if not check_chunk_jumps(pending["seq"], pending["state"], new,
+                                         filtered_action, m + 1):
+                    return
                 delays.append(m)
                 # The last old action run is chunk[k0 + m]; new[m + 1] follows it.
                 step_mm = np.linalg.norm(new[m + 1, :3] - chunk[k0 + m, :3]) * 1000

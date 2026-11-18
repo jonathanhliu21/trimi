@@ -699,6 +699,17 @@ class InferenceTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parse_args(['--predictor', 'localhost', '--rtc', '--state-anchor', 'measured'])
 
+    def test_rtc_rejects_jump_at_selected_takeover_action(self):
+        old = self.rtc_chunk(0, 6)
+        new = old.copy()
+        # Every step within the prediction passes the 150 mm check, but
+        # switching from old[4] to new[3] would jump 296 mm.
+        new[:, 0] = [.002, .1, .2, .3, .4, .5]
+        executed, _, _, output = self.run_rtc_with(
+            [old, new], [False, False, True], horizon=2)
+        self.assertEqual(executed, [1, 2, 3, 4])
+        self.assertIn('last commanded action', output)
+
     def test_rtc_holds_the_last_target_when_the_old_chunk_runs_out(self):
         chunks = [self.rtc_chunk(c, 4) for c in range(2)]
         executed, _, _, output = self.run_rtc_with(chunks, [False] * 5 + [True], horizon=1)

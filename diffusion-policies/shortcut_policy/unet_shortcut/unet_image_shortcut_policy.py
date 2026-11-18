@@ -118,14 +118,15 @@ class UnetImageShortcutPolicy(nn.Module):
         return self.predict_action_shortcut(obs)
 
     @torch.no_grad()
-    def predict_action_shortcut(self, obs, num_inference_steps=None):
+    def predict_action_shortcut(self, obs, num_inference_steps=None, *, sampler=None):
         steps = self.num_inference_steps if num_inference_steps is None else num_inference_steps
         cond_BG = self._encode_obs(obs)
         z0 = torch.randn(
             (cond_BG.shape[0], self.horizon, self.action_dim_Fa),
             dtype=self.dtype, device=self.device,
         )
-        trajectory = self.shortcut_model.sample_ode_shortcut(
+        sample = self.shortcut_model.sample_ode_shortcut if sampler is None else sampler
+        trajectory = sample(
             z0=z0, num_inference_steps=steps, cond_BG=cond_BG,
             flow_only=self.shortcut_fraction == 0,
         )
