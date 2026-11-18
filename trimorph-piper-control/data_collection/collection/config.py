@@ -71,6 +71,12 @@ PIPER_START_JOINTS_DEG = {
     # Captured from passive can0 joint feedback, 2026-11-06 17:06:24 PST.
     # J1..J6 degrees (CAN millidegrees divided by 1000).
     "home_cube1": (-26.452, 116.559, -78.024, -45.641, 50.068, 76.868),
+    # Captured from passive can0 joint feedback, 2026-11-17 17:49:28 PST.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    # "home_cube_newhw": (-40.798, 105.741, -81.698, -25.353, 60.771, 51.247),
+    # Captured from passive can0 joint feedback, 2026-11-18 13:43:16 PST.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    "home_cube_newhw": (-42.630, 98.166, -69.691, -29.638, 50.366, 55.604),
     # Previous home_unscrew1:
     # "home_unscrew1": (-50.73, 108.65, -58.83, 22.08, 36.01, 28.63),
     # Previous measured start: flange XYZ m (0.227855, -0.244662, 0.176002),
@@ -95,6 +101,10 @@ HAND_START_POSITIONS_RAD = {
     "home_4a": (0.009, -0.004, 0.658, 0.368, 0.012, -0.420, 0.103, 0.018, -0.067, 0.025, 0.022, 0.004, 0.094),
     "home_4b": (-0.004, -0.005, 0.628, 0.374, 0.012, -0.292, 0.050, 0.018, -0.017, -0.037, 0.021, -0.028, 0.030),
     "home_cube1": (-0.019, -0.005, 0.730, 0.238, 0.013, -0.213, 0.077, 0.018, -0.159, 0.025, 0.018, -0.070, 0.100),
+    # Median first synchronized hand sample across all 155
+    # data_trimorph_cube_pick_place_new_hw episodes, 2026-11-18.
+    # Motors 0..12 in leader radians; calibration: xl330_new_hand_transparent.yaml.
+    "home_cube_newhw": (-0.000242, 0.268826, -3.327321, -7.528447, 0.013126, -0.370311, 0.019204, 0.020796, -0.092660, -0.030680, 0.017728, 0.036194, 0.198621),
     "home_unscrew1": (-0.029, -0.137, 0.889, 0.406, 0.015, -1.039, 0.039, 0.013, -0.473, 0.007, -0.152, -0.400, 0.410),
 }
 # home_4c and home_4d were tested with the home_4b hand start.

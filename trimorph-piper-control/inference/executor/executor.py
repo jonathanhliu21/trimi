@@ -54,7 +54,7 @@ MAX_EEF_JUMP_M = 0.15
 ARM_ACTION_EMA_ALPHA = 0.4 # action[:6]: XYZ + rotation vector
 HAND_ACTION_EMA_ALPHA = 0.7  # action[6:]: 13 hand motor positions
 # Multiply hand targets before EMA; arm targets always retain scale 1.0.
-HAND_ACTION_SCALE = 1.03
+HAND_ACTION_SCALE = 1.005
 # --rtc: the expected inference delay is the most actions executed while waiting
 # for any of this many recent replies (the paper's conservative max).
 RTC_DELAY_HISTORY = 10
