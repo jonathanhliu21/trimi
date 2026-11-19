@@ -4,7 +4,8 @@ The control loop calls LivePlot.push() every cycle; it only puts the sample on
 a bounded queue and drops it if the plot falls behind, so drawing never slows
 the loop. Each joint gets a panel with its value over the last few seconds
 (follower-minus-leader angle, or follower current), red where the joint is in
-contact, and dashed lines at +-limit.
+contact, orange where its leader joint is only held because its finger is, and
+dashed lines at +-limit.
 """
 
 from __future__ import annotations
@@ -47,13 +48,17 @@ class LivePlot:
         )
         self.process.start()
 
-    def push(self, t: float, current, feedback) -> None:
+    def push(self, t: float, current, feedback, held=None) -> None:
+        """`feedback`: nonzero where the joint is in contact; `held`: true where its leader joint is held."""
+
         self._pushes += 1
         if self._pushes % 50 == 0 and not self.process.is_alive():
             return  # the window was closed
+        state = (np.asarray(feedback) != 0).astype(np.int8) * 2  # 2 contact, 1 held, 0 free
+        if held is not None:
+            state = np.maximum(state, np.asarray(held, dtype=bool).astype(np.int8))
         try:
-            self.queue.put_nowait((float(t), np.asarray(current, dtype=np.float32),
-                                   np.asarray(feedback) != 0))
+            self.queue.put_nowait((float(t), np.asarray(current, dtype=np.float32), state))
         except queue.Full:
             pass
 
@@ -83,7 +88,7 @@ def plot_main(samples, motor_ids, labels, limit_value, unit, title, window_s) ->
     fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 2.0 * rows), sharex=True, squeeze=False)
     fig.canvas.manager.set_window_title(title)
     limit = 1.15 * limit_value
-    lines, contact_lines = [], []
+    lines, held_lines, contact_lines = [], [], []
     for ax in axes.flat:
         ax.set_visible(False)
     for motor in motor_ids:
@@ -98,6 +103,7 @@ def plot_main(samples, motor_ids, labels, limit_value, unit, title, window_s) ->
         ax.axhline(0.0, color="0.85", lw=0.8)
         ax.tick_params(labelsize=7)
         lines.append(ax.plot([], [], lw=1.0, color="tab:blue")[0])
+        held_lines.append(ax.plot([], [], lw=2.0, color="tab:orange")[0])
         contact_lines.append(ax.plot([], [], lw=2.0, color="tab:red")[0])
     for ax in axes[-1]:
         ax.set_xlabel("s", fontsize=8)
@@ -118,7 +124,7 @@ def plot_main(samples, motor_ids, labels, limit_value, unit, title, window_s) ->
                 break
             if sample is None:
                 plt.close(fig)
-                return lines + contact_lines
+                return lines + held_lines + contact_lines
             t, current, contact = sample
             times.append(t)
             currents.append(current)
@@ -127,10 +133,11 @@ def plot_main(samples, motor_ids, labels, limit_value, unit, title, window_s) ->
             t = np.asarray(times) - times[-1]
             current = np.asarray(currents)
             contact = np.asarray(contacts)
-            for j, (line, contact_line) in enumerate(zip(lines, contact_lines)):
+            for j, (line, held_line, contact_line) in enumerate(zip(lines, held_lines, contact_lines)):
                 line.set_data(t, current[:, j])
-                contact_line.set_data(t, np.where(contact[:, j], current[:, j], np.nan))
-        return lines + contact_lines
+                held_line.set_data(t, np.where(contact[:, j] == 1, current[:, j], np.nan))
+                contact_line.set_data(t, np.where(contact[:, j] == 2, current[:, j], np.nan))
+        return lines + held_lines + contact_lines
 
     fig._animation = FuncAnimation(fig, update, interval=50, blit=True, cache_frame_data=False)
     plt.show()

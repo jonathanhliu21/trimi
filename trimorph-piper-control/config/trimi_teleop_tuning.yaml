@@ -18,15 +18,21 @@ rate_hz: 100
 ramp_s: 2.0
 max_jump_rad: 1.0
 
-# Contact: both of these for contact_hold_ms
+# Contact (error and still: both for contact_hold_ms)
+contact_motors: [0, 2, 4, 5, 7, 8, 10, 11]  # joints watched for contact; a contact still walls its whole finger
 contact_error_rad: 0.02         # leader past the follower by more than this
 contact_still_rad_s: 0.25       # follower slower than this (held back); a slow follower still tracking moves 0.2-0.6
 contact_hold_ms: 20
 contact_current_ma: null        # null: positions only; a number also requires the follower to push that hard
 stop_margin_rad: 0.1            # no feedback this close to the joint's homing stop
+contact_motor_overrides:        # single motors' contact settings over the ones above (error_rad, hold_ms)
+  0: {error_rad: 0.04, hold_ms: 100}          # thumb joint 0 is geared high and lags at the start of a fast move
+  2: {error_rad: 0.04, hold_ms: 60}  
 
 # Wall
 wall_current_ma: 1500            # the wall's holding current on the leader (XL330 limit 1750)
+wall_whole_finger: true         # true: contact on any joint walls the whole finger (thumb 0-3, index 4-6,
+                                #   middle 7-9, ring 10-12); false: each joint on its own
 wall_follow: false              # false: the wall stays where contact began; true: it moves with the follower
 wall_settle_ms: 300             # after contact the wall holds this long, so the leader is brought back to it
 wall_release_rad: 0.01          # let go once the leader is this far out of the wall (the hand opens)
@@ -36,6 +42,8 @@ wall_speed_rad_s: 6.0           # how fast the leader is brought back to a wall 
 wall_p_gain: null               # wall stiffness; null: the leader calibration's (now 2000 / 100 / 400)
 wall_i_gain: null
 wall_d_gain: null
+wall_motor_gains:               # single motors' wall gains over the three above (unset keys keep them)
+  0: {p: 300, i: 0, d: 100}             # thumb joint 0 is geared high: softer (P), and no I winding up against a push
 
 # Joints (uncomment to use)
 # feedback_motors: [0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12]

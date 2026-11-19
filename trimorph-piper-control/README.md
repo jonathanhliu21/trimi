@@ -381,6 +381,12 @@ on an object (the leader meets its own stop there too). `--grasp-only` makes
 the index/middle/ring PIP and MCP (flexion reads negative) count only errors in
 the grasping direction; add `MOTOR=+1`/`MOTOR=-1` for others, e.g.
 `--grasp-only 1=-1` for a thumb joint. The other joints count both directions.
+`--contact-motors` (`contact_motors: [0, 2, 4, 5, 7, 8, 10, 11]`) limits
+contact detection to some joints; the others are still walled with their
+finger. `--contact-motor-overrides MOTOR:error_rad=E,hold_ms=H`
+(`contact_motor_overrides: {0: {error_rad: 0.06}}`) gives single joints their
+own contact error and hold time: thumb joint 0 is geared high and lags at the
+start of a fast move, long enough to pass for contact at the common 0.02 rad.
 
 At contact the leader is stopped where the follower stopped (a wall): the
 joint's own motor holds the leader at the follower's position at contact, in
@@ -396,16 +402,34 @@ the follower moving on freely ends it sooner. After that the wall lets go the
 moment the hand opens: the leader comes `--wall-release-rad` (0.01) out of it,
 or its motor current turns to pull the finger in by `--wall-release-ma` (40).
 At any time it lets go when the follower moves on past it by `--wall-pass-rad`
-(0.03) or faster than the still speed: nothing was there. `--wall-p-gain`/`-i-gain`/`-d-gain` set its stiffness
-(default: the leader calibration's). Out of contact the leader's joints are
-unpowered (torque off), since a powered Dynamixel drags when turned by hand; on
-exit they are left torque off with the calibration's current cap and gains.
+(0.03) or faster than the still speed: nothing was there. `--wall-p-gain`/
+`-i-gain`/`-d-gain` set its stiffness (default: the leader calibration's), and
+`--wall-motor-gains MOTOR:p=P,i=I,d=D` (`wall_motor_gains: {0: {p: 600, i: 0}}`)
+one joint's over them: a joint geared too high to give under the hand (thumb
+joint 0) gets a softer P, and no I, which would wind up against a steady push
+until the wall pushes back with full current.
+
+Walls go up a whole finger at a time (thumb 0-3, index 4-6, middle 7-9, ring
+10-12): while any joint of a finger is in contact, its other joints are held
+too, each at its follower's position, and the hand opening at any of them
+takes the whole finger's walls down. For a held joint not in contact itself,
+opening is judged in its grasping direction, so the PIP/MCP under
+`--grasp-only` can release the finger but an ABAD joint cannot.
+`--no-wall-whole-finger` (`wall_whole_finger: false`) walls each joint on its
+own. Out of contact the leader's joints are unpowered (torque off), since a
+powered Dynamixel drags when turned by hand; on exit they are left torque off
+with the calibration's current cap and gains.
+
+`--log` writes the file when the teleop stops, also on a second Ctrl-C,
+SIGTERM, a closed terminal (SIGHUP) or a failed shutdown; only SIGKILL loses it.
 
 With `--print` each line also shows the loop rate and the bus time per cycle.
 The two hands are read at the same time on their own buses, so a cycle takes
 about as long as the slower read. `--plot` opens a live plot of each joint's
 follower-minus-leader angle (`--plot current` for the follower's current), red
-while in contact, in a separate process that never slows the loop.
+while in contact and orange while held only because the rest of its finger is,
+in a separate process that never slows the loop. `--print` lists both: the
+joints in contact and the leader joints walled.
 
 Every tunable has a long option and a key in `config/trimi_teleop_tuning.yaml`,
 which is read on every run: built-in defaults, then that file (or `--tuning

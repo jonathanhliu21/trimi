@@ -231,6 +231,20 @@ class TeleopLoopTests(unittest.TestCase):
         out = [contact.update(e, 0.0, 0.0, 0.01 * k) for k, e in enumerate(errors)]
         self.assertEqual(out, [0.0, 0.0, -1.0, -1.0, 0.0, 0.0])  # 0.03 alone does not re-enter
 
+    def test_a_joint_can_have_its_own_contact_error_and_hold_time(self):
+        contact = ContactDetector([0, 4], [0, 4], {4: -1}, enter_rad=0.02,
+                                  motor_overrides={0: {"error_rad": 0.06, "hold_ms": 40}})
+        self.assertEqual((contact.detectors[0].enter_rad, contact.detectors[0].persistence_s), (0.06, 0.04))
+        self.assertEqual(contact.detectors[1].enter_rad, 0.02)  # the rest keep the common setting
+        zeros = np.zeros(2)
+        contact.update([0.0, 0.0], zeros, zeros, zeros, 0.0)  # arm
+        found = []
+        for step in range(1, 8):  # the leader runs 0.05 rad ahead of a still follower on both joints
+            found.append(contact.update([0.05, -0.05], zeros, zeros, zeros, 0.01 * step))
+        self.assertEqual(found[-1].tolist(), [0.0, -1.0])  # 0.05 is contact on the index PIP, not on motor 0
+        with self.assertRaisesRegex(ValueError, "detect no contact"):
+            ContactDetector([0, 4], [4], motor_overrides={0: {"error_rad": 0.06}})
+
     def test_a_gap_that_stays_put_is_not_contact(self):
         from scripts.teleop.trimi_teleop import BlockedContact
 
@@ -282,6 +296,16 @@ class TeleopLoopTests(unittest.TestCase):
         self.assertEqual(parse_args(["--no-tuning", "--contact-current-ma", "150"]).contact_current_ma, 150.0)
         with self.assertRaises(SystemExit):
             parse_args(["--no-tuning", "--contact-current-ma", "-5"])
+        self.assertEqual(parse_args(["--no-tuning", "--wall-motor-gains", "0:p=600,i=0", "3:d=100"]).wall_motor_gains,
+                         {0: {"p": 600, "i": 0}, 3: {"d": 100}})
+        for bad in ("0:q=5", "0:p=-1", "x:p=5", "0:p=20000"):
+            with self.assertRaises(SystemExit):
+                parse_args(["--no-tuning", "--wall-motor-gains", bad])
+        self.assertEqual(parse_args(["--no-tuning", "--contact-motor-overrides", "0:error_rad=0.06,hold_ms=60"])
+                         .contact_motor_overrides, {0: {"error_rad": 0.06, "hold_ms": 60.0}})
+        for bad in ("0:error_rad=0", "0:hold_ms=-1", "0:p=5", "0:error_rad=x"):
+            with self.assertRaises(SystemExit):
+                parse_args(["--no-tuning", "--contact-motor-overrides", bad])
 
 
 class TuningFileTests(unittest.TestCase):
@@ -289,13 +313,14 @@ class TuningFileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "tuning.yaml"
             path.write_text("wall_current_ma: 600\ncontact-current-ma: 90\nforce_feedback: true\n"
-                            "grasp_only: {1: -1}\nfollower_p_gain: 1200\n")
+                            "grasp_only: {1: -1}\nfollower_p_gain: 1200\nwall_motor_gains: {0: {p: 600, i: 0}}\n")
             args = parse_args(["--tuning", str(path), "--contact-current-ma", "150"])
             self.assertEqual(args.wall_current_ma, 600)
             self.assertEqual(args.contact_current_ma, 150.0)  # the flag wins
             self.assertTrue(args.force_feedback)
             self.assertEqual(args.grasp_only, {1: -1})
             self.assertEqual(args.follower_p_gain, 1200)
+            self.assertEqual(args.wall_motor_gains, {0: {"p": 600, "i": 0}})
             self.assertEqual(args.tuning, path)
 
     def test_saved_settings_load_back_the_same(self):
@@ -434,6 +459,83 @@ class WallTests(unittest.TestCase):
                           leader_positions=[-0.54, 0.0], leader_currents=[300.0, 0.0])
         self.assertEqual(out[0], 0.0)
 
+    def finger_wall(self):
+        """Index PIP 4, MCP 5, ABAD 6 and middle PIP 7 walled by finger; the index PIP stops on an object."""
+
+        from scripts.teleop.trimi_teleop import FINGER_GROUPS, WallContact
+
+        wall = WallContact([4, 5, 6, 7], [4, 5, 6, 7], {4: -1, 5: -1, 7: -1}, groups=FINGER_GROUPS)
+        zeros = np.zeros(4)
+        free = [-0.5, -0.3, 0.05, -0.4]
+        for k in range(3):
+            wall.update(free, free, zeros, zeros, 0.01 * k, leader_positions=free, leader_currents=zeros)
+        k = 3
+        # the follower PIP stops at -0.5; MCP and ABAD trail the leader by a little, the middle finger is free
+        leader = [-0.6, -0.31, 0.05, -0.41]
+        follower = [-0.5, -0.305, 0.052, -0.41]
+        while not wall.engaged[0]:
+            wall.update(leader, follower, zeros, zeros, 0.01 * k, leader_positions=leader, leader_currents=zeros)
+            k += 1
+        return wall, k, follower
+
+    def test_contact_on_one_joint_walls_its_whole_finger(self):
+        wall, k, follower = self.finger_wall()
+        out = wall.update([-0.5, -0.305, 0.052, -0.41], follower, np.zeros(4), np.zeros(4), 0.01 * k,
+                          leader_positions=[-0.5, -0.305, 0.052, -0.41], leader_currents=np.zeros(4))
+        self.assertEqual(out.tolist(), [-1.0, 0.0, 0.0, 0.0])  # only the PIP is in contact
+        self.assertEqual(wall.engaged.tolist(), [True, True, True, False])  # the index finger is held
+        np.testing.assert_allclose(wall.walls[:3], follower[:3])  # each at its follower's position
+        self.assertTrue(np.isnan(wall.walls[3]))
+
+    def test_the_hand_opening_at_any_joint_of_the_finger_lets_it_all_go(self):
+        zeros = np.zeros(4)
+        held = [-0.5, -0.305, 0.052, -0.41]
+        for leader_positions, leader_currents, opened in (
+                ([-0.5, -0.29, 0.052, -0.41], zeros, True),  # the MCP (not in contact) comes 0.015 rad out
+                ([-0.5, -0.305, 0.052, -0.41], [0.0, -60.0, 0.0, 0.0], True),  # or its motor pulls it in
+                ([-0.5, -0.305, 0.08, -0.41], [0.0, 0.0, 300.0, 0.0], False)):  # ABAD has no opening side
+            wall, k, follower = self.finger_wall()
+            later = 0.01 * k + wall.settle_s
+            out = wall.update(held, follower, zeros, zeros, later,
+                              leader_positions=leader_positions, leader_currents=leader_currents)
+            self.assertEqual(wall.engaged[:3].tolist(), [not opened] * 3)
+            self.assertEqual(out[0], 0.0 if opened else -1.0)
+            if opened:
+                self.assertTrue(np.isnan(wall.walls[:3]).all())
+
+    def test_joints_left_out_of_contact_detection_are_still_walled_with_their_finger(self):
+        from scripts.teleop.trimi_teleop import FINGER_GROUPS, WallContact
+
+        wall = WallContact([4, 5, 6], [4, 5, 6], {4: -1, 5: -1}, groups=FINGER_GROUPS, contact_motor_ids=[4, 5],
+                           enter_rad=0.02)
+        zeros = np.zeros(3)
+        for k in range(3):
+            wall.update([-0.5, -0.3, 0.0], [-0.5, -0.3, 0.0], zeros, zeros, 0.01 * k,
+                        leader_positions=[-0.5, -0.3, 0.0], leader_currents=zeros)
+        # the ABAD (6) is held back 0.1 rad: not watched, no wall
+        for k in range(3, 10):
+            out = wall.update([-0.5, -0.3, 0.1], [-0.5, -0.3, 0.0], zeros, zeros, 0.01 * k,
+                              leader_positions=[-0.5, -0.3, 0.1], leader_currents=zeros)
+        self.assertFalse(wall.engaged.any())
+        # the PIP stops on an object: the whole finger is walled, ABAD included
+        for k in range(10, 17):
+            out = wall.update([-0.6, -0.3, 0.1], [-0.5, -0.3, 0.0], zeros, zeros, 0.01 * k,
+                              leader_positions=[-0.6, -0.3, 0.1], leader_currents=zeros)
+        self.assertEqual(out.tolist(), [-1.0, 0.0, 0.0])
+        self.assertEqual(wall.engaged.tolist(), [True, True, True])
+        with self.assertRaisesRegex(ValueError, "not among the wall motors"):
+            WallContact([4, 5, 6], [4, 5], contact_motor_ids=[6])
+
+    def test_a_finger_wall_comes_down_when_its_last_contact_ends(self):
+        wall, k, follower = self.finger_wall()
+        zeros = np.zeros(4)
+        # the object goes: the follower PIP moves on past its wall
+        moving = np.array([-1.0, 0.0, 0.0, 0.0])
+        out = wall.update([-0.6, -0.305, 0.052, -0.41], [-0.55, -0.305, 0.052, -0.41], moving, zeros, 0.01 * k,
+                          leader_positions=[-0.6, -0.305, 0.052, -0.41], leader_currents=zeros)
+        self.assertEqual(out.tolist(), [0.0] * 4)
+        self.assertFalse(wall.engaged.any())
+
     def test_leader_goal_is_written_before_the_torque_goes_on(self):
         from midas_hand_api.actuators import control_table as ct
 
@@ -441,12 +543,16 @@ class WallTests(unittest.TestCase):
 
         hand = FakeLeaderHand()
         calls = hand.dxl_client.calls
-        wall = LeaderWall(hand, [3, 5, 7], [5, 7], current_ma=700.0, gains={"p": 3000})
+        wall = LeaderWall(hand, [3, 5, 7], [5, 7], current_ma=700.0, gains={"p": 3000},
+                          motor_gains={7: {"p": 600, "i": 0}})
         wall.start()
         self.assertEqual(calls[0], ("torque", False, (5, 7)))
         self.assertIn(("write", ct.ADDR_OPERATING_MODE, (5, 7), (5, 5)), calls)
         self.assertIn(("write", ct.ADDR_GOAL_CURRENT, (5, 7), (700, 700)), calls)
-        self.assertIn(("gains", (5, 7), 3000, None, None), calls)
+        gains = [c for c in calls if c[0] == "gains"]
+        self.assertEqual(gains, [("gains", (5, 7), 3000, None, None), ("gains", (7,), 600, 0, None)])  # then motor 7's
+        with self.assertRaisesRegex(ValueError, "no wall"):
+            LeaderWall(hand, [3, 5, 7], [5, 7], current_ma=700.0, motor_gains={3: {"p": 600}})
         calls.clear()
         nan = float("nan")
         wall.update([False, True, False], [nan, -0.5, nan])  # motor 5: sign -1, offset 2.0 -> raw 2.5

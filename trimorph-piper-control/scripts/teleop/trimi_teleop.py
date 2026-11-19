@@ -34,6 +34,9 @@ put is the follower falling short of its goal, not an object; a gap past twice
 the contact error counts anyway). The motor current does not count by default: it
 mixes gear ratio, moment arm, acceleration and friction, differs from finger
 to finger, and cannot tell a fast move from a light touch.
+--contact-motors limits contact detection to some joints (the others are still
+walled with their finger). --contact-motor-overrides (e.g. 0:error_rad=0.06,hold_ms=60) sets the error
+and hold time of single joints, for one that lags behind more than the rest.
 --contact-current-ma N adds the condition that the follower also pushes
 towards its goal with more than N mA. --grasp-only makes the finger PIP/MCP
 (flexion reads negative), and any MOTOR=+1/-1 given, count only errors in the
@@ -53,15 +56,24 @@ only the follower moving on ends it sooner. After that the wall lets go the
 moment the hand opens: the leader comes out past it by --wall-release-rad, or
 its motor current turns to pull the finger in by more than --wall-release-ma.
 At any time it lets go when the follower moves on past it by --wall-pass-rad
-or faster than --contact-still-rad-s: nothing was there. --wall-p-gain/-i-gain/-d-gain set its
-stiffness (default: the leader calibration's). Out of contact the leader's
-joints are unpowered (torque off): a powered Dynamixel drags when turned by
-hand, most on the geared PIP and MCP joints.
+or faster than --contact-still-rad-s: nothing was there. --wall-p-gain/-i-gain/
+-d-gain set its stiffness (default: the leader calibration's), and
+--wall-motor-gains (e.g. 0:p=600,i=0) a single joint's, for a softer wall on a
+joint geared too high to give under the hand.
+
+Walls go up a whole finger at a time (thumb 0-3, index 4-6, middle 7-9, ring
+10-12): while any of its joints is in contact, the others are held too, each
+at its follower's position, and the hand opening at any of them (judged in the
+grasping direction for a joint not in contact itself) takes them all down.
+--no-wall-whole-finger walls each joint on its own. Out of contact the
+leader's joints are unpowered (torque off): a powered Dynamixel drags when
+turned by hand, most on the geared PIP and MCP joints.
 
 --log saves every cycle (leader angles, follower goals, angles, velocities and
-currents, the feedback) for scripts/teleop/analyze_teleop_log.py. --plot shows
-each joint's follower-minus-leader angle (or with --plot current, the
-follower's current) live in a separate window, red while in contact.
+currents, the joints in contact and the leader joints held) for
+scripts/teleop/analyze_teleop_log.py. --plot shows each joint's follower-minus-leader angle (or with --plot current, the
+follower's current) live in a separate window, red while in contact, orange
+while held only because the rest of its finger is.
 
 The two hands are read at the same time, each on its own bus, so a cycle takes
 about as long as the slower read instead of both.
@@ -101,9 +113,10 @@ TUNING_KEYS = (
     "current_limit_ma", "max_speed_rad_s", "max_acceleration_rad_s2",
     "follower_p_gain", "follower_i_gain", "follower_d_gain", "rate_hz", "ramp_s", "max_jump_rad",
     "contact_error_rad", "contact_current_ma", "contact_still_rad_s", "contact_hold_ms", "stop_margin_rad",
-    "wall_current_ma", "wall_follow", "wall_settle_ms", "wall_release_rad", "wall_release_ma", "wall_pass_rad",
+    "contact_motors", "contact_motor_overrides",
+    "wall_current_ma", "wall_whole_finger", "wall_follow", "wall_settle_ms", "wall_release_rad", "wall_release_ma", "wall_pass_rad",
     "wall_speed_rad_s",
-    "wall_p_gain", "wall_i_gain", "wall_d_gain",
+    "wall_p_gain", "wall_i_gain", "wall_d_gain", "wall_motor_gains",
     "force_feedback", "feedback_motors", "grasp_only", "motors",
     "leader_port", "follower_port", "leader_config", "follower_config", "plot", "plot_window_s", "print",
 )
@@ -129,8 +142,10 @@ DEFAULT_CONTACT_CURRENT_MA = None  # off: contact from positions only
 # Flexion reads negative on the finger PIP and MCP joints (limits about -2.9 .. 0.02).
 FINGER_FLEXION_DIRECTIONS = {4: -1, 5: -1, 7: -1, 8: -1, 10: -1, 11: -1}
 LIMIT_MARGIN_RAD = math.radians(20.0)
+# Motors of each finger: thumb, index, middle, ring (walled together by default).
+FINGER_GROUPS = ((0, 1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12))
 LOG_FIELDS = ("t", "leader", "goal", "position", "velocity", "current", "contact",
-              "leader_velocity", "leader_current")
+              "leader_velocity", "leader_current", "wall")
 
 
 def _by_motor(value, motor_ids: Sequence[int]) -> dict[int, float]:
@@ -258,7 +273,10 @@ class ContactDetector:
                  stops: Mapping[int, tuple[float, int]] | None = None, stop_margin_rad: float = STOP_MARGIN_RAD,
                  enter_rad: float = DEFAULT_CONTACT_ERROR_RAD,
                  enter_current_ma: float | None = DEFAULT_CONTACT_CURRENT_MA,
-                 still_rad_s: float = CONTACT_STILL_RAD_S, persistence_s: float = CONTACT_PERSISTENCE_S):
+                 still_rad_s: float = CONTACT_STILL_RAD_S, persistence_s: float = CONTACT_PERSISTENCE_S,
+                 motor_overrides: Mapping[int, Mapping[str, float]] | None = None):
+        """`motor_overrides` (motor -> error_rad / hold_ms) replace enter_rad / persistence_s for single joints."""
+
         motor_ids = [int(m) for m in motor_ids]
         directions = {int(m): int(d) for m, d in (directions or {}).items()}
         unknown = sorted((set(int(m) for m in feedback_motor_ids) | set(directions)) - set(motor_ids))
@@ -266,10 +284,16 @@ class ContactDetector:
             raise ValueError(f"Force-feedback motors {unknown} are not among the active motors {motor_ids}")
         if any(d not in (-1, 1) for d in directions.values()):
             raise ValueError(f"Grasp directions must be +1 or -1: {directions}")
+        overrides = {int(m): dict(o) for m, o in (motor_overrides or {}).items()}
+        unknown = sorted(set(overrides) - set(int(m) for m in feedback_motor_ids))
+        if unknown:
+            raise ValueError(f"Contact settings given for motors {unknown}, which detect no contact")
         self.detectors = {
             motor_ids.index(int(m)): BlockedContact(
-                directions.get(int(m), 0), enter_rad=enter_rad, enter_current_ma=enter_current_ma,
-                still_rad_s=still_rad_s, persistence_s=persistence_s)
+                directions.get(int(m), 0),
+                enter_rad=float(overrides.get(int(m), {}).get("error_rad", enter_rad)),
+                enter_current_ma=enter_current_ma, still_rad_s=still_rad_s,
+                persistence_s=float(overrides.get(int(m), {}).get("hold_ms", 1000 * persistence_s)) / 1000)
             for m in feedback_motor_ids
         }
         self.armed = np.zeros(len(motor_ids), dtype=bool)
@@ -308,55 +332,101 @@ class WallContact:
     """Contact for the wall: entered like ContactDetector, left when the hand opens.
 
     Once a joint is in contact the leader is held at a wall, so the
-    follower's error no longer says anything; the wall is left when the leader
-    comes out of it by release_rad, when the leader's own current turns to
-    pull the finger into the object by release_ma, or when the follower moves
-    on into the free space faster than still_rad_s or past the wall by
-    pass_rad (nothing was there). For settle_s after contact only the last
-    counts, so the leader is first brought back to the wall.
-    `walls` holds where the leader joints in contact are held: the follower's
-    position when contact began, or with `follow` its position now.
+    follower's error no longer says anything. A joint's contact ends when its
+    follower moves on into the free space faster than still_rad_s or past the
+    wall by pass_rad (nothing was there). The walls come down when the hand
+    opens: a leader joint comes out of its wall by release_rad, or its own
+    current turns to pull the finger in by release_ma, judged on the side
+    pushed into (a held joint not in contact itself: its grasp direction, if
+    it has one). For settle_s after the walls go up only the follower moving
+    on counts, so the leader is first brought back to them.
+
+    `groups` (tuples of motor IDs; default: each joint alone) are walled
+    together: while any joint of a group is in contact, all its joints are
+    held, and the hand opening at any of them takes all its walls down.
+    `walls` holds where the held leader joints are held: the follower's
+    position when they were first held, or with `follow` its position now;
+    `engaged` marks them.
     """
 
     def __init__(self, motor_ids: Sequence[int], feedback_motor_ids: Sequence[int],
                  directions: Mapping[int, int] | None = None, *, release_rad: float = DEFAULT_WALL_RELEASE_RAD,
                  release_ma: float = DEFAULT_WALL_RELEASE_MA, still_rad_s: float = CONTACT_STILL_RAD_S,
                  follow: bool = False, settle_s: float = DEFAULT_WALL_SETTLE_MS / 1000.0,
-                 pass_rad: float = DEFAULT_WALL_PASS_RAD, **detect):
-        self.detect = ContactDetector(motor_ids, feedback_motor_ids, directions, still_rad_s=still_rad_s, **detect)
-        self.indices = sorted(self.detect.detectors)
+                 pass_rad: float = DEFAULT_WALL_PASS_RAD, groups: Sequence[Sequence[int]] | None = None,
+                 contact_motor_ids: Sequence[int] | None = None, **detect):
+        contact_motor_ids = feedback_motor_ids if contact_motor_ids is None else contact_motor_ids
+        outside = sorted(set(int(m) for m in contact_motor_ids) - set(int(m) for m in feedback_motor_ids))
+        if outside:
+            raise ValueError(f"Contact motors {outside} are not among the wall motors {list(feedback_motor_ids)}")
+        self.detect = ContactDetector(motor_ids, contact_motor_ids, directions, still_rad_s=still_rad_s, **detect)
+        motor_ids = [int(m) for m in motor_ids]
+        index = {m: i for i, m in enumerate(motor_ids)}
+        self.indices = sorted(index[int(m)] for m in feedback_motor_ids)
+        walled = set(self.indices)
+        self.groups: list[list[int]] = []  # active wall joints walled together, as indices
+        for group in groups or ():
+            members = sorted(index[int(m)] for m in group if int(m) in index and index[int(m)] in walled)
+            if members and not walled.isdisjoint(members):
+                self.groups.append(members)
+                walled -= set(members)
+        self.groups += [[i] for i in sorted(walled)]
+        self.grasp = np.zeros(len(motor_ids))
+        for m, d in (directions or {}).items():
+            if int(m) in index:
+                self.grasp[index[int(m)]] = float(d)
         self.release_rad, self.release_ma, self.still_rad_s = release_rad, release_ma, still_rad_s
         self.follow = follow
         self.settle_s = float(settle_s)
         self.pass_rad = float(pass_rad)
-        self.since = np.full(len(motor_ids), np.nan)  # when each wall went up
-        self.engaged = np.zeros(len(motor_ids), dtype=bool)
-        self.side = np.zeros(len(motor_ids))
+        self.since = np.full(len(motor_ids), np.nan)  # when each group's walls went up
+        self.engaged = np.zeros(len(motor_ids), dtype=bool)  # leader held at walls[i]
+        self.side = np.zeros(len(motor_ids))  # the side pushed into, per joint in contact
         self.walls = np.full(len(motor_ids), np.nan)
+
+    def _release(self, members) -> None:
+        self.engaged[members], self.side[members] = False, 0.0
+        self.walls[members], self.since[members] = np.nan, np.nan
 
     def update(self, goal, positions, velocities, currents, now_s: float, *, leader_positions,
                leader_currents) -> np.ndarray:
-        """+-1 (the side pushed into) where the leader is held at a wall, 0 elsewhere."""
+        """+-1 (the side pushed into) per joint in contact, 0 elsewhere; `engaged` marks the walls."""
 
         positions = np.asarray(positions, dtype=np.float64)
         found = self.detect.update(goal, positions, velocities, currents, now_s)
-        for i in self.indices:
-            if not self.engaged[i]:
-                if found[i] != 0.0:
-                    self.engaged[i], self.side[i], self.walls[i] = True, found[i], positions[i]
-                    self.since[i] = now_s
+        for members in self.groups:
+            for i in members:
+                side = self.side[i]
+                if side == 0.0:
+                    if found[i] != 0.0:
+                        self.side[i] = found[i]
+                        if not self.engaged[i]:
+                            self.walls[i] = positions[i]
+                elif (side * velocities[i] > self.still_rad_s
+                      or side * (positions[i] - self.walls[i]) > self.pass_rad):
+                    self.side[i] = 0.0  # the follower moved on: nothing there
+                    self.walls[i] = positions[i]  # still held while the group is, from here
+            if not self.side[members].any():
+                self._release(members)
                 continue
-            if self.follow:
-                self.walls[i] = positions[i]
-            side = self.side[i]
-            settling = now_s - self.since[i] < self.settle_s
-            out_of_wall = side * (leader_positions[i] - self.walls[i]) < -self.release_rad
-            pulling_in = side * leader_currents[i] > self.release_ma
-            follower_free = (side * velocities[i] > self.still_rad_s
-                             or side * (positions[i] - self.walls[i]) > self.pass_rad)
-            if follower_free or (not settling and (out_of_wall or pulling_in)):
-                self.engaged[i], self.side[i], self.walls[i], self.since[i] = False, 0.0, np.nan, np.nan
-        return np.where(self.engaged, self.side, 0.0)
+            if not self.engaged[members].any():
+                self.since[members] = now_s  # the walls go up
+            for i in members:
+                if not self.engaged[i]:
+                    self.engaged[i] = True
+                    if np.isnan(self.walls[i]):
+                        self.walls[i] = positions[i]
+                elif self.follow:
+                    self.walls[i] = positions[i]
+            if now_s - self.since[members[0]] < self.settle_s:
+                continue
+            for i in members:
+                side = self.side[i] or self.grasp[i]
+                if side and (side * (leader_positions[i] - self.walls[i]) < -self.release_rad
+                             or side * leader_currents[i] > self.release_ma):
+                    self._release(members)  # the hand opens
+                    break
+        return self.side.copy()
 
 
 class LeaderWall:
@@ -364,7 +434,10 @@ class LeaderWall:
 
     def __init__(self, hand, motor_ids: Sequence[int], feedback_motor_ids: Sequence[int], *,
                  current_ma: float, speed_rad_s: float = DEFAULT_WALL_SPEED_RAD_S,
-                 gains: Mapping[str, int] | None = None):
+                 gains: Mapping[str, int] | None = None,
+                 motor_gains: Mapping[int, Mapping[str, int]] | None = None):
+        """`gains` (p/i/d) for every wall motor, then `motor_gains` (motor -> p/i/d) over them."""
+
         from midas_hand_api.actuators import control_table
 
         self.ct = control_table
@@ -384,6 +457,11 @@ class LeaderWall:
         self.restore_raw = int(hand.config.goal_current_limit / self.unit_ma)
         self.speed_rad_s = float(speed_rad_s)
         self.gains = {k: int(v) for k, v in (gains or {}).items() if v is not None}
+        self.motor_gains = {int(m): {k: int(v) for k, v in g.items() if v is not None}
+                            for m, g in (motor_gains or {}).items()}
+        unknown = sorted(set(self.motor_gains) - set(self.ids))
+        if unknown:
+            raise ValueError(f"Wall gains given for motors {unknown}, which get no wall (wall motors {self.ids})")
         self.powered: set[int] = set()
         self.started = False
 
@@ -399,6 +477,9 @@ class LeaderWall:
         self._write(self.ids, [self.current_raw] * len(self.ids), ct.ADDR_GOAL_CURRENT, ct.LEN_GOAL_CURRENT)
         if self.gains:
             self.hand.set_gains(self.ids, **self.gains)
+        for motor, gains in self.motor_gains.items():
+            if gains:
+                self.hand.set_gains([motor], **gains)
         self.hand.set_motion_profile(profile_velocity_rad_s=self.speed_rad_s, motor_ids=self.ids)
         self.started = True
 
@@ -460,8 +541,9 @@ def teleop_loop(
     their own buses, and the follower's state is compared with the goal it was
     following, the one sent the cycle before. `send_feedback(leader_angles,
     leader_velocities, feedback, dt)` gets the contact feedback (and may return
-    the leader currents it sent); `log` collects LOG_FIELDS and
-    `monitor(t, current, error, feedback)` sees every cycle. Follower currents
+    the leader currents it sent); `log` collects LOG_FIELDS ("contact": the
+    side each joint in contact pushes into, "wall": 1 where the leader is
+    held) and `monitor(t, current, error, feedback)` sees every cycle. Follower currents
     are multiplied by `current_signs` (its joint signs) so they share the
     angles' direction.
     """
@@ -481,6 +563,7 @@ def teleop_loop(
     last_time = t0
     last_goal = start.copy()  # what the follower is following
     feedback = np.zeros_like(start)
+    held = np.zeros_like(start)  # leader joints held at a wall
     leader_velocity = np.zeros_like(start)
     leader_current = np.zeros_like(start)
     cycles = 0
@@ -521,6 +604,7 @@ def teleop_loop(
                 if contact is not None and alpha >= 1.0:
                     feedback = contact.update(last_goal, measured, velocity, current, now,
                                               leader_positions=positions, leader_currents=leader_measured_current)
+                    held = np.asarray(contact.engaged, dtype=np.float64)
                     leader_current = leader_measured_current
                     if send_feedback is not None:
                         sent = send_feedback(positions, leader_velocity, feedback, now - last_time)
@@ -529,7 +613,7 @@ def teleop_loop(
                 error = measured - last_goal
                 if log is not None:
                     values = (now - t0, positions, last_goal, measured, velocity, current, feedback,
-                              leader_velocity, leader_current)
+                              leader_velocity, leader_current, held)
                     for name, value in zip(LOG_FIELDS, values):
                         log.setdefault(name, []).append(np.array(value, dtype=np.float64))
                 if monitor is not None:
@@ -538,11 +622,13 @@ def teleop_loop(
                     degrees = np.degrees(error)
                     worst = int(np.abs(degrees).argmax())
                     in_contact = [int(i) for i in np.nonzero(feedback)[0]]
+                    walled = [int(i) for i in np.nonzero(held)[0]]
                     timing = (f" | loop {len(busy) / print_period_s:.0f} Hz, busy {1000 * np.mean(busy):.1f}"
                               f"/{1000 * np.max(busy):.1f} ms mean/max" if busy and cycles >= len(busy) else "")
                     print("leader deg " + " ".join(f"{v:+5.0f}" for v in np.degrees(positions))
                           + f" | worst error {degrees[worst]:+.1f} deg (index {worst})"
-                          + (f" | contact {in_contact}" if contact is not None else "") + timing, flush=True)
+                          + (f" | contact {in_contact} wall {walled}" if contact is not None else "") + timing,
+                          flush=True)
                     busy.clear()
                     next_print = now + print_period_s
             follower.set_positions(goal, clip=True)
@@ -609,6 +695,7 @@ def run(args: argparse.Namespace) -> int:
     follower_config = load_hand_config(args.follower_config, follower_port, args.motors)
     motor_ids = [int(m) for m in follower_config.motor_ids]
     feedback_motors = motor_ids if args.feedback_motors is None else [int(m) for m in args.feedback_motors]
+    contact_motors = feedback_motors if args.contact_motors is None else [int(m) for m in args.contact_motors]
     current_ma = min(args.current_limit_ma, follower_config.goal_current_limit)
     directions = None
     if args.grasp_only is not None:
@@ -623,9 +710,11 @@ def run(args: argparse.Namespace) -> int:
             motor_ids, feedback_motors, directions, release_rad=args.wall_release_rad,
             release_ma=args.wall_release_ma, still_rad_s=args.contact_still_rad_s, follow=args.wall_follow,
             settle_s=args.wall_settle_ms / 1000.0, pass_rad=args.wall_pass_rad,
+            groups=FINGER_GROUPS if args.wall_whole_finger else None,
             stops=homing_stop_readings(raw["follower"]), stop_margin_rad=args.stop_margin_rad,
             enter_rad=args.contact_error_rad, enter_current_ma=args.contact_current_ma,
-            persistence_s=args.contact_hold_ms / 1000.0)
+            persistence_s=args.contact_hold_ms / 1000.0, motor_overrides=args.contact_motor_overrides,
+            contact_motor_ids=contact_motors)
     print(f"Leader   {leader_port}\n         {args.leader_config}\n"
           f"Follower {follower_port}\n         {args.follower_config}\n"
           f"Motors {motor_ids}; follower current cap {current_ma:.0f} mA, "
@@ -633,9 +722,14 @@ def run(args: argparse.Namespace) -> int:
     if contact is not None:
         pushing = ("" if args.contact_current_ma is None
                    else f" and pushing with over {args.contact_current_ma:g} mA")
-        print(f"Contact: follower under {args.contact_still_rad_s:g} rad/s and over {args.contact_error_rad:g} rad "
-              f"short of its goal{pushing} for {args.contact_hold_ms:g} ms")
-        print(f"Wall on motors {feedback_motors}: the leader held at the follower's "
+        print(f"Contact on motors {contact_motors}: follower under {args.contact_still_rad_s:g} rad/s and over {args.contact_error_rad:g} rad "
+              f"short of its goal{pushing} for {args.contact_hold_ms:g} ms" + "".join(
+                  f"; motor {m}: over {o.get('error_rad', args.contact_error_rad):g} rad for "
+                  f"{o.get('hold_ms', args.contact_hold_ms):g} ms"
+                  for m, o in sorted((args.contact_motor_overrides or {}).items())))
+        print(f"Wall on motors {feedback_motors}"
+              + (", a whole finger at a time" if args.wall_whole_finger else ", joint by joint")
+              + ": the leader held at the follower's "
               f"{'current position' if args.wall_follow else 'position at contact'} with up to "
               f"{args.wall_current_ma:g} mA, back to it at {args.wall_speed_rad_s:g} rad/s and held "
               f"{args.wall_settle_ms:g} ms; then let go when it comes {args.wall_release_rad:g} rad out or pulls in "
@@ -645,6 +739,9 @@ def run(args: argparse.Namespace) -> int:
 
     leader = follower = feedback_controller = plot = None
     log: dict[str, list] | None = {} if args.log else None
+    if log is not None:
+        print(f"Logging every cycle to {args.log.resolve()} (written when it stops)")
+    _stop_on_signals()  # closing the terminal or kill: stop like Ctrl-C, so the hands go off and the log is kept
     try:
         if args.plot:
             from scripts.teleop.live_plot import LivePlot
@@ -687,11 +784,19 @@ def run(args: argparse.Namespace) -> int:
                 leader, motor_ids, feedback_motors, current_ma=args.wall_current_ma,
                 speed_rad_s=args.wall_speed_rad_s,
                 gains={"p": args.wall_p_gain, "i": args.wall_i_gain, "d": args.wall_d_gain},
+                motor_gains=args.wall_motor_gains,
             )
             feedback_controller.start()
+            base = {k: v if v is not None else default for k, v, default in (
+                ("p", args.wall_p_gain, leader_config.position_p_gain),
+                ("i", args.wall_i_gain, leader_config.position_i_gain),
+                ("d", args.wall_d_gain, leader_config.position_d_gain))}
+            print("Wall gains P {p} I {i} D {d}".format(**base) + "".join(
+                "; motor {} P {p} I {i} D {d}".format(m, **{**base, **g})
+                for m, g in sorted((args.wall_motor_gains or {}).items())))
 
             def send_feedback(leader_angles, leader_velocities, found, dt):
-                feedback_controller.update(found != 0, contact.walls)
+                feedback_controller.update(contact.engaged, contact.walls)
 
         follower.set_current_limit(int(round(current_ma)))
         follower.set_motion_profile(
@@ -710,30 +815,64 @@ def run(args: argparse.Namespace) -> int:
             current_signs=follower.config.joint_signs_array, leader_current_signs=leader.config.joint_signs_array,
             log=log,
             monitor=None if plot is None else (
-                (lambda t, current, error, feedback: plot.push(t, np.degrees(error), feedback))
-                if args.plot == "error" else (lambda t, current, error, feedback: plot.push(t, current, feedback))),
+                lambda t, current, error, feedback: plot.push(
+                    t, np.degrees(error) if args.plot == "error" else current, feedback,
+                    None if contact is None else contact.engaged)),
         )
         print(f"Stopped after {cycles} cycles.")
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
-        if follower is not None:
-            follower.shutdown()
-        if feedback_controller is not None:
+        # Each step runs whatever the one before did (an error, a second Ctrl-C), and the log is saved last.
+        failed = []
+        for name, part, method in (("follower", follower, "shutdown"), ("leader wall", feedback_controller, "shutdown"),
+                                   ("leader", leader, "shutdown"), ("plot", plot, "close")):
+            if part is None:
+                continue
             try:
-                feedback_controller.shutdown()
-            except Exception as exc:  # still switch the leader off below
-                print(f"Warning: {exc}", file=sys.stderr)
-        if leader is not None:
-            leader.shutdown()
-        print("Both hands' torque is off.")
-        if plot is not None:
-            plot.close()
+                getattr(part, method)()
+            except BaseException as exc:
+                failed.append(name)
+                _say(f"Warning: {name} shutdown: {exc!r}", file=sys.stderr)
+        if leader is not None or follower is not None:
+            _say("Both hands' torque is off." if not {"follower", "leader"} & set(failed)
+                 else f"Check the hands: {', '.join(failed)} shutdown failed.")
         if log:
-            save_log(args.log, log, motor_ids, rate_hz=args.rate_hz, current_limit_ma=current_ma,
-                     force_feedback=args.force_feedback, ramp_s=args.ramp_s)
-            print(f"Saved {len(log['t'])} cycles to {args.log}")
+            for attempt in range(3):  # a Ctrl-C while saving tries again
+                try:
+                    save_log(args.log, log, motor_ids, rate_hz=args.rate_hz, current_limit_ma=current_ma,
+                             force_feedback=args.force_feedback, ramp_s=args.ramp_s)
+                    _say(f"Saved {len(log['t'])} cycles to {args.log.resolve()}")
+                    break
+                except KeyboardInterrupt:
+                    _say("Still saving the log...", file=sys.stderr)
     return 0
+
+
+def _say(*args, **kwargs) -> None:
+    """print, but never fail on a terminal that has gone away."""
+
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
+
+def _stop_on_signals() -> None:
+    """SIGTERM and SIGHUP (the terminal closed) raise KeyboardInterrupt, as Ctrl-C does."""
+
+    import signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
 
 
 def _current_or_off(text: str) -> float | None:
@@ -775,7 +914,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-feedback", action="store_true",
                         help="push back on leader joints whose follower joint is in contact")
     parser.add_argument("--feedback-motors", type=int, nargs="+",
-                        help="motor IDs that get force feedback (default: all active)")
+                        help="motor IDs whose leader joint gets a wall (default: all active)")
+    parser.add_argument("--contact-motors", type=int, nargs="+",
+                        help="motor IDs whose follower joint is watched for contact, among the wall motors; "
+                             "with --wall-whole-finger a contact still walls the whole finger "
+                             "(default: all wall motors)")
     parser.add_argument("--grasp-only", nargs="*", metavar="MOTOR=SIGN",
                         help="count only the grasping direction: the finger PIP/MCP (flexion negative), "
                              "plus any MOTOR=+1/-1 given (e.g. thumb joints)")
@@ -789,10 +932,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="the follower counts as held back below this speed (default: %(default)g)")
     parser.add_argument("--contact-hold-ms", type=float, default=1000 * CONTACT_PERSISTENCE_S,
                         help="how long the contact conditions must hold (default: %(default)g)")
+    parser.add_argument("--contact-motor-overrides", nargs="+", metavar="MOTOR:error_rad=E,hold_ms=H",
+                        help="contact error and hold time for single motors, e.g. 0:error_rad=0.06 for a joint "
+                             "that lags behind (default: none)")
     parser.add_argument("--stop-margin-rad", type=float, default=STOP_MARGIN_RAD,
                         help="no feedback within this of the joint's homing stop (default: %(default)g)")
     parser.add_argument("--wall-current-ma", type=float, default=DEFAULT_WALL_CURRENT_MA,
                         help="the wall's holding current on the leader (default: %(default)g; XL330 limit 1750)")
+    parser.add_argument("--wall-whole-finger", action=argparse.BooleanOptionalAction, default=True,
+                        help="a wall on any joint of a finger holds all that finger's joints, and the hand "
+                             "opening at any of them lets them all go; --no-wall-whole-finger walls each "
+                             "joint on its own")
     parser.add_argument("--wall-follow", action="store_true",
                         help="wall: move with the follower while in contact instead of staying where contact began")
     parser.add_argument("--wall-settle-ms", type=float, default=DEFAULT_WALL_SETTLE_MS,
@@ -810,6 +960,9 @@ def build_parser() -> argparse.ArgumentParser:
     for gain in ("p", "i", "d"):
         parser.add_argument(f"--wall-{gain}-gain", type=int,
                             help=f"wall: leader position {gain.upper()} gain (default: the leader calibration's)")
+    parser.add_argument("--wall-motor-gains", nargs="+", metavar="MOTOR:p=P,i=I,d=D",
+                        help="wall gains for single motors over --wall-p/i/d-gain, e.g. 0:p=600,i=0 for a "
+                             "softer wall on a high-ratio joint (default: none)")
     parser.add_argument("--log", type=Path, help="save every cycle to this .npz")
     parser.add_argument("--plot", nargs="?", const="error", choices=("error", "current"),
                         help="live plot per joint: 'error' (follower minus leader, deg; the default) or "
@@ -837,6 +990,9 @@ def load_tuning(path: Path, parser: argparse.ArgumentParser) -> dict:
         if name not in known:
             unknown.append(str(key))
             continue
+        if name in ("wall_motor_gains", "contact_motor_overrides") and isinstance(value, Mapping):  # {0: {p: 600}}
+            value = [f"{m}:" + ",".join(f"{k}={v}" for k, v in (gains or {}).items())
+                     for m, gains in value.items()]
         if name == "grasp_only":  # true / {} = the finger defaults, a mapping or MOTOR=SIGN list adds joints
             if value is True:
                 value = []
@@ -862,6 +1018,8 @@ def save_tuning(path: Path, args: argparse.Namespace) -> None:
             value = str(value)
         if key == "grasp_only" and value is not None:
             value = {int(m): int(d) for m, d in value.items()}
+        if key in ("wall_motor_gains", "contact_motor_overrides") and value is not None:
+            value = {int(m): dict(g) for m, g in value.items()}
         values[key] = value
     header = ("# Tuning for scripts/teleop/trimi_teleop.py (--tuning FILE). Keys are the long option names;\n"
               "# command-line flags override them. Angles are motor radians.\n")
@@ -926,6 +1084,32 @@ def parse_args(argv=None) -> argparse.Namespace:
             if pairs[int(motor)] not in (-1, 1):
                 parser.error(f"--grasp-only takes MOTOR=+1 or MOTOR=-1, not {item!r}")
         args.grasp_only = pairs
+    per_motor = (
+        ("wall_motor_gains", "MOTOR:p=P,i=I,d=D (gains 0-16383)",
+         {k: (int, lambda v: 0 <= v <= 16383) for k in ("p", "i", "d")}),
+        ("contact_motor_overrides", "MOTOR:error_rad=E,hold_ms=H (E positive, H not negative)",
+         {"error_rad": (float, lambda v: math.isfinite(v) and v > 0),
+          "hold_ms": (float, lambda v: math.isfinite(v) and v >= 0)}),
+    )
+    for name, usage, keys in per_motor:
+        items = getattr(args, name)
+        if items is None:
+            continue
+        settings: dict[int, dict] = {}
+        for item in items:
+            try:
+                motor, _, rest = str(item).partition(":")
+                entry = settings.setdefault(int(motor), {})
+                for pair in filter(None, rest.split(",")):
+                    key, text = pair.split("=")
+                    cast, valid = keys[key.strip().lower()]
+                    value = cast(text)
+                    if not valid(value):
+                        raise ValueError
+                    entry[key.strip().lower()] = value
+            except (ValueError, KeyError):
+                parser.error(f"--{name.replace('_', '-')} takes {usage}, not {item!r}")
+        setattr(args, name, settings)
     args.leader_config = Path(args.leader_config).expanduser()
     args.follower_config = Path(args.follower_config).expanduser()
     if args.log is not None:
