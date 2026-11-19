@@ -368,6 +368,66 @@ outside their limits (a power cycle can shift a joint by a turn; home again).
 A leader reading that jumps more than `--max-jump-rad` in one cycle stops it,
 and both hands' torque is off on exit.
 
+`--force-feedback`: a follower joint is in contact when, for 20 ms, it is still
+(under `--contact-still-rad-s`, 0.25; a slow follower still tracking moves at
+0.2-0.6) and the leader is more than `--contact-error-rad` (0.04) past it and
+still pulling away from it. A gap that stays put is the follower falling short
+of its goal, not an object; one past twice the contact error counts anyway. The motor current does not count by default: it mixes gear ratio, moment
+arm, acceleration and friction, differs from finger to finger, and cannot tell
+a fast move from a light touch. `--contact-current-ma N` adds the condition
+that the follower also pushes towards its goal with more than N mA. A follower
+within 0.1 rad of the stop homing found for that joint is at its own stop, not
+on an object (the leader meets its own stop there too). `--grasp-only` makes
+the index/middle/ring PIP and MCP (flexion reads negative) count only errors in
+the grasping direction; add `MOTOR=+1`/`MOTOR=-1` for others, e.g.
+`--grasp-only 1=-1` for a thumb joint. The other joints count both directions.
+
+At contact the leader is stopped where the follower stopped (a wall): the
+joint's own motor holds the leader at the follower's position at contact, in
+current-based position mode with up to `--wall-current-ma` (700; the XL330
+allows 1750), its internal loop far stiffer than the 100 Hz teleop loop could
+render. The wall stays there (`--wall-follow` moves it with the follower, so a
+soft object gives, but so do the follower's flex and gear play), and the
+follower keeps following the leader, so pressing harder bends the leader
+slightly past the wall and the follower squeezes harder. For the first
+`--wall-settle-ms` (120) the wall holds whatever the hand does, so the leader is
+brought back to where the follower stopped, at `--wall-speed-rad-s` (3); only
+the follower moving on freely ends it sooner. After that the wall lets go the
+moment the hand opens: the leader comes `--wall-release-rad` (0.01) out of it,
+or its motor current turns to pull the finger in by `--wall-release-ma` (40).
+At any time it lets go when the follower moves on past it by `--wall-pass-rad`
+(0.03) or faster than the still speed: nothing was there. `--wall-p-gain`/`-i-gain`/`-d-gain` set its stiffness
+(default: the leader calibration's). Out of contact the leader's joints are
+unpowered (torque off), since a powered Dynamixel drags when turned by hand; on
+exit they are left torque off with the calibration's current cap and gains.
+
+With `--print` each line also shows the loop rate and the bus time per cycle.
+The two hands are read at the same time on their own buses, so a cycle takes
+about as long as the slower read. `--plot` opens a live plot of each joint's
+follower-minus-leader angle (`--plot current` for the follower's current), red
+while in contact, in a separate process that never slows the loop.
+
+Every tunable has a long option and a key in `config/trimi_teleop_tuning.yaml`,
+which is read on every run: built-in defaults, then that file (or `--tuning
+FILE`, or none with `--no-tuning`), then the command line. The follower's
+position P/I/D gains can be overridden there too (`follower_p_gain`, ...).
+`--save-tuning FILE` writes the settings a command line amounts to and exits,
+so a tuned command line can be kept as a file.
+
+How well the follower's current alone shows contact can be measured: record a
+run with free motion only and one pushing the follower on a rigid object, then
+compare them:
+
+```bash
+python3 scripts/teleop/trimi_teleop.py ... --log free.npz      # move freely, touch nothing
+python3 scripts/teleop/trimi_teleop.py ... --log contact.npz   # squeeze an object, light to firm
+python3 scripts/teleop/analyze_teleop_log.py --free free.npz --contact contact.npz
+```
+
+Per joint it prints the free-motion current, the floor left after a fitted
+friction/motion model, the contact current, mA per radian of push, and how far
+past first contact the leader must push before the current clears the floor.
+
 ## 6. Episode replay and current logging
 
 Replay the latest episode on TRIMORPH and PiperX (or supply an episode number,
