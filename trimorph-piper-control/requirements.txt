@@ -1,4 +1,5 @@
 numpy
+mujoco>=3.2  # scripts/sim (MjSpec)
 scipy
 matplotlib
 opencv-python

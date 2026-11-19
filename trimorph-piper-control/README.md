@@ -43,6 +43,8 @@ cp config/hand.example.yaml config/hand.yaml
 | `data_collection/` | `collect_hand_only.py`, `replay_episode.py`, and collection documentation |
 | `data_collection/collection/` | Shared runtime configuration, episode storage, workers, contact detection, and retargeting |
 | `scripts/thumb_retargeting/` | Paired thumb calibration and model fitting |
+| `scripts/sim/` | TriMI MuJoCo model builder and the 1:1 hand-to-sim mirror |
+| `scripts/teleop/` | TriMI-to-TriMI 1:1 joint teleoperation and Quest-to-Piper teleoperation |
 | `scripts/motion_smoothness/` | Deterministic joint motion tests |
 | `scripts/tracking_error/` | Leader/follower tracking diagnostics |
 | `scripts/dataset/` | Piper-only postprocessing base and dataset validation (`data_collection/postprocess_dataset.py` extends it) |
@@ -332,6 +334,40 @@ python3 data_collection/collect_hand_only.py \
   --disable-force-feedback-motors 8
 ```
 
+## 5b. TriMI leader to TriMI follower (1:1 joints)
+
+Two identical TriMI hands, each on its own adapter (both use motor IDs 0-12,
+so they cannot share a bus). Home each hand into its own calibration, the
+follower from the leader's file so both use the same homing table and read
+the same angle in the same pose. Take the hands off and keep the fingers
+clear while homing:
+
+```bash
+TRIMI_LIVE=~/TriMI-Copilot/.venv/bin/trimi-live
+$TRIMI_LIVE home --hand-port /dev/serial/by-id/<LEADER> \
+  --out ~/.config/trimi-copilot/hand_leader.yaml
+$TRIMI_LIVE home --hand-config ~/.config/trimi-copilot/hand_leader.yaml \
+  --hand-port /dev/serial/by-id/<FOLLOWER> --out ~/.config/trimi-copilot/hand_follower.yaml
+```
+
+Then teleoperate. The leader is unpowered and moved by hand; its calibrated
+joint angles go unchanged to the follower:
+
+```bash
+python3 scripts/teleop/trimi_teleop.py \
+  --leader-port /dev/serial/by-id/<LEADER> \
+  --follower-port /dev/serial/by-id/<FOLLOWER> --print
+```
+
+The follower eases onto the leader's pose over `--ramp-s` (2 s), then follows
+at `--rate-hz` (100). Its goals are clipped to its joint limits, its current is
+capped at `--current-limit-ma` (400 mA) and its speed at `--max-speed-rad-s`
+(6). The script refuses calibrations with different motor IDs, joint signs or
+homing tables, a follower file that was never homed, and joints reading far
+outside their limits (a power cycle can shift a joint by a turn; home again).
+A leader reading that jumps more than `--max-jump-rad` in one cycle stops it,
+and both hands' torque is off on exit.
+
 ## 6. Episode replay and current logging
 
 Replay the latest episode on TRIMORPH and PiperX (or supply an episode number,
@@ -506,6 +542,51 @@ python3 scripts/tracking_error/get_tracking_error.py --help
 
 Tracking diagnostics write to `output/tracking_error/` by default. Motion
 smoothness tests use the local calibrated `config/one_finger_test.yaml`.
+
+## TriMI in MuJoCo (1:1 mirror)
+
+Build the MuJoCo model once from the Onshape URDF export (zip, folder, or
+`.urdf`). It is written to `assets/trimi_v2/`, which is not tracked:
+
+```bash
+python3 scripts/sim/build_trimi_sim_model.py ../TRIMI_URDF_v2.zip
+```
+
+The export does not load into MuJoCo as is: the palm mesh exceeds MuJoCo's
+200,000-face STL limit, every part was exported at 1 kg/m^3 (masses about 1000x
+too small), and there is no collision geometry. The builder fixes these and
+prints the joint chains it found.
+
+Then move the hand and watch the model follow. The motors stay torque-disabled.
+By default the script reads the calibration `trimi-live home` saves
+(`~/.config/trimi-copilot/hand.yaml`) and the only adapter in
+`/dev/serial/by-id`; pass `--hand-config` / `--hand-port` otherwise:
+
+```bash
+python3 scripts/sim/trimi_mirror.py
+```
+
+`config/trimi_v2_joint_map.yaml` gives each motor's URDF joint as
+`q_urdf = sign * scale * (q_leader - zero)`. MCP and PIP use scale 34/84: a
+34-tooth gear on the motor drives an 84-tooth sector on the next link. ABAD and
+thumb joints are direct (scale 1).
+
+The zeros synchronize the model with the hand at the hard stops that homing
+drives into. Homing leaves each motor reading `-joint_sign * cad_offset` at its
+stop; `sync_hard_stops.py` turns the same joint in the URDF until its link meets
+the palm or the links it is mounted on (the motor horn, drive gears and other
+fingers are ignored, as in homing) and sets the zero so both agree. The zeros
+depend on the homing table, not on the offsets a homing measures, so re-run it
+only when the table changes (`--reverse`, `--zero-here`, `--stop-deg`) or a
+sign is flipped:
+
+```bash
+python3 scripts/sim/sync_hard_stops.py --source ../TRIMI_URDF_v2.zip --write
+```
+
+Without `--source` it uses the model's decimated meshes (within about 0.5 deg).
+A joint that homes against a false stop (held or blocked) reads wrong in both
+the hand's own tools and the model; re-homing it fixes both.
 
 ## Important shared modules
 
