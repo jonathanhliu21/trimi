@@ -286,16 +286,36 @@ python inference/executor/executor.py --predictor GPU_HOST --rtc
 The predictor returns the whole prediction horizon (16 actions), and the executor
 runs each chunk from index 1, one action per period. Once `--rtc-horizon`
 (default 8) of its actions have run, it sends the next observation right after
-commanding action k0, without stopping: the observed arm pose is that raw
-policy action (so the new chunk shares the old one's frame; `--rtc` therefore
-requires `--state-anchor command`), and the request carries the rest of the
-chunk from k0 on plus the expected delay d, the most actions run while waiting
-for any of the last 10 replies. If the arm is beyond `--anchor-max-mm` /
-`--anchor-max-deg` from that action, the measured pose is sent with no chunk,
+commanding action k0, without stopping. The arm reference matches plain async
+and synchronous execution: `RobotIO.read_state()` uses the last filtered/
+reachable commanded pose, after EMA, IK and joint-speed limiting. In joint mode
+this is FK of the action's joint endpoint; in Cartesian mode it is the filtered
+Cartesian command. The arm pose is used for relative-to-absolute action
+conversion, not as a neural-network observation input. `--rtc` still requires
+`--state-anchor command`.
+
+The request carries the previous absolute targets from k0 on plus the expected
+delay d, the most actions run while waiting for any of the last 10 replies.
+The predictor expresses those targets relative to the new reference using the
+existing SE(3) conversion. It does not shift the old absolute trajectory to a
+new location or filter the overlap a second time. A difference between the
+filtered reference and the raw plan does not discard overlap guidance.
+
+The fallback check also matches plain async: if measured pose is beyond
+`--anchor-max-mm` / `--anchor-max-deg` from that commanded pose,
+the measured pose is sent with no overlap,
 so the policy replans from the arm instead of continuing the plan. The arm keeps executing the old chunk. The reply takes over at the
 first period after it arrives, at index m + 1 after m more old actions. If the
 old chunk runs out first, the arm holds its last target ("starved" in the log).
 Only the first chunk after the start or a pedal reset is waited for.
+
+`state` events report `command; measured off ...` during normal tracking, and
+`measured; FALLBACK ...` when the translation or orientation tracking threshold
+is exceeded. Reference selection is changed only in the RTC request path;
+plain async and synchronous behavior are unchanged. No predictor logic update
+is required. This reference correction does not establish that all release
+overtravel is fixed; compare with `--rtc-max-guidance 0` to isolate the reference
+from overlap guidance, which still favors the old absolute trajectory.
 
 The predictor samples the new chunk with inpainting guidance toward the old
 one (`inference/predictor/rtc.py`): weight 1 on the observation and the d

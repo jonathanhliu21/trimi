@@ -4,8 +4,11 @@ Black, Galliker, Levine 2025, "Real-Time Execution of Action Chunking Flow
 Policies". The executor keeps executing the current chunk while the next one is
 sampled, and sends the rest of the current chunk from the observation step on.
 The policy's actions are window-relative to the observed state (index 0 is the
-observation), so new index i continues old step k0 + i, where k0 is the step
-whose raw action the executor sent as the observed arm pose. The new chunk is
+observation-time index), so new index i continues old step k0 + i, where k0 is
+the step just commanded at observation time. The arm reference is the same
+filtered/reachable command used by plain async execution. Previous targets
+remain absolute and are converted relative to that reference for guidance;
+the reference need not equal the previous raw action. The new chunk is
 sampled with pseudoinverse guidance (PiGDM) toward that remainder: weight 1 on
 the observation and the `delay` steps the executor runs before the new chunk
 arrives, exponentially decaying weights over the rest of the overlap, and 0

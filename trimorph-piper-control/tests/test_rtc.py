@@ -29,6 +29,33 @@ class GuidanceWeightTests(unittest.TestCase):
             guidance_weights(T, overlap=4, frozen=5)
 
 
+class ReferenceConversionTests(unittest.TestCase):
+    def test_absolute_overlap_round_trips_through_a_different_arm_reference(self):
+        from scipy.spatial.transform import Rotation
+        # Load this NumPy/SciPy-only module without the package __init__, which
+        # imports the training dataset and requires the GPU environment's torch.
+        path = Path(__file__).resolve().parents[2] / 'diffusion-policies/shared/env/midas/se3_utils.py'
+        spec = importlib.util.spec_from_file_location('rtc_se3_utils', path)
+        se3 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(se3)
+
+        state = np.r_[.4, -.2, .3, 0, 0, np.pi / 2, np.linspace(-1, 1, 13)].astype(np.float32)
+        previous = np.tile(state, (4, 1))
+        previous[:, 0] += np.arange(1, 5) * .01
+        previous[:, 5] += .2
+        previous[:, 6:] += .1
+        # The same conversion used by make_chunker: prepend the new reference,
+        # rather than implicitly using previous[0] as the relative origin.
+        relative = se3.absolute_to_relative(np.vstack((state[None], previous)))[1:]
+        np.testing.assert_allclose(relative[0, :3], [0, -.01, 0], atol=1e-7)
+        restored = se3.relative_to_absolute(relative, state)
+        np.testing.assert_allclose(restored[:, :3], previous[:, :3], atol=1e-7)
+        np.testing.assert_allclose(restored[:, 6:], previous[:, 6:], atol=1e-7)
+        orientation_error = (Rotation.from_rotvec(restored[:, 3:6])
+                             * Rotation.from_rotvec(previous[:, 3:6]).inv()).magnitude()
+        np.testing.assert_allclose(orientation_error, 0, atol=1e-7)
+
+
 def gp_policy():
     """A 'policy' whose denoiser is exact for a smooth Gaussian-process prior over 16-step chunks,
     with the deployed checkpoint's DDIM settings."""

@@ -637,7 +637,7 @@ class InferenceTests(unittest.TestCase):
             protocol.send_obs(client, 6, image, state, t_capture=4.0,
                               rtc={'prev_chunk': np.full((2, 19), np.nan), 'delay': 1, 'max_guidance': 20.0})
 
-    def test_rtc_anchor_is_the_raw_action_unless_arm_is_far_from_it(self):
+    def test_explicit_anchor_override_uses_filtered_command_for_tracking(self):
         robot = RobotIO.__new__(RobotIO)
         robot.hand, robot.piper = Mock(), Mock()
         robot.hand.read_pos.return_value = np.zeros(13)
@@ -652,6 +652,40 @@ class InferenceTests(unittest.TestCase):
             robot.read_state(action)
         self.assertIn('FALLBACK', robot.state_note)
 
+    def test_explicit_anchor_override_does_not_change_default_command_reference(self):
+        robot = RobotIO.__new__(RobotIO)
+        robot.state_anchor, robot.anchor_max_mm, robot.anchor_max_deg = 'command', 50., 20.
+        robot.commanded_pose = np.zeros(6)
+        raw = np.array([.10, 0, 0, 0, 0, .6])  # 100 mm / 34 deg ahead of filtered target
+        measured = np.array([.005, 0, 0, 0, 0, .01])
+        np.testing.assert_array_equal(robot.anchored_pose(measured, raw), raw)
+        self.assertNotIn('FALLBACK', robot.state_note)
+        self.assertIn('raw plan off', robot.state_note)
+        # All execution modes use this default filtered-command reference.
+        np.testing.assert_array_equal(robot.anchored_pose(measured), robot.commanded_pose)
+
+    def test_explicit_anchor_tracking_guard_uses_last_interpolated_joint_target(self):
+        robot = RobotIO.__new__(RobotIO)
+        robot.state_anchor, robot.anchor_max_mm, robot.anchor_max_deg = 'command', 50., 20.
+        robot.piper, robot.joint_control = Mock(), Mock()
+        robot.joint_control.fk.side_effect = lambda q: q.copy()  # simple numerical test mapping
+        robot.segment = (np.zeros(6), np.array([.2, 0, 0, 0, 0, 0]))
+        robot.commanded_pose = robot.segment[1].copy()  # end of action, not yet sent
+        robot.send_substep(.25)
+        robot.piper.move_joint.assert_called_once_with([.05, 0., 0., 0., 0., 0.], mode='smooth')
+        raw = np.array([.3, 0, 0, 0, 0, 0])
+        measured = np.array([.05, 0, 0, 0, 0, 0])
+        np.testing.assert_array_equal(robot.anchored_pose(measured, raw), raw)
+        self.assertNotIn('FALLBACK', robot.state_note)
+        # True translation and orientation deviations still trigger fallback,
+        # even when the raw plan itself happens to match measured feedback.
+        for offset in ([.08, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, .5]):
+            far = measured + offset
+            with contextlib.redirect_stdout(io.StringIO()):
+                np.testing.assert_array_equal(robot.anchored_pose(far, far), far)
+            self.assertIn('FALLBACK', robot.state_note)
+            self.assertTrue(robot.anchor_fallback)
+
     @staticmethod
     def rtc_chunk(c, length):
         # x = chunk number / 100 + index / 1000, so executed actions show their chunk and index.
@@ -659,7 +693,7 @@ class InferenceTests(unittest.TestCase):
         chunk[:, 0] = c / 100 + np.arange(length) / 1000
         return chunk
 
-    def run_rtc_with(self, chunks, ready, horizon, max_cycles=2, pedal=None, robot=None):
+    def run_rtc_with(self, chunks, ready, horizon, max_cycles=2, pedal=None, robot=None, arm_alpha=1.0):
         robot = robot or FakeRobot()
         robot.apply_action = Mock(wraps=robot.apply_action)
         args = SimpleNamespace(hz=10, max_cycles=max_cycles, jpeg_quality=85, rtc_horizon=horizon,
@@ -670,7 +704,7 @@ class InferenceTests(unittest.TestCase):
              patch('inference.executor.executor.protocol.recv_action', side_effect=replies) as recv_action, \
              patch('inference.executor.executor.reply_ready', side_effect=ready), \
              patch('inference.executor.executor.time.sleep'), \
-             patch('inference.executor.executor.ARM_ACTION_EMA_ALPHA', 1.0), \
+             patch('inference.executor.executor.ARM_ACTION_EMA_ALPHA', arm_alpha), \
              contextlib.redirect_stdout(output):
             run_rtc(args, robot, FakeCamera(), Mock(), pedal)
         executed = [round(float(call.args[0][0]) * 1000) for call in robot.apply_action.call_args_list]
@@ -687,17 +721,59 @@ class InferenceTests(unittest.TestCase):
         np.testing.assert_array_equal(second['prev_chunk'], chunks[0][2:])
         self.assertEqual(second['delay'], 1)  # ceil(first round trip / 100 ms)
         state = send_obs.call_args_list[1].args[3]
-        np.testing.assert_allclose(state[:6], chunks[0][2, :6], atol=1e-7)  # anchored on the raw action
+        np.testing.assert_allclose(state[:6], chunks[0][2, :6], atol=1e-7)  # EMA disabled in this test
         self.assertIn('rtc delay=2 (expected 1)', output)
 
-    def test_rtc_replans_from_the_arm_when_it_is_far_from_the_plan(self):
+    def test_rtc_uses_filtered_reference_and_retains_absolute_overlap(self):
+        robot = FakeRobot()
+        robot.read_state = Mock(wraps=robot.read_state)
+        chunks = [self.rtc_chunk(c, 6) for c in range(2)]
+        chunks[0][:, 5] = np.arange(6) * .1
+        _, send_obs, _, _ = self.run_rtc_with(
+            chunks, [True], horizon=2, robot=robot, arm_alpha=.4)
+        state = send_obs.call_args_list[1].args[3]
+        # After actions 1 and 2: filtered = .4 * raw[2] + .6 * (.4 * raw[1]).
+        expected = .4 * chunks[0][2, :6] + .6 * .4 * chunks[0][1, :6]
+        np.testing.assert_allclose(state[:6], expected, atol=1e-7)
+        self.assertGreater(np.linalg.norm(state[:6] - chunks[0][2, :6]), .01)
+        for call in robot.read_state.call_args_list:
+            self.assertEqual(call.args, ())  # same read_state() call as plain async
+            self.assertEqual(call.kwargs, {})
+        np.testing.assert_array_equal(
+            send_obs.call_args_list[1].kwargs['rtc']['prev_chunk'], chunks[0][2:])
+
+    def test_rtc_replans_from_feedback_on_tracking_fallback(self):
         robot = FakeRobot()
         robot.read_state = Mock(return_value=np.zeros(19, dtype=np.float32))  # measured fallback
+        robot.anchor_fallback = True
         chunks = [self.rtc_chunk(c, 6) for c in range(2)]
         _, send_obs, _, _ = self.run_rtc_with(chunks, [True], horizon=2, robot=robot)
         self.assertEqual(send_obs.call_args_list[1].kwargs['rtc']['prev_chunk'].shape, (0, 19))
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parse_args(['--predictor', 'localhost', '--rtc', '--state-anchor', 'measured'])
+
+    def test_rtc_angular_fallback_discards_overlap_even_at_same_xyz(self):
+        robot = FakeRobot()
+        def read_state():
+            state = robot.state.copy()
+            robot.anchor_fallback = robot.apply_action.call_count > 0
+            if robot.anchor_fallback:
+                state[5] += .5  # same XYZ, measured yaw exceeds angular threshold
+            return state
+        robot.read_state = Mock(side_effect=read_state)
+        chunks = [self.rtc_chunk(c, 6) for c in range(2)]
+        _, send_obs, _, _ = self.run_rtc_with(chunks, [True], horizon=2, robot=robot)
+        self.assertEqual(send_obs.call_args_list[1].kwargs['rtc']['prev_chunk'].shape, (0, 19))
+
+    def test_rtc_tracking_fallback_cannot_keep_overlap_when_raw_matches_feedback(self):
+        robot = FakeRobot()
+        def read_state():
+            robot.anchor_fallback = robot.apply_action.call_count > 0
+            return robot.state.copy()
+        robot.read_state = Mock(side_effect=read_state)
+        chunks = [self.rtc_chunk(c, 6) for c in range(2)]
+        _, send_obs, _, _ = self.run_rtc_with(chunks, [True], horizon=2, robot=robot)
+        self.assertEqual(send_obs.call_args_list[1].kwargs['rtc']['prev_chunk'].shape, (0, 19))
 
     def test_rtc_rejects_jump_at_selected_takeover_action(self):
         old = self.rtc_chunk(0, 6)

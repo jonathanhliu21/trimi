@@ -51,7 +51,7 @@ MOTOR_IDS = tuple(defaults.TRIMORPH_MOTOR_IDS)
 MAX_EEF_JUMP_M = 0.15
 # Independent per-action EMA for the arm pose and hand motor positions.
 # filtered = alpha * target + (1 - alpha) * previous; 1.0 disables smoothing.
-ARM_ACTION_EMA_ALPHA = 0.4 # action[:6]: XYZ + rotation vector
+ARM_ACTION_EMA_ALPHA = 0.25 # action[:6]: XYZ + rotation vector
 HAND_ACTION_EMA_ALPHA = 0.7  # action[6:]: 13 hand motor positions
 # Multiply hand targets before EMA; arm targets always retain scale 1.0.
 HAND_ACTION_SCALE = 1.005
@@ -198,6 +198,7 @@ class RobotIO:
         self.joint_control = None
         self.dt = 1.0 / args.hz
         self.commanded_pose = None
+        self.sent_joint_target = None
         self.segment = None
         # move_j commands per action (joint mode): 4 at --hz 15 and --command-hz 60.
         self.substeps = max(1, round(args.command_hz / args.hz)) if args.arm_control == "joint" else 1
@@ -328,27 +329,41 @@ class RobotIO:
     def anchored_pose(self, measured, anchor=None):
         """The pose the predictor anchors the next chunk to.
 
-        The predictor starts each chunk exactly at the observed arm pose, so with
-        the measured pose the arm's tracking lag or swing at observation time is
-        copied into every chunk. --state-anchor command uses the last commanded
-        pose instead (in joint mode, FK of the joint target sent), or `anchor`
-        when given (--rtc: the raw policy action just commanded, so the new chunk
-        continues the old one in its own frame), unless the arm is more than
-        --anchor-max-mm / --anchor-max-deg away from it.
+        This pose is used to convert window-relative predictions to absolute
+        targets; it is not an arm-pose input to the observation encoder.
+        --state-anchor command uses the last filtered/reachable commanded pose
+        (in joint mode, FK of the action's joint endpoint). Synchronous, async
+        and RTC execution all use that default reference and tracking check.
+        An explicit `anchor` overrides the returned reference; its tracking
+        check uses the interpolated joint target actually sent when available.
         """
         measured = vector(measured, 6, "measured pose")
+        self.anchor_fallback = False
         commanded = self.commanded_pose if anchor is None else vector(anchor, 6, "anchor pose")
         if self.state_anchor != "command" or commanded is None:
             self.state_note = "measured"
             return measured
-        off_mm = float(np.linalg.norm(measured[:3] - commanded[:3]) * 1000)
+        reference = commanded
+        if anchor is not None and self.commanded_pose is not None:
+            reference = vector(self.commanded_pose, 6, "filtered command pose")
+            sent_joints = getattr(self, "sent_joint_target", None)
+            if sent_joints is not None:
+                reference = vector(self.joint_control.fk(sent_joints), 6, "sent joint target pose")
+        off_mm = float(np.linalg.norm(measured[:3] - reference[:3]) * 1000)
         off_deg = float(np.degrees((Rotation.from_euler("xyz", measured[3:])
-                                    * Rotation.from_euler("xyz", commanded[3:]).inv()).magnitude()))
+                                    * Rotation.from_euler("xyz", reference[3:]).inv()).magnitude()))
+        plan_note = ""
+        if anchor is not None:
+            plan_mm = float(np.linalg.norm(measured[:3] - commanded[:3]) * 1000)
+            plan_deg = float(np.degrees((Rotation.from_euler("xyz", measured[3:])
+                                         * Rotation.from_euler("xyz", commanded[3:]).inv()).magnitude()))
+            plan_note = f"; raw plan off {plan_mm:.1f} mm {plan_deg:.1f} deg"
         if off_mm <= self.anchor_max_mm and off_deg <= self.anchor_max_deg:
             source = "command" if anchor is None else "action"
-            self.state_note = f"{source}; measured off {off_mm:.1f} mm {off_deg:.1f} deg"
+            self.state_note = f"{source}; measured off {off_mm:.1f} mm {off_deg:.1f} deg{plan_note}"
             return commanded
-        self.state_note = f"measured; FALLBACK, off {off_mm:.1f} mm {off_deg:.1f} deg"
+        self.state_note = f"measured; ALLBACK, off {off_mm:.1f} mm {off_deg:.1f} deg{plan_note}"
+        self.anchor_fallback = True
         print(f"WARNING: arm is {off_mm:.0f} mm / {off_deg:.0f} deg from its commanded pose; "
               "sending the measured pose to the predictor", flush=True)
         return measured
@@ -384,7 +399,9 @@ class RobotIO:
     def send_substep(self, fraction):
         """Joint target `fraction` (0..1] of the way through the current action's segment."""
         start, end = self.segment
-        self.piper.move_joint((start + fraction * (end - start)).tolist(), mode="smooth")
+        target = start + fraction * (end - start)
+        self.piper.move_joint(target.tolist(), mode="smooth")
+        self.sent_joint_target = target.copy()
 
     def close(self):
         try:
@@ -1122,11 +1139,14 @@ def run_rtc(args, robot, camera, sock, pedal=None, view=None, log=None):
     observed state), so every chunk is executed from index 1, one action per
     tick at --hz. Once --rtc-horizon of its actions have run (counting those run
     from the previous chunk while this one was predicted), the next request goes
-    out right after action k0 is commanded: the observed arm pose is that raw
-    action (anchored_pose), and the request carries chunk[k0:] and the expected
+    out right after action k0 is commanded: the arm reference is the filtered/
+    reachable commanded pose, as in run_async, and the request carries the
+    previous absolute targets chunk[k0:] and the expected
     delay d, the most actions run while waiting for any of the last
-    RTC_DELAY_HISTORY replies. If the arm is too far from that action, the
-    measured pose goes out with no chunk: the policy replans from the arm
+    RTC_DELAY_HISTORY replies. The predictor expresses the overlap relative to
+    this reference without moving its absolute targets. If the arm is too far
+    from the commanded pose, the measured pose goes out with no
+    chunk: the policy replans from the arm
     instead of continuing the plan. The arm keeps executing the old chunk; the new
     one, whose index i continues old step k0 + i, takes over at the first tick
     after its reply arrives: at index m + 1 after m more old actions. If the old
@@ -1214,9 +1234,13 @@ def run_rtc(args, robot, camera, sock, pedal=None, view=None, log=None):
             if (pending is None and index - 1 >= args.rtc_horizon
                     and (not args.max_cycles or seq < args.max_cycles)):
                 k0 = index - 1  # the action just commanded
-                image, capture_time, state, _ = capture(robot, camera, seq, log, anchor=pose_to_piper(chunk[k0, :6]))
-                # Measured fallback (the arm is far from the plan): replan from the arm, do not continue the plan.
-                prev = chunk[k0:] if np.allclose(state[:3], chunk[k0, :3], rtol=0, atol=1e-6) else chunk[:0]
+                image, capture_time, state, _ = capture(robot, camera, seq, log)
+                # Match async's reference selection. The overlap remains absolute:
+                # the predictor converts it relative to this state, including SE(3)
+                # rotation. A reference different from the raw action is expected;
+                # only a tracking fallback (translation or rotation) drops guidance.
+                keep_overlap = not getattr(robot, "anchor_fallback", False)
+                prev = chunk[k0:] if keep_overlap else chunk[:0]
                 delay = max(delays)
                 protocol.send_obs(sock, seq, image, state, t_capture=capture_time, jpeg_quality=args.jpeg_quality,
                                   rtc={"prev_chunk": prev, "delay": delay, "max_guidance": args.rtc_max_guidance})
