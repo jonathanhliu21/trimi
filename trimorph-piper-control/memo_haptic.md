@@ -17,4 +17,4 @@
 
 
 
-python3 scripts/teleop/trimi_teleop.py --leader-port $L --follower-port $F   --force-feedback --grasp-only --plot --print --log 11191418
+python3 scripts/teleop/trimi_teleop.py --leader-port $L --follower-port $F   --force-feedback --grasp-only --plot --print --log $(date +%m%d%H%M)
