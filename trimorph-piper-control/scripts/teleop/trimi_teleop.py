@@ -146,6 +146,8 @@ LIMIT_MARGIN_RAD = math.radians(20.0)
 FINGER_GROUPS = ((0, 1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12))
 LOG_FIELDS = ("t", "leader", "goal", "position", "velocity", "current", "contact",
               "leader_velocity", "leader_current", "wall")
+# Starts the line printed once the follower is set up and starts following; quest_trimi_teleop.py waits for it.
+FOLLOWING_MESSAGE = "Follower easing to the leader's pose"
 
 
 def _by_motor(value, motor_ids: Sequence[int]) -> dict[int, float]:
@@ -806,7 +808,7 @@ def run(args: argparse.Namespace) -> int:
         start = follower.clip_positions(follower.read_pos())
         follower.set_positions(start, clip=True)
         follower.enable_torque()
-        print(f"Follower easing to the leader's pose over {args.ramp_s:g} s, then following. Ctrl-C stops.")
+        print(f"{FOLLOWING_MESSAGE} over {args.ramp_s:g} s, then following. Ctrl-C stops.", flush=True)
         cycles = teleop_loop(
             leader, follower, start,
             rate_hz=args.rate_hz, ramp_s=args.ramp_s, max_jump_rad=args.max_jump_rad,

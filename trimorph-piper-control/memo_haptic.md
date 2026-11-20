@@ -18,3 +18,7 @@
 
 
 python3 scripts/teleop/trimi_teleop.py --leader-port $L --follower-port $F   --force-feedback --grasp-only --plot --print --log $(date +%m%d%H%M)
+
+
+python3 scripts/teleop/quest_trimi_teleop.py --calibration CAL.json --quest-port 5005 \
+  -- --leader-port $L --follower-port $F --force-feedback --grasp-only --log hand_$(date +%m%d%H%M)

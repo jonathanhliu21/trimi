@@ -44,7 +44,7 @@ cp config/hand.example.yaml config/hand.yaml
 | `data_collection/collection/` | Shared runtime configuration, episode storage, workers, contact detection, and retargeting |
 | `scripts/thumb_retargeting/` | Paired thumb calibration and model fitting |
 | `scripts/sim/` | TriMI MuJoCo model builder and the 1:1 hand-to-sim mirror |
-| `scripts/teleop/` | TriMI-to-TriMI 1:1 joint teleoperation and Quest-to-Piper teleoperation |
+| `scripts/teleop/` | TriMI-to-TriMI 1:1 joint teleoperation, Quest-to-Piper teleoperation, and both together |
 | `scripts/motion_smoothness/` | Deterministic joint motion tests |
 | `scripts/tracking_error/` | Leader/follower tracking diagnostics |
 | `scripts/dataset/` | Piper-only postprocessing base and dataset validation (`data_collection/postprocess_dataset.py` extends it) |
@@ -451,6 +451,37 @@ python3 scripts/teleop/analyze_teleop_log.py --free free.npz --contact contact.n
 Per joint it prints the free-motion current, the floor left after a fitted
 friction/motion model, the contact current, mA per radian of push, and how far
 past first contact the leader must push before the current clears the floor.
+
+## 5c. Quest arm and TriMI hand together
+
+The follower TriMI is mounted on the Piper flange; the operator wears the
+leader with the Quest controller strapped to it. One command runs the Quest
+arm teleoperation (`scripts/teleop/quest_teleop.py`) and the hand
+teleoperation of section 5b with its force feedback
+(`scripts/teleop/trimi_teleop.py`), both unchanged: options before `--` go to
+the arm, options after it to the hand (its tuning YAML is read as usual).
+
+```bash
+python3 scripts/teleop/quest_trimi_teleop.py \
+  --calibration <RUN>/calibration_quest/quest_calibration.json --quest-port 5005 \
+  -- --leader-port /dev/serial/by-id/<LEADER> --follower-port /dev/serial/by-id/<FOLLOWER> \
+  --force-feedback --grasp-only --log hand_$(date +%m%d%H%M)
+```
+
+The hand starts first, and the arm only once the follower is following, so a
+hand that fails to start (port, calibration) stops before the arm moves. The
+arm then runs as `quest_teleop.py` does: Enter to move home, the pedal as
+clutch, `h`+Enter home, `q`+Enter home and quit. The fingers follow the leader
+whether the clutch is engaged or not. When either stops, the other is stopped
+as by Ctrl-C (the hand's torque goes off and its log is saved; the arm holds
+its last target), and Ctrl-C stops both. Each runs in its own process, so the
+arm's CAN and Quest threads never slow the hand's 100 Hz loop. Hand output is
+prefixed with `[hand]`.
+
+Run it with an interpreter that has both pyAgxArm and the hand API's
+dependencies. `--dry-run` (before `--`) runs the hand without moving the arm,
+a first check with the hand mounted. Check that `--payload` (default `half`)
+suits the arm with the hand on it.
 
 ## 6. Episode replay and current logging
 
