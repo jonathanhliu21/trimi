@@ -3,6 +3,7 @@ import copy
 from pathlib import Path
 import unittest
 import tempfile
+from unittest.mock import patch
 
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
@@ -307,7 +308,7 @@ class ShortcutTests(unittest.TestCase):
             cfg.training.lr_warmup_steps = 0
             cfg.training.val_every = cfg.training.sample_every = 1
             cfg.logging.mode = 'disabled'
-            cfg.checkpoint.save_last_ckpt = False
+            cfg.checkpoint.save_last_ckpt = True
             cfg.checkpoint.topk.k = 0
             workspace = TrainDiffusionUnetImageWorkspace(cfg)
             workspace.run()
@@ -315,7 +316,17 @@ class ShortcutTests(unittest.TestCase):
             self.assertTrue(workspace.model.training)
             self.assertFalse(workspace.ema_model.training)
             self.assertIsNone(workspace.ema_model.model.final_projection[1].weight.grad)
+            # Final saving must include the final epoch, even off the interval.
+            import dill
+            saved = torch.load(workspace.get_checkpoint_path(), map_location='cpu', pickle_module=dill, weights_only=False)
+            self.assertEqual(dill.loads(saved['pickles']['epoch']), 2)
             checkpoint = workspace.save_checkpoint(use_thread=False)
+            previous = Path(checkpoint).read_bytes()
+            with patch('torch.save', side_effect=RuntimeError('serialization failed')):
+                with self.assertRaisesRegex(RuntimeError, 'serialization failed'):
+                    workspace.save_checkpoint()
+            self.assertEqual(Path(checkpoint).read_bytes(), previous)
+            self.assertEqual(list(Path(checkpoint).parent.glob('*.tmp')), [])
             restored = TrainDiffusionUnetImageWorkspace(cfg)
             restored.load_checkpoint(checkpoint, weights_only=False)
             self.assertEqual(restored.optimizer_step, workspace.optimizer_step)

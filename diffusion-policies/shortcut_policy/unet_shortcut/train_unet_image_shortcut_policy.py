@@ -15,6 +15,7 @@ import copy
 import dill
 import torch
 import threading
+import tempfile
 import sys
 import random
 import wandb
@@ -387,6 +388,12 @@ class TrainDiffusionUnetImageWorkspace:
         optimizer_to(self.optimizer, device)
 
         train_sampling_batch = None
+        verify_backbone = cfg.training.get("verify_backbone_gradients", False)
+        if verify_backbone:
+            backbone_parameters = [p for name, p in self.model.obs_encoder.named_parameters() if "backbone" in name]
+            optimizer_parameters = {id(p) for group in self.optimizer.param_groups for p in group["params"]}
+            if not backbone_parameters or not all(p.requires_grad and id(p) in optimizer_parameters for p in backbone_parameters):
+                raise RuntimeError("Backbone must be unfrozen and included in the optimizer")
 
         log_path = os.path.join(self.output_dir, "logs.json.txt")
         with JsonLogger(log_path) as json_logger:
@@ -423,8 +430,20 @@ class TrainDiffusionUnetImageWorkspace:
                         loss = raw_loss / group_size
                         loss.backward()
 
+                        if verify_backbone:
+                            probe = next((p for p in backbone_parameters if p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0), None)
+                            if probe is None:
+                                raise RuntimeError("No finite, nonzero DINOv3 backbone gradients")
+                            backbone_before = probe.detach().clone()
+
                         if (batch_idx + 1) % accumulation == 0 or batch_idx + 1 == train_batches:
+                            has_learning_rate = any(group["lr"] > 0 for group in self.optimizer.param_groups)
                             self.optimizer.step()
+                            if verify_backbone and has_learning_rate:
+                                if torch.equal(backbone_before, probe.detach()):
+                                    raise RuntimeError("DINOv3 backbone did not update")
+                                print("BACKBONE_VERIFIED: unfrozen, nonzero gradients, weights updated", flush=True)
+                                verify_backbone = False
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
                             self.optimizer_step += 1
@@ -591,13 +610,18 @@ class TrainDiffusionUnetImageWorkspace:
                 self.global_step += 1
                 self.epoch += 1
 
+        # A completed run must include its final updates before a batch Pod exits.
+        if cfg.checkpoint.save_last_ckpt:
+            self.save_checkpoint(use_thread=False)
+        wandb_run.finish()
+
     def save_checkpoint(
         self,
         path=None,
         tag="latest",
         exclude_keys=None,
         include_keys=None,
-        use_thread=True,
+        use_thread=False,
     ):
         if path is None:
             path = pathlib.Path(self.output_dir).joinpath("checkpoints", f"{tag}.ckpt")
@@ -623,13 +647,31 @@ class TrainDiffusionUnetImageWorkspace:
             elif key in include_keys:
                 payload["pickles"][key] = dill.dumps(value)
 
+        def write_checkpoint():
+            # Leave the previous checkpoint intact if serialization fails.
+            fd, temporary_path = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    torch.save(payload, stream, pickle_module=dill)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_path, path)
+                directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+
         if use_thread:
             self._saving_thread = threading.Thread(
-                target=lambda: torch.save(payload, path, pickle_module=dill)
+                target=write_checkpoint
             )
             self._saving_thread.start()
         else:
-            torch.save(payload, path, pickle_module=dill)
+            write_checkpoint()
         return str(path.absolute())
 
     def get_checkpoint_path(self, tag="latest"):
