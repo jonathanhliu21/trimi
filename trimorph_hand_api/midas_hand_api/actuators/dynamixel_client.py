@@ -73,10 +73,43 @@ def _latency_timer_path(
     return path if path.exists() else None
 
 
+def _read_latency_timer_ms(path: pathlib.Path) -> Optional[int]:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _try_serial_low_latency_flag(
+    serial_port: object,
+    path: pathlib.Path,
+    target_ms: int,
+) -> bool:
+    """Request 1 ms latency through the tty's ASYNC_LOW_LATENCY flag.
+
+    Linux's ftdi_sio driver programs a 1 ms latency timer while this flag is
+    set, and any user who can open the tty (e.g. the ``dialout`` group) may set
+    it via TIOCSSERIAL. Unlike the root-owned sysfs file, this needs no sudo.
+    The flag lasts until the adapter is unplugged; it is re-applied on connect.
+    """
+
+    set_low_latency_mode = getattr(serial_port, "set_low_latency_mode", None)
+    if set_low_latency_mode is None:
+        return False
+    try:
+        set_low_latency_mode(True)
+    except (OSError, ValueError, NotImplementedError) as exc:
+        logging.debug("Could not set ASYNC_LOW_LATENCY on %s: %s", path, exc)
+        return False
+    current_ms = _read_latency_timer_ms(path)
+    return current_ms is not None and current_ms <= target_ms
+
+
 def _set_low_latency_timer(
     port_name: str,
     target_ms: int = _LOW_LATENCY_TIMER_MS,
     sysfs_root: pathlib.Path = _USB_SERIAL_SYSFS,
+    serial_port: Optional[object] = None,
 ) -> None:
     path = _latency_timer_path(port_name, sysfs_root=sysfs_root)
     if path is None:
@@ -106,6 +139,18 @@ def _set_low_latency_timer(
         return
 
     if current_ms <= target_ms:
+        return
+
+    if serial_port is not None and _try_serial_low_latency_flag(
+        serial_port, path, target_ms
+    ):
+        logging.info(
+            "Set Dynamixel USB serial latency timer for %s from %d ms to %d ms "
+            "via the ASYNC_LOW_LATENCY tty flag",
+            port_name,
+            current_ms,
+            target_ms,
+        )
         return
 
     try:
@@ -252,10 +297,14 @@ class DynamixelClient:
                 f"Could not open port '{self.port_name}'. Check the port is correct, "
                 "or omit port to auto-detect."
             )
-        _set_low_latency_timer(self.port_name)
         if not self.port_handler.setBaudRate(self.baudrate):
             self.port_handler.closePort()
             raise OSError(f"Failed to set Dynamixel baudrate {self.baudrate}")
+        # After setBaudRate: the Python SDK reopens the serial port there, so
+        # this targets the final pyserial handle.
+        _set_low_latency_timer(
+            self.port_name, serial_port=getattr(self.port_handler, "ser", None)
+        )
 
     def disconnect(self, disable_torque: bool = True) -> None:
         if not self.is_connected:
