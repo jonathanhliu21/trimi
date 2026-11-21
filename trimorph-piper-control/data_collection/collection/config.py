@@ -21,9 +21,8 @@ TASK_CAMERA_FPS = 30
 # "180" is the readable alias for flipping both axes.
 TASK_CAMERA_FLIP = "both"
 # Fixed exposure, sensitivity and white balance (auto-exposure and auto white
-# balance are off). Measured from the auto values under the lab lighting on
-# 2026-11-01; no frame-to-frame flicker at this exposure.
-TASK_CAMERA_EXPOSURE_US = 5829
+# balance are off). Before was 5829 us, now is 7000 for screw task
+TASK_CAMERA_EXPOSURE_US = 7000
 TASK_CAMERA_ISO = 100
 TASK_CAMERA_WHITE_BALANCE_K = 2634
 TASK_VIEW_WINDOW_NAME = "trimorph_task_view"
