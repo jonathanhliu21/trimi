@@ -8,6 +8,9 @@
     },
     {
       "path": "trimorph_hand_api"
+    },
+    {
+      "path": "rss_preparation"
     }
   ],
   "settings": {}

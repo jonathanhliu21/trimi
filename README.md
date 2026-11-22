@@ -8,6 +8,7 @@ generative policy training, and learned policy deployment in one repository.
 | `diffusion-policies/` | Diffusion, flow-matching, and shortcut policy training; shared vision encoders and inference wrappers | [Training README](diffusion-policies/README.md), [shortcut policy guide](diffusion-policies/shortcut_policy/README.md) |
 | `trimorph-piper-control/` | TRIMORPH/MIDAS bring-up, retargeting, force feedback, Piper/OAK/Quest/Vicon collection, replay, and policy execution | [Control README](trimorph-piper-control/README.md), [collection pipeline](trimorph-piper-control/data_collection/PIPELINE.md), [inference guide](trimorph-piper-control/inference/README.md) |
 | `trimorph_hand_api/` | Dynamixel hand control, homing/calibration, and Paxini tactile support | [Hand API README](trimorph_hand_api/README.md) |
+| `rss_preparation/` | Hand-only record → replay (idle / TPU / human) → current and position overlay plots; hand smoke test | [RSS preparation README](rss_preparation/README.md) |
 
 The component READMEs retain their detailed instructions, examples, credits,
 and citations. This page connects them into a single workflow. Run component
