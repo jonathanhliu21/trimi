@@ -17,6 +17,7 @@ from data_collection.replay_episode import (
     JOINT_ACTION_SCALES,
     REPLAY_HZ,
     ReplayCurrentRecorder,
+    LocalIKReplay,
     advance_current_sample_schedule,
     build_replay_config,
     build_replay_hand_config,
@@ -42,6 +43,126 @@ from scripts.trimorph_api_test.gen_graphs_from_csvs import _load_telemetry
 
 
 class ReplayEpisodeTests(unittest.TestCase):
+    def local_ik_args(self, **overrides):
+        values = dict(arm_control="joint", joint_level=False, piper_rate_hz=60., ik_rate_hz=15.,
+                      max_joint_speed_deg_s=(45., 45., 90., 60., 45., 60.), ik_damping_sigma=.03,
+                      arm_diag=False, playback_speed=.5, no_preposition=False,
+                      preposition_seconds=.1, preposition_speed_percent=20, settle_seconds=0.)
+        return SimpleNamespace(**(values | overrides))
+
+    def test_local_ik_mode_defaults_and_invalid_options(self):
+        with patch('sys.argv', ['replay_episode.py', '--arm-control', 'joint']):
+            args = parse_args()
+        self.assertEqual(args.piper_rate_hz, 60.)
+        self.assertEqual(args.ik_rate_hz, 15.)
+        for flags, message in ((['--joint-level'], 'omit --joint-level'),
+                               (['--ik-rate-hz', '61'], '--ik-rate-hz'),
+                               (['--ik-rate-hz', 'nan'], '--ik-rate-hz'),
+                               (['--ik-damping-sigma', '-1'], '--ik-damping-sigma'),
+                               (['--max-joint-speed-deg-s', *(['nan']*6)], '--max-joint-speed-deg-s')):
+            with self.subTest(flags=flags), patch('sys.argv', ['replay_episode.py', '--arm-control', 'joint', *flags]):
+                with self.assertRaisesRegex(ValueError, message):
+                    main()
+
+    def test_local_ik_interpolates_and_respects_bounds_and_wall_time_speed_caps(self):
+        api = MagicMock()
+        seed = np.radians([-35., 136., -80., 5., -62., 95.])
+        api.get_joint_angles.return_value = seed.tolist()
+        args = self.local_ik_args()
+        control = LocalIKReplay(api, args)
+        pose = control.controller.fk(seed).copy()
+        pose[:3] += [.05, 0., .1]
+        previous = seed
+        for wall_time in np.arange(16)/60:
+            control.command(api, pose, wall_time)
+            sent = np.array(api.move_joint.call_args.args[0])
+            self.assertTrue(np.all(abs(sent-previous) <= np.radians(args.max_joint_speed_deg_s)/60 + 1e-8))
+            self.assertTrue(np.all(sent >= control.controller.lower-1e-9))
+            self.assertTrue(np.all(sent <= control.controller.upper+1e-9))
+            self.assertLess(sent[4], 0.)  # preserve the demonstrated wrist side
+            previous = sent
+        self.assertGreater(np.linalg.norm(previous-seed), .001)
+        self.assertLess(np.linalg.norm(control.controller.fk(previous)[:3]-pose[:3]),
+                        np.linalg.norm(control.controller.fk(seed)[:3]-pose[:3]))
+        self.assertEqual(api.move_joint.call_args.kwargs, {'mode': 'smooth'})
+        api.move_eef.assert_not_called()
+
+    def test_local_ik_replay_and_preposition_never_send_cartesian_commands(self):
+        clock = SimpleNamespace(now=0.)
+        class FakeStop:
+            def is_set(self):
+                return False
+            def wait(self, seconds):
+                clock.now += seconds
+                return False
+        api = MagicMock()
+        seed = np.radians([-35., 136., -80., 5., -62., 95.])
+        api.get_joint_angles.return_value = seed.tolist()
+        from inference.executor.joint_control import JointController
+        fk = JointController().fk
+        stream = (np.array([0., .1]), np.array([fk(seed), fk(seed+np.radians([1., 0., 0., 0., 0., 0.]))]))
+        args = self.local_ik_args()
+        with patch('data_collection.replay_episode.time.monotonic', side_effect=lambda: clock.now):
+            replay_piper_commands(api, stream, 0., .1, 0., args, FakeStop())
+        self.assertAlmostEqual(clock.now, .2)  # half-speed playback, caps use wall time
+        self.assertGreater(api.move_joint.call_count, 5)
+        api.move_eef.assert_not_called()
+        api.reset_mock()
+        hand = MagicMock()
+        def sleep(seconds):
+            clock.now += seconds
+        with (patch('data_collection.replay_episode.time.monotonic', side_effect=lambda: clock.now),
+              patch('data_collection.replay_episode.time.sleep', side_effect=sleep)):
+            move_to_first_pose(hand, api, (stream[0], np.zeros((2, 13))), stream, 0., args)
+        api.get_joint_angles.assert_called_once()
+        self.assertGreater(api.move_joint.call_count, 0)
+        hand.set_positions.assert_called()
+        api.move_eef.assert_not_called()
+
+    def test_local_ik_requires_valid_seed_inside_policy_margins(self):
+        api = MagicMock()
+        for measured, exception in ((None, RuntimeError), ([0.]*5, ValueError),
+                                    ([float('nan')]*6, ValueError),
+                                    (np.radians([-35.,136.,-80.,5.,-70.,95.]), ValueError)):
+            with self.subTest(measured=measured):
+                api.get_joint_angles.return_value = measured
+                with self.assertRaises(exception):
+                    LocalIKReplay(api, self.local_ik_args())
+        api.move_joint.assert_not_called()
+        api.move_eef.assert_not_called()
+
+    def test_local_ik_main_replays_processed_eef_without_recorded_joints(self):
+        import json
+        from inference.executor.joint_control import JointController
+        seed = np.radians([-35., 136., -80., 5., -62., 95.])
+        pose = JointController().fk(seed)
+        api = MagicMock()
+        api.get_joint_angles.return_value = seed.tolist()
+        api.is_ok.return_value = True
+        api.enable.return_value = True
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / 'raw' / 'episode_000002'
+            processed = root / 'processed' / raw.name
+            raw.mkdir(parents=True)
+            processed.mkdir(parents=True)
+            (raw / 'leader_hand.csv').write_text('elapsed_s,pos_0\n0,0\n.03,0\n')
+            (processed / 'metadata.json').write_text(json.dumps({'pose_frame': 'piper_base'}))
+            with (processed / 'piper.csv').open('w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['elapsed_s', 'x', 'y', 'z', 'roll', 'pitch', 'yaw'])
+                writer.writerow([0., *pose])
+                writer.writerow([.03, *pose])
+            with (patch('sys.argv', ['replay_episode.py', '2', '--dataset-root', directory,
+                                     '--arm-only', '--no-preposition', '--arm-control', 'joint']),
+                  patch('scripts.piper_api.piper_api.PiperAPI', return_value=api)):
+                self.assertEqual(main(), 0)
+        api.set_position_mode.assert_called_once()
+        self.assertGreater(api.move_joint.call_count, 0)
+        api.move_eef.assert_not_called()
+        api.get_eef_pose.assert_not_called()
+        api.disconnect.assert_called_once()
+
     def test_cartesian_feedback_wrap_interpolates_continuously(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'piper.csv'

@@ -24,6 +24,33 @@ XYZ/rotation-vector actions. Arm joint logging is optional and does not change
 the Cartesian training action format. See [PIPELINE.md](PIPELINE.md#2-collecting)
 for the collection, postprocessing, and training commands.
 
+To replay EEF recordings using the policy deployment's local IK instead of
+firmware Cartesian IK, add `--arm-control joint`:
+
+```bash
+python data_collection/replay_episode.py 2 \
+  --dataset-root data_trimorph_test_kinesthetic \
+  --hand-config config/xl330_new_hand_transparent.yaml --hand-port /dev/ttyUSB0 \
+  --arm-control joint --playback-speed 0.5 \
+  --arm-diag --arm-diag-interval-s 0.1 \
+  --output-positions output/kinesthetic_episode_2_local_ik_positions.csv
+```
+
+The shared solver is `inference/executor/joint_control.py:JointController`:
+local damped IK, joint margins, wrist-side preservation, and joint speed caps.
+Prepositioning also uses local IK. Each replay iteration seeds it from measured
+joints; a seed outside the policy's joint margins is rejected before sending
+joint targets. Local IK solves at `--ik-rate-hz 15` and interpolates joint writes
+at `--piper-rate-hz 60` by default. Speed caps use wall time, including during
+slowed playback. Override `--max-joint-speed-deg-s` (six values) or
+`--ik-damping-sigma` to match deployment tuning. IK may approximate a Cartesian
+target when constrained; it does not guarantee exact trajectory tracking.
+
+This mode consumes XYZ/Euler EEF poses from the processed CSV and requires no
+recorded arm joints. `--joint-level` instead replays recorded joint angles and
+cannot be combined with `--arm-control joint`. The existing default
+`--arm-control pose` retains firmware Cartesian replay.
+
 Each run saves its episodes to the next free `data_collection_n` folder
 (`n = 0, 1, 2, ...`), printed at startup as `Saving episodes to ...`. Use
 `--dataset-name NAME` to save to `NAME_n` instead; `NAME` may include parent

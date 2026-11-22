@@ -21,6 +21,12 @@ if __package__ in (None, ""):
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from inference.executor.joint_control import (
+    DAMPING_SIGMA,
+    DEFAULT_MAX_JOINT_SPEED_DEG_S,
+    JointController,
+)
+
 from data_collection.collection.config import (
     DEFAULT_HAND_CONFIG,
     DEFAULT_HAND_MEASURE_RATE_HZ,
@@ -365,9 +371,19 @@ def parse_args() -> argparse.Namespace:
         "--piper-rate-hz",
         "--arm-rate-hz",
         type=float,
-        default=DEFAULT_PIPER_RATE_HZ,
-        help="Piper replay rate in Hz, independent of the hand (default: %(default)s).",
+        default=None,
+        help="Piper command rate, independent of the hand (default: 60 Hz for local IK, 250 Hz otherwise).",
     )
+    parser.add_argument("--arm-control", choices=("pose", "joint"), default="pose",
+                        help="pose: firmware Cartesian IK (default); joint: reuse policy local IK on EEF poses, "
+                             "sending interpolated move_j targets. Does not require recorded joints.")
+    parser.add_argument("--ik-rate-hz", type=float, default=15.0,
+                        help="Local IK solve rate; joint commands interpolate between solves (default: %(default)s).")
+    parser.add_argument("--max-joint-speed-deg-s", type=float, nargs=6,
+                        default=DEFAULT_MAX_JOINT_SPEED_DEG_S,
+                        help="Local IK speed caps J1..J6 in degrees/second (same defaults as policy deployment).")
+    parser.add_argument("--ik-damping-sigma", type=float, default=DAMPING_SIGMA,
+                        help="Local IK damping threshold (same default as policy deployment).")
     parser.add_argument(
         "--read-piper-raw", action="store_true",
         help="Read raw/episode_XXXXXX/piper.csv instead of the postprocessed Piper CSV.",
@@ -450,6 +466,8 @@ def parse_args() -> argparse.Namespace:
         help="Seconds between --arm-diag samples (default: %(default)s).",
     )
     args = parser.parse_args()
+    if args.piper_rate_hz is None:
+        args.piper_rate_hz = 60.0 if args.arm_control == "joint" else DEFAULT_PIPER_RATE_HZ
     if args.loop is not None and args.loop < 1:
         parser.error("--loop must be a positive integer")
     return args
@@ -701,6 +719,41 @@ def offset_piper_position(stream, *, y_mm=0.0, z_mm=0.0):
     return times, shifted
 
 
+class LocalIKReplay:
+    """Reuse policy IK at its solve rate and interpolate joint writes in wall time."""
+
+    def __init__(self, api, args):
+        self.controller = JointController(args.max_joint_speed_deg_s, sigma_start=args.ik_damping_sigma)
+        measured = api.get_joint_angles()
+        if measured is None:
+            raise RuntimeError("Local IK replay requires measured Piper joint feedback")
+        measured = np.asarray(measured, dtype=float)
+        if measured.shape != (6,) or not np.isfinite(measured).all():
+            raise ValueError("Local IK replay requires six finite measured joint angles")
+        # Avoid reset() clipping an initial joint into the margin in one command.
+        if np.any(measured < self.controller.lower) or np.any(measured > self.controller.upper):
+            raise ValueError("Local IK start joints are outside the policy controller's joint margins; "
+                             "move to an interior start configuration before replay")
+        self.controller.reset(measured)
+        self.period_s = 1.0 / args.ik_rate_hz
+        self.write_period_s = 1.0 / args.piper_rate_hz
+        self.start = measured.copy()
+        self.target = measured.copy()
+        self.segment_start_s = None
+        self.info = None
+
+    def command(self, api, pose, wall_elapsed_s):
+        if self.segment_start_s is None or wall_elapsed_s >= self.segment_start_s + self.period_s - 1e-9:
+            # Begin at the last joint target actually sent, including after late ticks.
+            self.controller.q = self.target.copy()
+            self.start = self.target.copy()
+            self.goal, self.info = self.controller.command(pose, self.period_s)
+            self.segment_start_s = wall_elapsed_s
+        fraction = np.clip((wall_elapsed_s - self.segment_start_s + self.write_period_s) / self.period_s, 0., 1.)
+        self.target = self.start + fraction * (self.goal - self.start)
+        api.move_joint(self.target.tolist(), mode="smooth")
+
+
 def replay_piper_commands(
     api,
     piper_stream: tuple[np.ndarray, np.ndarray],
@@ -717,6 +770,7 @@ def replay_piper_commands(
     playback_speed = getattr(args, "playback_speed", 1.0)
     tick = 0
     next_arm_diag_s = 0.0
+    local_ik = LocalIKReplay(api, args) if getattr(args, "arm_control", "pose") == "joint" else None
     if args.joint_level:
         from scripts.piper_api.replay_trajectory import command_bounded_joint_step
 
@@ -729,6 +783,8 @@ def replay_piper_commands(
         piper_target = sample_stream(*piper_stream, start_s + elapsed_s)
         if args.joint_level:
             command_bounded_joint_step(api, piper_target, args.max_joint_step_rad)
+        elif local_ik is not None:
+            local_ik.command(api, piper_target, time.monotonic() - wall_start)
         else:
             api.move_eef(piper_target)
         if args.arm_diag and elapsed_s + 1e-12 >= next_arm_diag_s:
@@ -737,6 +793,8 @@ def replay_piper_commands(
                 f"replay-{elapsed_s:.3f}s",
                 None if args.joint_level else piper_target,
             )
+            if local_ik is not None:
+                print(f"[local-ik:{elapsed_s:.3f}s] {local_ik.info}", flush=True)
             while next_arm_diag_s <= elapsed_s + 1e-12:
                 next_arm_diag_s += args.arm_diag_interval_s
         if elapsed_s >= duration_s:
@@ -865,19 +923,36 @@ def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, arg
         if args.settle_seconds > 0:
             time.sleep(args.settle_seconds)
         return
+    local_ik = (LocalIKReplay(api, args)
+                if api is not None and first_eef is not None and getattr(args, "arm_control", "pose") == "joint"
+                else None)
+    started = time.monotonic()
+    period_s = 1.0 / args.piper_rate_hz if local_ik is not None else 0.05
     end_t = time.monotonic() + args.preposition_seconds
     while time.monotonic() < end_t:
         if hand is not None and first_hand is not None:
             hand.set_positions(first_hand, clip=True)
         if api is not None and first_eef is not None:
-            api.move_eef(first_eef)
-        time.sleep(0.05)
+            if local_ik is not None:
+                local_ik.command(api, first_eef, time.monotonic() - started)
+            else:
+                api.move_eef(first_eef)
+        time.sleep(period_s)
     if args.settle_seconds > 0:
         time.sleep(args.settle_seconds)
 
 
 def main() -> int:
     args = parse_args()
+    if args.arm_control == "joint":
+        if args.joint_level:
+            raise ValueError("--arm-control joint solves EEF poses; omit --joint-level to use local IK")
+        if not math.isfinite(args.ik_rate_hz) or not 0 < args.ik_rate_hz <= args.piper_rate_hz:
+            raise ValueError("--ik-rate-hz must be positive and no greater than --piper-rate-hz")
+        if not all(math.isfinite(v) and 0 < v <= 180 for v in args.max_joint_speed_deg_s):
+            raise ValueError("--max-joint-speed-deg-s requires six finite values in (0, 180]")
+        if not math.isfinite(args.ik_damping_sigma) or not 0 <= args.ik_damping_sigma <= .2:
+            raise ValueError("--ik-damping-sigma must be finite and between 0 and 0.2")
     if args.use_mocap and args.mocap_output is None:
         raise ValueError("--use-mocap requires --mocap-output")
     if not args.use_mocap and (args.mocap_output is not None or args.mocap_topics):
@@ -1031,7 +1106,7 @@ def main() -> int:
                 raise RuntimeError("Timed out while enabling Piper")
             if args.arm_diag:
                 log_piper_diagnostics(api, "after-enable")
-            if args.joint_level:
+            if args.joint_level or args.arm_control == "joint":
                 from scripts.piper_api.replay_trajectory import POSITION_MODE_SETTLE_S
 
                 api.set_position_mode()
