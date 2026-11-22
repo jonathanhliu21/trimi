@@ -319,3 +319,91 @@ def test_plot_marks_partial_runs(config, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["plot_trials.py", str(session), "--formats", "png"])
     assert plot_trials.main() == 0
     assert "partial run" in capsys.readouterr().out
+
+
+# ------------------------------------------------- hand selection + models
+
+
+def write_hand_yaml(path: Path, port: str | None, models: dict | None = None) -> Path:
+    import yaml
+
+    data = {"motor_model": "xl330-m077-t", "port": port}
+    if models:
+        data["motor_models"] = models
+    path.write_text(yaml.safe_dump(data))
+    return path
+
+
+def test_resolve_hand_picks_the_plugged_in_hand(tmp_path):
+    plugged = tmp_path / "ttyPlugged"
+    plugged.touch()
+    absent = str(tmp_path / "ttyAbsent")
+    a = write_hand_yaml(tmp_path / "a.yaml", absent)
+    b = write_hand_yaml(tmp_path / "b.yaml", str(plugged))
+
+    assert rc.resolve_hand(None, None, candidates=(a, b)) == (b, str(plugged))
+    # --config picks a hand explicitly (its pinned port), --port overrides the pin.
+    assert rc.resolve_hand(a, None, candidates=(a, b)) == (a, absent)
+    assert rc.resolve_hand(a, "/dev/other", candidates=(a, b)) == (a, "/dev/other")
+
+
+def test_resolve_hand_refuses_to_guess(tmp_path):
+    plugged = tmp_path / "ttyPlugged"
+    plugged.touch()
+    a = write_hand_yaml(tmp_path / "a.yaml", str(tmp_path / "ttyAbsent"))
+    with pytest.raises(RuntimeError, match="none of the known hands"):
+        rc.resolve_hand(None, None, candidates=(a,))
+    b = write_hand_yaml(tmp_path / "b.yaml", str(plugged))
+    c = write_hand_yaml(tmp_path / "c.yaml", str(plugged))
+    with pytest.raises(RuntimeError, match="more than one"):
+        rc.resolve_hand(None, None, candidates=(b, c))
+    unpinned = write_hand_yaml(tmp_path / "unpinned.yaml", None)
+    with pytest.raises(RuntimeError, match="does not pin a port"):
+        rc.resolve_hand(unpinned, None)
+    with pytest.raises(FileNotFoundError):
+        rc.resolve_hand(tmp_path / "missing.yaml", None)
+
+
+@pytest.mark.parametrize("path", rc.HAND_CONFIGS, ids=lambda p: p.name)
+def test_hand_configs_pin_a_port_and_declare_every_motor(path):
+    config = rc.load_config(path)
+    assert config.port and config.port == rc.config_port(path)  # load_config keeps the pin
+    declared = rc.expected_motor_models(path)
+    assert sorted(declared) == list(config.motor_ids)
+    assert set(declared.values()) <= set(rc.MODEL_NAMES.values())
+
+
+class PingHand:
+    """Just enough of MidasHand for verify_hand."""
+
+    def __init__(self, config, models):
+        self.config = config
+        self.motor_ids = list(config.motor_ids)
+        self.models = models
+
+    def ping(self):
+        return dict(self.models)
+
+
+def test_verify_hand_catches_the_other_hands_config(config):
+    number = {name: n for n, name in rc.MODEL_NAMES.items()}
+    trimi2 = rc.expected_motor_models(rc.CONFIG_DIR / "trimi2.yaml")
+    hand = PingHand(config, {m: number[trimi2[m]] for m in config.motor_ids})
+
+    assert rc.verify_hand(hand, trimi2, "trimi2.yaml") == hand.models
+    trimi1 = rc.expected_motor_models(rc.CONFIG_DIR / "trimi1.yaml")
+    with pytest.raises(RuntimeError, match="ID 1 expected XL330-M077-T, found XC330-M181-T") as error:
+        rc.verify_hand(hand, trimi1, "trimi1.yaml")
+    assert "ID 12 expected XL330-M077-T" in str(error.value)
+    # Names compare case-insensitively, with or without the -T suffix.
+    assert rc.model_mismatches({1: "XC330-M181-T"}, {1: "xc330-m181"}) == {}
+
+
+def test_replay_detects_motors_changed_since_recording(tmp_path):
+    meta = tmp_path / "metadata.json"
+    assert rt.recorded_motor_models(meta) == {}  # older sessions: nothing to compare
+    rc.write_json(meta, {"motor_models": {"1": "XL330-M077-T", "6": "XL330-M077-T"}})
+    recorded = rt.recorded_motor_models(meta)
+    assert recorded == {1: "XL330-M077-T", 6: "XL330-M077-T"}
+    now = {1: "XC330-M181-T", 6: "XL330-M077-T"}
+    assert rc.model_mismatches(now, recorded) == {1: ("XL330-M077-T", "XC330-M181-T")}

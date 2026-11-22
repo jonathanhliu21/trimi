@@ -1,5 +1,24 @@
+# Trimi1: the first TriMi hand, on USB adapter FTBEO9P0 (Trimi2 is FTBEO3G5).
+# home_offsets: first-run hard-stop measurements from 2026-11-20 (thumb not
+# repeatable). Joint limits are opened (+/-100 rad) for the RSS record/replay
+# test. motor_models lists the real model on each ID (see trimi2.yaml); the
+# rss_preparation scripts check it on connect.
 placeholders_unreviewed: false
 motor_model: xl330-m077-t
+motor_models:
+  0: XL330-M077-T
+  1: XL330-M077-T
+  2: XC330-M181-T
+  3: XC330-M181-T
+  4: XL330-M077-T
+  5: XC330-M181-T
+  6: XL330-M077-T
+  7: XL330-M077-T
+  8: XC330-M181-T
+  9: XL330-M077-T
+  10: XL330-M077-T
+  11: XC330-M181-T
+  12: XL330-M077-T
 motor_ids:
 - 0
 - 1
@@ -14,7 +33,7 @@ motor_ids:
 - 10
 - 11
 - 12
-port: null
+port: /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO9P0-if00-port0
 baudrate: 1000000
 operating_mode: 5
 position_p_gain: 2000

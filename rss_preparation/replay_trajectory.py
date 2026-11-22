@@ -33,7 +33,7 @@ import rss_common as rc  # noqa: E402
 
 
 DEFAULT_RATE_HZ = 100.0
-DEFAULT_OPERATING_MODE = 5
+DEFAULT_OPERATING_MODE = rc.REPLAY_OPERATING_MODE
 DEFAULT_ABORT_FRACTION = 0.95
 DEFAULT_ABORT_SAMPLES = 10
 DEFAULT_PREPOSITION_S = 3.0
@@ -59,8 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("session", help="Session name (under --data-root) or directory")
     parser.add_argument("--condition", required=True, help="idle, tpu, human (or another label)")
     parser.add_argument("--data-root", type=Path, default=rc.DEFAULT_DATA_ROOT, help="Where sessions live (default: %(default)s)")
-    parser.add_argument("--config", type=Path, default=rc.DEFAULT_CONFIG, help="Hand YAML (default: %(default)s)")
-    parser.add_argument("--port", default=rc.DEFAULT_PORT, help="Serial port (default: %(default)s)")
+    rc.add_hand_arguments(parser)
     parser.add_argument("--operating-mode", type=int, choices=(3, 5), default=DEFAULT_OPERATING_MODE, help="5 = current-based position (cap enforced), 3 = pure position (default: %(default)s)")
     parser.add_argument("--current-limit-ma", type=int, default=None, help="Goal Current cap in mode 5 (default: the YAML's goal_current_limit_ma)")
     parser.add_argument("--abort-current-ma", type=float, default=None, help=f"Torque off if any |current| stays at/above this (default: {DEFAULT_ABORT_FRACTION} x cap)")
@@ -94,7 +93,15 @@ def parse_args() -> argparse.Namespace:
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0:
             parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    rc.resolve_hand_args(parser, args)
     return args
+
+
+def recorded_motor_models(metadata_path: Path) -> dict[int, str]:
+    """Per-ID motor models saved with the recording ({} for older sessions)."""
+
+    saved = (rc.read_json(metadata_path) or {}).get("motor_models") or {}
+    return {int(motor_id): str(name) for motor_id, name in saved.items()}
 
 
 # --------------------------------------------------------------------------
@@ -300,6 +307,7 @@ def main() -> int:
     duration_s = float(times[-1])
 
     print(f"Session {paths.name}: trajectory {duration_s:.2f} s, {len(times)} samples")
+    print(f"Hand: {args.config.stem} on {args.port}")
     print(
         f"Condition: {args.condition} | mode {args.operating_mode} | current cap {cap_ma} mA"
         f"{'' if args.operating_mode == 5 else ' (NOT enforced in mode 3)'} | abort at {abort_ma:.0f} mA "
@@ -322,12 +330,21 @@ def main() -> int:
     result = ReplayResult()
     turns = np.zeros(len(trajectory_ids), dtype=int)
     start_residual = np.zeros(len(trajectory_ids))
+    motor_models: dict[int, str] = {}
     started_at = rc.now_iso()
     with rc.ReadErrorCounter() as read_errors:
-        hand = rc.open_hand(config)
+        hand = rc.open_hand(config, args.config)
         try:
             rc.warn_if_slow_latency(args.port)
             hand.disable_torque(verify=True)
+            motor_models = rc.model_names(hand.ping())
+            changed = rc.model_mismatches(motor_models, recorded_motor_models(paths.trajectory_metadata))
+            if changed:
+                raise RuntimeError(
+                    rc.describe_mismatches(changed, "the recording")
+                    + ". This hand's motors changed since the trajectory was recorded (or it is "
+                    "a different hand), so the recorded angles no longer match. Re-record."
+                )
             instruction = CONDITION_INSTRUCTIONS.get(args.condition, "")
             if not args.yes:
                 rc.prompt_enter(f"[{args.condition}] {instruction} Press Enter to enable torque and move to the start pose...")
@@ -438,6 +455,8 @@ def main() -> int:
             "loop_overruns": result.overruns,
             "read_errors": read_errors.count,
             "config_path": str(Path(args.config).resolve()),
+            "port": args.port,
+            "motor_models": motor_models,
             "config": rc.config_snapshot(config),
             "git": rc.git_state(),
         },

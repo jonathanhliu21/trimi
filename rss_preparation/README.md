@@ -26,9 +26,38 @@ source .venv/bin/activate
 cd ../rss_preparation
 ```
 
-Defaults: config `../trimorph-piper-control/config/trimi1.yaml` (the Trimi1 hand, rehomed 2026-11-20),
-port `/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO9P0-if00-port0`.
-Override them with `--config` and `--port`.
+## Hands
+
+Each hand has its own YAML in `../trimorph-piper-control/config/`:
+
+| Hand | Config | USB adapter | Calibration | Motors |
+|---|---|---|---|---|
+| Trimi1 | `trimi1.yaml` | FTBEO9P0 | first-run hard stops, 2026-11-20 | XC330-M181-T on 2, 3, 5, 8, 11; XL330-M077-T elsewhere |
+| Trimi2 | `trimi2.yaml` | FTBEO3G5 | not homed (offsets 0) | XL330-M077-T on 0, 4, 7, 10; XC330-M288-T on 2; XC330-M181-T elsewhere |
+
+Both open the joint limits to ±100 rad for this test.
+
+- **Picking the hand.** Each YAML pins its adapter in `port`. With no
+  `--config`, the scripts use whichever known hand is plugged in. If neither
+  or both are plugged in, they ask for `--config`. `--port` overrides the
+  pinned port.
+- **Motor check.** `motor_models` in each YAML lists the model on every ID.
+  The scripts check it on connect, so running one hand's config on the other
+  fails with the mismatched IDs. midas_hand_api itself takes a single
+  `motor_model` per hand; XL330 and XC330 share the control table and units,
+  so `xl330-m077-t` works for these mixed hands.
+- **After swapping a motor:**
+  1. Set the new motor's ID and baud rate (1 Mbps).
+  2. Update `motor_models`.
+  3. Re-record. A new motor has a different zero, so older recordings no
+     longer line up. Replay refuses a recording whose saved motor models
+     differ from the hand. This only works for sessions recorded after
+     2026-11-22; older recordings don't save their motor models.
+- **Adding a hand.** Write its YAML with `port` and `motor_models`, then
+  append it to `HAND_CONFIGS` in `rss_common.py`.
+
+Close Dynamixel Wizard (or at least disconnect it) before running the
+scripts. Two programs on the bus garble each other's packets.
 
 ## Workflow
 
@@ -67,11 +96,14 @@ The replay CSVs use `ReplayCurrentRecorder`'s schema, so
   - `--motion-test` moves each motor ±0.15 rad and back in mode 5 with a
     300 mA cap. The hand must be empty.
   - `--set-return-delay-zero` writes Return Delay Time = 0 to motor EEPROM.
-- **record_trajectory.py** records at 100 Hz by default. Press Enter or pass
-  `--duration` to stop. It reports the achieved rate, read errors and range of
-  motion.
+- **record_trajectory.py** first switches the motors to the replay's mode 5,
+  with torque still off, so no mode change happens between recording and
+  replay. Swapped or reset motors come up in factory mode 3. It then records
+  at 100 Hz by default. Press Enter or pass `--duration` to stop. It reports
+  the achieved rate, read errors and range of motion.
 - **replay_trajectory.py** runs once per condition, at 100 Hz by default:
-  1. Prompts with torque still off, so you can insert the TPU or your hand.
+  1. Checks the hand's motor models against the recording's, then prompts
+     with torque still off, so you can insert the TPU or your hand.
   2. Configures the mode, current cap and gains, and sets the motion profile.
   3. Enables torque, holding the current pose.
   4. Runs a 3 s cosine ramp to the first sample and settles for 1 s.
@@ -121,9 +153,10 @@ The replay CSVs use `ReplayCurrentRecorder`'s schema, so
   (identical physical pose) and refuses to start if any joint is still more
   than `--max-start-delta-rad` (1.5) from the first sample.
 - **Absolute angles depend on the calibration.** Tracking error and current
-  are unaffected by the offsets above. For anatomically meaningful absolute
-  angles in the figures, re-home the hand before recording (see
-  `../trimorph_hand_api/README.md`).
+  are unaffected by the offsets above. `trimi2.yaml` is not homed, so its
+  angles are raw motor angles times the joint sign. For anatomically
+  meaningful absolute angles in the figures, re-home the hand before
+  recording (see `../trimorph_hand_api/README.md`).
 
 ## USB latency
 

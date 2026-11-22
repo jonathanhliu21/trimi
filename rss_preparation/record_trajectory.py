@@ -34,8 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--session", default=None, help="Session name or directory (default: timestamp)")
     parser.add_argument("--data-root", type=Path, default=rc.DEFAULT_DATA_ROOT, help="Where sessions live (default: %(default)s)")
-    parser.add_argument("--config", type=Path, default=rc.DEFAULT_CONFIG, help="Hand YAML (default: %(default)s)")
-    parser.add_argument("--port", default=rc.DEFAULT_PORT, help="Serial port (default: %(default)s)")
+    rc.add_hand_arguments(parser)
     parser.add_argument("--rate-hz", type=float, default=DEFAULT_RATE_HZ, help="Sample rate (default: %(default)s)")
     parser.add_argument("--duration", type=float, default=None, help="Stop after this many seconds (Enter also stops)")
     parser.add_argument("--countdown", type=int, default=DEFAULT_COUNTDOWN_S, help="Seconds of countdown before recording (default: %(default)s)")
@@ -43,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration must be positive")
+    rc.resolve_hand_args(parser, args)
     return args
 
 
@@ -92,12 +92,17 @@ def main() -> int:
         print(f"error: {paths.trajectory_csv} exists; pass --force to overwrite", file=sys.stderr)
         return 1
 
-    config = rc.load_config(args.config, args.port)
-    hand = rc.open_hand(config)
+    config = rc.load_config(args.config, args.port, operating_mode=rc.REPLAY_OPERATING_MODE)
+    hand = rc.open_hand(config, args.config)
     try:
         rc.warn_if_slow_latency(args.port)
         hand.disable_torque(verify=True)
-        print(f"Connected on {hand.port}. Torque is OFF on all {len(hand.motor_ids)} motors.")
+        # Put the motors in the replay's operating mode now (torque stays off), so
+        # no mode change happens between recording and replay. A swapped or reset
+        # motor comes up in factory mode 3.
+        hand.configure(enable_torque=False)
+        motor_models = rc.model_names(hand.ping())
+        print(f"Connected to {args.config.stem} on {hand.port}. Torque is OFF on all {len(hand.motor_ids)} motors.")
         print(f"Session: {paths.root}")
         rc.prompt_enter("Put the hand on. Press Enter to start recording (Enter again stops)...")
         for remaining in range(args.countdown, 0, -1):
@@ -132,6 +137,7 @@ def main() -> int:
             "recorded_at": rc.now_iso(),
             "config_path": str(Path(args.config).resolve()),
             "port": args.port,
+            "motor_models": motor_models,
             "requested_rate_hz": args.rate_hz,
             "timing": stats,
             "loop_overruns": overruns,

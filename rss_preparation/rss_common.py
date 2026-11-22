@@ -27,10 +27,11 @@ import numpy as np
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 TRIMI_ROOT = PACKAGE_DIR.parent
-DEFAULT_CONFIG = (
-    TRIMI_ROOT / "trimorph-piper-control" / "config" / "trimi1.yaml"
-)
-DEFAULT_PORT = "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO9P0-if00-port0"
+CONFIG_DIR = TRIMI_ROOT / "trimorph-piper-control" / "config"
+# Known hands. Each YAML pins its own USB adapter in `port`; that is how the
+# scripts tell which hand is plugged in (resolve_hand).
+HAND_CONFIGS = (CONFIG_DIR / "trimi1.yaml", CONFIG_DIR / "trimi2.yaml")
+DEFAULT_CONFIG = HAND_CONFIGS[0]  # joint-sign fallback for plotting old runs
 DEFAULT_DATA_ROOT = PACKAGE_DIR / "data"
 USB_SERIAL_SYSFS = Path("/sys/bus/usb-serial/devices")
 
@@ -82,6 +83,11 @@ CONDITION_LABELS = {
 }
 
 TRAJECTORY_FILENAME = "leader_hand.csv"
+
+# Replay operating mode: 5 = current-based position (the current cap is
+# enforced). Recording switches the motors to it too (torque stays off), so no
+# mode change happens between recording and replay.
+REPLAY_OPERATING_MODE = 5
 
 # Replay motion profile. The policy rollout (inference/executor/executor.py)
 # uses 3 rad/s; the RSS replay uses 6 rad/s to follow faster human motion.
@@ -310,9 +316,111 @@ def default_session_name() -> str:
 # --------------------------------------------------------------------------
 
 
+def _read_yaml(path: Path) -> dict:
+    import yaml
+
+    with open(path) as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: YAML root must be a mapping")
+    return data
+
+
+def config_port(path: Path) -> str | None:
+    """The serial port a hand YAML pins in ``port``, or None."""
+
+    port = _read_yaml(Path(path)).get("port")
+    return str(port) if port else None
+
+
+def resolve_hand(
+    config_path: Path | None = None,
+    port: str | None = None,
+    candidates: Sequence[Path] = HAND_CONFIGS,
+) -> tuple[Path, str]:
+    """Pick the hand config and serial port for a hardware script.
+
+    ``--config`` names the hand. Without it, use the known hand whose pinned
+    USB adapter is plugged in. ``--port`` overrides the config's pinned port.
+    """
+
+    if config_path is None:
+        known = [Path(p) for p in candidates if Path(p).is_file()]
+        plugged = [p for p in known if (pinned := config_port(p)) and Path(pinned).exists()]
+        if len(plugged) != 1:
+            listing = ", ".join(f"{p.name} -> {config_port(p) or 'no port'}" for p in known)
+            reason = "none of the known hands is" if not plugged else "more than one known hand is"
+            raise RuntimeError(
+                f"cannot pick a hand automatically: {reason} plugged in ({listing}). Pass --config."
+            )
+        config_path = plugged[0]
+    config_path = Path(config_path).expanduser()
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Hand config not found: {config_path}")
+    if port is None:
+        port = config_port(config_path)
+        if port is None:
+            raise RuntimeError(f"{config_path.name} does not pin a port; pass --port")
+    return config_path, str(port)
+
+
+def add_hand_arguments(parser) -> None:
+    """--config / --port for the hardware scripts; resolve with resolve_hand_args."""
+
+    names = " or ".join(p.name for p in HAND_CONFIGS)
+    parser.add_argument("--config", type=Path, default=None, help=f"Hand YAML (default: whichever of {names} has its USB adapter plugged in)")
+    parser.add_argument("--port", default=None, help="Serial port (default: the port pinned in the config)")
+
+
+def resolve_hand_args(parser, args) -> None:
+    """Replace args.config / args.port with the resolved hand, or exit with a usage error."""
+
+    try:
+        args.config, args.port = resolve_hand(args.config, args.port)
+    except (RuntimeError, FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
+
+
+def expected_motor_models(path: Path | None) -> dict[int, str]:
+    """The per-ID models a hand YAML declares in ``motor_models`` ({} if none)."""
+
+    if path is None:
+        return {}
+    declared = _read_yaml(Path(path)).get("motor_models") or {}
+    return {int(motor_id): str(name).strip().upper() for motor_id, name in declared.items()}
+
+
+def model_names(models: Mapping[int, int]) -> dict[int, str]:
+    """{motor_id: model name} for ping results ({motor_id: model number})."""
+
+    return {int(m): MODEL_NAMES.get(int(n), f"model {n}") for m, n in sorted(models.items())}
+
+
+def _model_key(name: str) -> str:
+    key = str(name).strip().upper()
+    return key[:-2] if key.endswith("-T") else key
+
+
+def model_mismatches(
+    found: Mapping[int, str], expected: Mapping[int, str]
+) -> dict[int, tuple[str, str]]:
+    """{motor_id: (expected, found)} for IDs present in both whose models differ."""
+
+    return {
+        int(m): (expected[m], found[m])
+        for m in sorted(set(found) & set(expected))
+        if _model_key(found[m]) != _model_key(expected[m])
+    }
+
+
+def describe_mismatches(mismatches: Mapping[int, tuple[str, str]], expected_from: str) -> str:
+    details = "; ".join(f"ID {m} expected {want}, found {got}" for m, (want, got) in mismatches.items())
+    return f"motor models differ from {expected_from}: {details}"
+
+
 def load_config(
     path: Path = DEFAULT_CONFIG,
-    port: str | None = DEFAULT_PORT,
+    port: str | None = None,
     *,
     operating_mode: int | None = None,
     current_limit_ma: int | None = None,
@@ -326,7 +434,7 @@ def load_config(
     if not path.is_file():
         raise FileNotFoundError(f"Hand config not found: {path}")
     config = HandConfig.load(path)
-    changes: dict[str, object] = {"port": port}
+    changes: dict[str, object] = {} if port is None else {"port": port}
     if operating_mode is not None:
         changes["operating_mode"] = int(operating_mode)
     if current_limit_ma is not None:
@@ -345,8 +453,16 @@ def load_config(
     return config
 
 
-def verify_hand(hand) -> dict[int, int]:
-    """Raise unless every configured motor responds with a compatible model."""
+def verify_hand(
+    hand,
+    expected_models: Mapping[int, str] | None = None,
+    expected_from: str = "the config",
+) -> dict[int, int]:
+    """Raise unless every configured motor responds with a compatible model.
+
+    With ``expected_models`` (a YAML's ``motor_models``), each ID must also
+    have exactly that model, which catches using another hand's config.
+    """
 
     responses = hand.ping()
     missing = sorted(set(hand.motor_ids) - set(responses))
@@ -360,17 +476,29 @@ def verify_hand(hand) -> dict[int, int]:
     }
     if wrong:
         raise RuntimeError(f"Unexpected motor models: {wrong}")
+    mismatches = model_mismatches(model_names(responses), expected_models or {})
+    if mismatches:
+        raise RuntimeError(
+            describe_mismatches(mismatches, expected_from)
+            + ". Wrong config for this hand? If you swapped motors, update motor_models "
+            "in the YAML and re-record."
+        )
     return responses
 
 
-def open_hand(config):
-    """Connect (this also sets the 1 ms USB latency timer) and verify the bus."""
+def open_hand(config, config_path: Path | None = None):
+    """Connect (this also sets the 1 ms USB latency timer) and verify the bus.
+
+    With ``config_path``, each motor's model is also checked against that
+    YAML's ``motor_models``.
+    """
 
     from midas_hand_api import MidasHand
 
+    expected = expected_motor_models(config_path)
     hand = MidasHand(config, autoconnect=True)
     try:
-        verify_hand(hand)
+        verify_hand(hand, expected, Path(config_path).name if config_path else "the config")
     except Exception:
         hand.close()
         raise

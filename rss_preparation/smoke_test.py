@@ -47,8 +47,7 @@ MODE_NAMES = {0: "current", 1: "velocity", 3: "position", 4: "ext-pos", 5: "cur-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=rc.DEFAULT_CONFIG, help="Hand YAML (default: %(default)s)")
-    parser.add_argument("--port", default=rc.DEFAULT_PORT, help="Serial port (default: %(default)s)")
+    rc.add_hand_arguments(parser)
     parser.add_argument("--bench-samples", type=int, default=DEFAULT_BENCH_SAMPLES, help="Sync reads to time (default: %(default)s)")
     parser.add_argument("--motion-test", action="store_true", help="Move each motor a small angle and back (hand must be empty)")
     parser.add_argument("--motion-amplitude-rad", type=float, default=0.15, help="Motion test amplitude (default: %(default)s rad)")
@@ -56,7 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-tolerance-rad", type=float, default=0.05, help="Pass threshold on settled error (default: %(default)s rad)")
     parser.add_argument("--set-return-delay-zero", action="store_true", help="Write Return Delay Time = 0 (EEPROM) on motors where it is nonzero")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation prompts for opt-in actions")
-    return parser.parse_args()
+    args = parser.parse_args()
+    rc.resolve_hand_args(parser, args)
+    return args
 
 
 class RegisterReader:
@@ -277,7 +278,16 @@ def main() -> int:
         wrong = {m: n for m, n in models.items() if n not in rc.COMPATIBLE_MODEL_NUMBERS}
         if wrong:
             problems.append(f"unexpected motor models: {wrong}")
-        print(f"{len(models)}/{len(config.motor_ids)} motors responded.\n")
+        print(f"{len(models)}/{len(config.motor_ids)} motors responded.")
+        expected = rc.expected_motor_models(args.config)
+        mismatches = rc.model_mismatches(rc.model_names(models), expected)
+        if mismatches:
+            message = rc.describe_mismatches(mismatches, args.config.name)
+            problems.append(f"{message} (wrong config for this hand, or update motor_models after a swap)")
+            print(f"MISMATCH: {message}")
+        elif expected:
+            print(f"Motor models match {args.config.name}.")
+        print()
 
         table_problems, return_delays = status_table(hand, models)
         problems.extend(table_problems)
