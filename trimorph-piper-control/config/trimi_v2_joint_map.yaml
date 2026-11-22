@@ -1,0 +1,38 @@
+# TriMI motor -> TriMI v2 URDF joint, used by scripts/sim/trimi_mirror.py.
+#
+#   q_urdf = sign * scale * (q_leader - zero)    (radians)
+#
+# q_leader is the calibrated reading of the hand YAML; the mirror defaults to the
+# file 'trimi-live home' saves (~/.config/trimi-copilot/hand.yaml).
+#
+# zero comes from the hard stops homing drives into, not from a held pose:
+#   python3 scripts/sim/sync_hard_stops.py --source ../TRIMI_URDF_v2.zip --write
+# finds each stop in the URDF meshes and sets zero so that the reading homing
+# gives at the stop (-joint_sign * cad_offset) lands on the URDF stop angle.
+# A plain re-home only changes the hand YAML's offsets and needs no re-run; re-run
+# it when the homing table changes (--reverse, --zero-here, --stop-deg).
+#
+# - MCP and PIP (scale 34/84): each is a 34-tooth gear on the motor horn driving
+#   an 84-tooth sector on the next link (module 0.75 mm, 44.25 mm between axes,
+#   measured on the v2 meshes), so the joint turns 0.405 rad per motor radian.
+#   Flexion is negative on the leader (extension stop near 0) and positive in the
+#   URDF, hence sign -1.
+# - ABAD and thumb: the motor horn sits on the joint axis (scale 1).
+# - Thumb motors are tip -> palm (IP, MCP, CMC, CMC roll). Motor 1's sign was
+#   checked on the hand.
+# A sign flip changes the homing direction in the URDF, so re-run
+# sync_hard_stops.py after flipping one.
+joints:
+  0:  {urdf_joint: revolute_7,   label: Thumb IP,       sign: 1,  scale: 1.0,     zero: -0.0117}
+  1:  {urdf_joint: revolute_6,   label: Thumb MCP,      sign: -1, scale: 1.0,     zero: 0.0393}
+  2:  {urdf_joint: revolute_5,   label: Thumb CMC,      sign: 1,  scale: 1.0,     zero: 1.8181}
+  3:  {urdf_joint: revolute_4,   label: Thumb CMC roll, sign: 1,  scale: 1.0,     zero: -1.7678}
+  4:  {urdf_joint: revolute_1_3, label: Index PIP,      sign: -1, scale: 0.40476, zero: -0.1140}
+  5:  {urdf_joint: revolute_2_3, label: Index MCP,      sign: -1, scale: 0.40476, zero: -0.0213}
+  6:  {urdf_joint: revolute_1_2, label: Index ABAD,     sign: -1, scale: 1.0,     zero: 0.0458}
+  7:  {urdf_joint: revolute_2_2, label: Middle PIP,     sign: -1, scale: 0.40476, zero: 0.0124}
+  8:  {urdf_joint: revolute_1_1, label: Middle MCP,     sign: -1, scale: 0.40476, zero: 0.0461}
+  9:  {urdf_joint: revolute_2_1, label: Middle ABAD,    sign: -1, scale: 1.0,     zero: -0.4349}
+  10: {urdf_joint: revolute_1,   label: Ring PIP,       sign: -1, scale: 0.40476, zero: 0.0086}
+  11: {urdf_joint: revolute_2,   label: Ring MCP,       sign: -1, scale: 0.40476, zero: 0.0460}
+  12: {urdf_joint: revolute_3,   label: Ring ABAD,      sign: -1, scale: 1.0,     zero: 0.0118}

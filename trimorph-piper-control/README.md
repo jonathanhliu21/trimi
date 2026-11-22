@@ -43,6 +43,8 @@ cp config/hand.example.yaml config/hand.yaml
 | `data_collection/` | `collect_hand_only.py`, `replay_episode.py`, and collection documentation |
 | `data_collection/collection/` | Shared runtime configuration, episode storage, workers, contact detection, and retargeting |
 | `scripts/thumb_retargeting/` | Paired thumb calibration and model fitting |
+| `scripts/sim/` | TriMI MuJoCo model builder and the 1:1 hand-to-sim mirror |
+| `scripts/teleop/` | TriMI-to-TriMI 1:1 joint teleoperation, Quest-to-Piper teleoperation, and both together |
 | `scripts/motion_smoothness/` | Deterministic joint motion tests |
 | `scripts/tracking_error/` | Leader/follower tracking diagnostics |
 | `scripts/dataset/` | Piper-only postprocessing base and dataset validation (`data_collection/postprocess_dataset.py` extends it) |
@@ -332,6 +334,155 @@ python3 data_collection/collect_hand_only.py \
   --disable-force-feedback-motors 8
 ```
 
+## 5b. TriMI leader to TriMI follower (1:1 joints)
+
+Two identical TriMI hands, each on its own adapter (both use motor IDs 0-12,
+so they cannot share a bus). Home each hand into its own calibration, the
+follower from the leader's file so both use the same homing table and read
+the same angle in the same pose. Take the hands off and keep the fingers
+clear while homing:
+
+```bash
+TRIMI_LIVE=~/TriMI-Copilot/.venv/bin/trimi-live
+$TRIMI_LIVE home --hand-port /dev/serial/by-id/<LEADER> \
+  --out ~/.config/trimi-copilot/hand_leader.yaml
+$TRIMI_LIVE home --hand-config ~/.config/trimi-copilot/hand_leader.yaml \
+  --hand-port /dev/serial/by-id/<FOLLOWER> --out ~/.config/trimi-copilot/hand_follower.yaml
+```
+
+Then teleoperate. The leader is unpowered and moved by hand; its calibrated
+joint angles go unchanged to the follower:
+
+```bash
+python3 scripts/teleop/trimi_teleop.py \
+  --leader-port /dev/serial/by-id/<LEADER> \
+  --follower-port /dev/serial/by-id/<FOLLOWER> --print
+```
+
+The follower eases onto the leader's pose over `--ramp-s` (2 s), then follows
+at `--rate-hz` (100). Its goals are clipped to its joint limits, its current is
+capped at `--current-limit-ma` (400 mA) and its speed at `--max-speed-rad-s`
+(6). The script refuses calibrations with different motor IDs, joint signs or
+homing tables, a follower file that was never homed, and joints reading far
+outside their limits (a power cycle can shift a joint by a turn; home again).
+A leader reading that jumps more than `--max-jump-rad` in one cycle stops it,
+and both hands' torque is off on exit.
+
+`--force-feedback`: a follower joint is in contact when, for 20 ms, it is still
+(under `--contact-still-rad-s`, 0.25; a slow follower still tracking moves at
+0.2-0.6) and the leader is more than `--contact-error-rad` (0.04) past it and
+still pulling away from it. A gap that stays put is the follower falling short
+of its goal, not an object; one past twice the contact error counts anyway. The motor current does not count by default: it mixes gear ratio, moment
+arm, acceleration and friction, differs from finger to finger, and cannot tell
+a fast move from a light touch. `--contact-current-ma N` adds the condition
+that the follower also pushes towards its goal with more than N mA. A follower
+within 0.1 rad of the stop homing found for that joint is at its own stop, not
+on an object (the leader meets its own stop there too). `--grasp-only` makes
+the index/middle/ring PIP and MCP (flexion reads negative) count only errors in
+the grasping direction; add `MOTOR=+1`/`MOTOR=-1` for others, e.g.
+`--grasp-only 1=-1` for a thumb joint. The other joints count both directions.
+`--contact-motors` (`contact_motors: [0, 2, 4, 5, 7, 8, 10, 11]`) limits
+contact detection to some joints; the others are still walled with their
+finger. `--contact-motor-overrides MOTOR:error_rad=E,hold_ms=H`
+(`contact_motor_overrides: {0: {error_rad: 0.06}}`) gives single joints their
+own contact error and hold time: thumb joint 0 is geared high and lags at the
+start of a fast move, long enough to pass for contact at the common 0.02 rad.
+
+At contact the leader is stopped where the follower stopped (a wall): the
+joint's own motor holds the leader at the follower's position at contact, in
+current-based position mode with up to `--wall-current-ma` (700; the XL330
+allows 1750), its internal loop far stiffer than the 100 Hz teleop loop could
+render. The wall stays there (`--wall-follow` moves it with the follower, so a
+soft object gives, but so do the follower's flex and gear play), and the
+follower keeps following the leader, so pressing harder bends the leader
+slightly past the wall and the follower squeezes harder. For the first
+`--wall-settle-ms` (120) the wall holds whatever the hand does, so the leader is
+brought back to where the follower stopped, at `--wall-speed-rad-s` (3); only
+the follower moving on freely ends it sooner. After that the wall lets go the
+moment the hand opens: the leader comes `--wall-release-rad` (0.01) out of it,
+or its motor current turns to pull the finger in by `--wall-release-ma` (40).
+At any time it lets go when the follower moves on past it by `--wall-pass-rad`
+(0.03) or faster than the still speed: nothing was there. `--wall-p-gain`/
+`-i-gain`/`-d-gain` set its stiffness (default: the leader calibration's), and
+`--wall-motor-gains MOTOR:p=P,i=I,d=D` (`wall_motor_gains: {0: {p: 600, i: 0}}`)
+one joint's over them: a joint geared too high to give under the hand (thumb
+joint 0) gets a softer P, and no I, which would wind up against a steady push
+until the wall pushes back with full current.
+
+Walls go up a whole finger at a time (thumb 0-3, index 4-6, middle 7-9, ring
+10-12): while any joint of a finger is in contact, its other joints are held
+too, each at its follower's position, and the hand opening at any of them
+takes the whole finger's walls down. For a held joint not in contact itself,
+opening is judged in its grasping direction, so the PIP/MCP under
+`--grasp-only` can release the finger but an ABAD joint cannot.
+`--no-wall-whole-finger` (`wall_whole_finger: false`) walls each joint on its
+own. Out of contact the leader's joints are unpowered (torque off), since a
+powered Dynamixel drags when turned by hand; on exit they are left torque off
+with the calibration's current cap and gains.
+
+`--log` writes the file when the teleop stops, also on a second Ctrl-C,
+SIGTERM, a closed terminal (SIGHUP) or a failed shutdown; only SIGKILL loses it.
+
+With `--print` each line also shows the loop rate and the bus time per cycle.
+The two hands are read at the same time on their own buses, so a cycle takes
+about as long as the slower read. `--plot` opens a live plot of each joint's
+follower-minus-leader angle (`--plot current` for the follower's current), red
+while in contact and orange while held only because the rest of its finger is,
+in a separate process that never slows the loop. `--print` lists both: the
+joints in contact and the leader joints walled.
+
+Every tunable has a long option and a key in `config/trimi_teleop_tuning.yaml`,
+which is read on every run: built-in defaults, then that file (or `--tuning
+FILE`, or none with `--no-tuning`), then the command line. The follower's
+position P/I/D gains can be overridden there too (`follower_p_gain`, ...).
+`--save-tuning FILE` writes the settings a command line amounts to and exits,
+so a tuned command line can be kept as a file.
+
+How well the follower's current alone shows contact can be measured: record a
+run with free motion only and one pushing the follower on a rigid object, then
+compare them:
+
+```bash
+python3 scripts/teleop/trimi_teleop.py ... --log free.npz      # move freely, touch nothing
+python3 scripts/teleop/trimi_teleop.py ... --log contact.npz   # squeeze an object, light to firm
+python3 scripts/teleop/analyze_teleop_log.py --free free.npz --contact contact.npz
+```
+
+Per joint it prints the free-motion current, the floor left after a fitted
+friction/motion model, the contact current, mA per radian of push, and how far
+past first contact the leader must push before the current clears the floor.
+
+## 5c. Quest arm and TriMI hand together
+
+The follower TriMI is mounted on the Piper flange; the operator wears the
+leader with the Quest controller strapped to it. One command runs the Quest
+arm teleoperation (`scripts/teleop/quest_teleop.py`) and the hand
+teleoperation of section 5b with its force feedback
+(`scripts/teleop/trimi_teleop.py`), both unchanged: options before `--` go to
+the arm, options after it to the hand (its tuning YAML is read as usual).
+
+```bash
+python3 scripts/teleop/quest_trimi_teleop.py \
+  --calibration <RUN>/calibration_quest/quest_calibration.json --quest-port 5005 \
+  -- --leader-port /dev/serial/by-id/<LEADER> --follower-port /dev/serial/by-id/<FOLLOWER> \
+  --force-feedback --grasp-only --log hand_$(date +%m%d%H%M)
+```
+
+The hand starts first, and the arm only once the follower is following, so a
+hand that fails to start (port, calibration) stops before the arm moves. The
+arm then runs as `quest_teleop.py` does: Enter to move home, the pedal as
+clutch, `h`+Enter home, `q`+Enter home and quit. The fingers follow the leader
+whether the clutch is engaged or not. When either stops, the other is stopped
+as by Ctrl-C (the hand's torque goes off and its log is saved; the arm holds
+its last target), and Ctrl-C stops both. Each runs in its own process, so the
+arm's CAN and Quest threads never slow the hand's 100 Hz loop. Hand output is
+prefixed with `[hand]`.
+
+Run it with an interpreter that has both pyAgxArm and the hand API's
+dependencies. `--dry-run` (before `--`) runs the hand without moving the arm,
+a first check with the hand mounted. Check that `--payload` (default `half`)
+suits the arm with the hand on it.
+
 ## 6. Episode replay and current logging
 
 Replay the latest episode on TRIMORPH and PiperX (or supply an episode number,
@@ -506,6 +657,51 @@ python3 scripts/tracking_error/get_tracking_error.py --help
 
 Tracking diagnostics write to `output/tracking_error/` by default. Motion
 smoothness tests use the local calibrated `config/one_finger_test.yaml`.
+
+## TriMI in MuJoCo (1:1 mirror)
+
+Build the MuJoCo model once from the Onshape URDF export (zip, folder, or
+`.urdf`). It is written to `assets/trimi_v2/`, which is not tracked:
+
+```bash
+python3 scripts/sim/build_trimi_sim_model.py ../TRIMI_URDF_v2.zip
+```
+
+The export does not load into MuJoCo as is: the palm mesh exceeds MuJoCo's
+200,000-face STL limit, every part was exported at 1 kg/m^3 (masses about 1000x
+too small), and there is no collision geometry. The builder fixes these and
+prints the joint chains it found.
+
+Then move the hand and watch the model follow. The motors stay torque-disabled.
+By default the script reads the calibration `trimi-live home` saves
+(`~/.config/trimi-copilot/hand.yaml`) and the only adapter in
+`/dev/serial/by-id`; pass `--hand-config` / `--hand-port` otherwise:
+
+```bash
+python3 scripts/sim/trimi_mirror.py
+```
+
+`config/trimi_v2_joint_map.yaml` gives each motor's URDF joint as
+`q_urdf = sign * scale * (q_leader - zero)`. MCP and PIP use scale 34/84: a
+34-tooth gear on the motor drives an 84-tooth sector on the next link. ABAD and
+thumb joints are direct (scale 1).
+
+The zeros synchronize the model with the hand at the hard stops that homing
+drives into. Homing leaves each motor reading `-joint_sign * cad_offset` at its
+stop; `sync_hard_stops.py` turns the same joint in the URDF until its link meets
+the palm or the links it is mounted on (the motor horn, drive gears and other
+fingers are ignored, as in homing) and sets the zero so both agree. The zeros
+depend on the homing table, not on the offsets a homing measures, so re-run it
+only when the table changes (`--reverse`, `--zero-here`, `--stop-deg`) or a
+sign is flipped:
+
+```bash
+python3 scripts/sim/sync_hard_stops.py --source ../TRIMI_URDF_v2.zip --write
+```
+
+Without `--source` it uses the model's decimated meshes (within about 0.5 deg).
+A joint that homes against a false stop (held or blocked) reads wrong in both
+the hand's own tools and the model; re-homing it fixes both.
 
 ## Important shared modules
 
