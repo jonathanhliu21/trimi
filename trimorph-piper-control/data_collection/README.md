@@ -222,6 +222,15 @@ python3 data_collection/replay_episode.py 0 --dataset-root data_collection_0 \
 
 The replay command moves the hardware. For the original raw Piper CSV behavior, add `--read-piper-raw`; this flag is required with `--joint-level`. Missing processed poses produce an error with no silent fallback to raw data. `--hand-only` does not require processed Piper files. The calibration quality and any Quest tracking discontinuities carry through into the converted data; postprocessing does not filter samples or establish workspace reachability.
 
+Add `--output-positions output/replay_positions.csv` (alias `--output-current`)
+to save measured Piper joints (`piper_joint_1_rad` through `piper_joint_6_rad`),
+flange XYZ in meters and Euler RPY in radians, and measured/target hand positions,
+velocities and motor currents. Samples include host monotonic time and Piper
+feedback timestamps; unavailable Piper feedback is blank. Logging covers playback,
+excluding prepositioning, at 10 samples per episode second (5 per wall-clock
+second at half speed). Partial samples are saved on Ctrl-C. Hand-only replay
+omits Piper columns; this option requires hand replay. Loop runs get separate CSVs.
+
 Use `--replay-speed 0.5` (alias for `--playback-speed 0.5`) to replay both
 hand and arm at half speed, or `--replay-speed 2` for double speed. Speed
 must be finite and greater than zero; the default is 1 (recorded speed).

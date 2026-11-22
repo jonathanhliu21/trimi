@@ -34,12 +34,91 @@ from data_collection.replay_episode import (
     main,
     parse_args,
     output_current_csv,
+    offset_piper_z,
+    offset_piper_position,
     prepare_hand_stream_for_replay,
 )
 from scripts.trimorph_api_test.gen_graphs_from_csvs import _load_telemetry
 
 
 class ReplayEpisodeTests(unittest.TestCase):
+    def test_combined_y_z_offsets_preserve_other_coordinates_and_source(self):
+        times = np.array([0., 1.])
+        poses = np.array([[.4, -.3, .06, 1., 2., 3.], [.5, -.2, .08, 2., 3., 4.]])
+        original = poses.copy()
+        for y_mm, z_mm in ((-5.4, 0.), (-5.4, 15.5), (5.4, -15.5)):
+            with self.subTest(y_mm=y_mm, z_mm=z_mm):
+                shifted_times, shifted = offset_piper_position((times, poses), y_mm=y_mm, z_mm=z_mm)
+                np.testing.assert_allclose(shifted[:, 1], original[:, 1]+y_mm/1000)
+                np.testing.assert_allclose(shifted[:, 2], original[:, 2]+z_mm/1000)
+                np.testing.assert_array_equal(shifted[:, [0, 3, 4, 5]], original[:, [0, 3, 4, 5]])
+                np.testing.assert_array_equal(poses, original)
+                np.testing.assert_array_equal(shifted_times, times)
+
+    def test_replay_y_offset_cli_and_invalid_modes(self):
+        with patch('sys.argv', ['replay_episode.py']):
+            self.assertEqual(parse_args().piper_y_offset_mm, 0.)
+        with patch('sys.argv', ['replay_episode.py', '--piper-y-offset-mm', '-5.4']):
+            self.assertEqual(parse_args().piper_y_offset_mm, -5.4)
+        for flags in (['--piper-y-offset-mm', 'nan'], ['--piper-y-offset-mm', 'inf'],
+                      ['--piper-y-offset-mm', '-5.4', '--hand-only'],
+                      ['--piper-y-offset-mm', '-5.4', '--joint-level', '--read-piper-raw']):
+            with self.subTest(flags=flags), patch('sys.argv', ['replay_episode.py', *flags]), self.assertRaisesRegex(ValueError, '--piper-y-offset-mm'):
+                main()
+
+    def test_replay_z_offset_shifts_only_z_and_preserves_episode(self):
+        times = np.array([0., 1.])
+        poses = np.array([[.4, -.3, .06, 1., 2., 3.], [.5, -.2, .08, 2., 3., 4.]])
+        original = poses.copy()
+        for offset_mm in (15.5, -10., 0.):
+            with self.subTest(offset_mm=offset_mm):
+                shifted_times, shifted = offset_piper_z((times, poses), offset_mm)
+                np.testing.assert_allclose(shifted[:, 2], original[:, 2] + offset_mm / 1000)
+                np.testing.assert_array_equal(shifted[:, [0, 1, 3, 4, 5]], original[:, [0, 1, 3, 4, 5]])
+                np.testing.assert_array_equal(poses, original)
+                np.testing.assert_array_equal(shifted_times, times)
+
+    def test_replay_z_offset_cli_and_invalid_modes(self):
+        with patch('sys.argv', ['replay_episode.py']):
+            self.assertEqual(parse_args().piper_z_offset_mm, 0.)
+        with patch('sys.argv', ['replay_episode.py', '--piper-z-offset-mm', '15.5']):
+            self.assertEqual(parse_args().piper_z_offset_mm, 15.5)
+        for flags in (['--piper-z-offset-mm', 'nan'], ['--piper-z-offset-mm', 'inf'],
+                      ['--piper-z-offset-mm', '15.5', '--hand-only'],
+                      ['--piper-z-offset-mm', '15.5', '--joint-level', '--read-piper-raw']):
+            with self.subTest(flags=flags), patch('sys.argv', ['replay_episode.py', *flags]), self.assertRaisesRegex(ValueError, '--piper-z-offset-mm'):
+                main()
+
+    def test_position_log_includes_measured_arm_and_hand_with_timestamps(self):
+        hand = MagicMock()
+        hand.read_pos_vel_cur.return_value = (np.array([0.2]), np.array([0.3]), np.array([12.0]))
+        piper = MagicMock()
+        piper.get_joint_state.return_value = SimpleNamespace(joints=[0.1] * 6, timestamp=10.0)
+        piper.get_eef_state.return_value = SimpleNamespace(pose=[0.4, -0.2, 0.1, 3.0, 0.0, 1.0], timestamp=10.01)
+        recorder = ReplayCurrentRecorder((0,), piper=piper)
+        recorder.sample(hand, np.array([0.25]), elapsed_s=0.0)
+        piper.get_joint_state.return_value = None
+        piper.get_eef_state.return_value = None
+        recorder.sample(hand, np.array([0.26]), elapsed_s=0.1)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'positions.csv'
+            output_current_csv(recorder, output)
+            with output.open() as stream:
+                rows = list(csv.DictReader(stream))
+        self.assertEqual(float(rows[0]['piper_joint_6_rad']), 0.1)
+        self.assertEqual(float(rows[0]['piper_x_m']), 0.4)
+        self.assertEqual(float(rows[0]['piper_yaw_rad']), 1.0)
+        self.assertEqual(float(rows[0]['motor_0_actual_position_rad']), 0.2)
+        self.assertEqual(float(rows[0]['motor_0_target_position_rad']), 0.25)
+        self.assertEqual(float(rows[0]['piper_joint_timestamp_s']), 10.0)
+        self.assertGreater(int(rows[0]['sample_monotonic_ns']), 0)
+        self.assertEqual(rows[1]['piper_joint_6_rad'], '')
+        self.assertEqual(rows[1]['piper_x_m'], '')
+
+    def test_output_positions_alias(self):
+        with patch('sys.argv', ['replay_episode.py', '--output-positions', 'positions.csv']):
+            self.assertEqual(parse_args().output_current, Path('positions.csv'))
+
     def test_loop_cli(self):
         for flags, expected in (([], 1), (["--loop"], None), (["--loop", "3"], 3)):
             with self.subTest(flags=flags), patch("sys.argv", ["replay_episode.py", *flags]):

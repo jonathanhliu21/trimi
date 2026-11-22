@@ -18,7 +18,7 @@ port: null
 baudrate: 1000000
 operating_mode: 5
 position_p_gain: 2000
-position_i_gain: 100
+position_i_gain: 0
 position_d_gain: 400
 goal_current_limit_ma: 1700
 home_offsets:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import nullcontext
 import csv
 from datetime import datetime
 import json
@@ -51,10 +52,10 @@ MOTOR_IDS = tuple(defaults.TRIMORPH_MOTOR_IDS)
 MAX_EEF_JUMP_M = 0.15
 # Independent per-action EMA for the arm pose and hand motor positions.
 # filtered = alpha * target + (1 - alpha) * previous; 1.0 disables smoothing.
-ARM_ACTION_EMA_ALPHA = 0.25 # action[:6]: XYZ + rotation vector
-HAND_ACTION_EMA_ALPHA = 0.7  # action[6:]: 13 hand motor positions
+ARM_ACTION_EMA_ALPHA = 0.5 # action[:6]: XYZ + rotation vector
+HAND_ACTION_EMA_ALPHA = 0.9  # action[6:]: 13 hand motor positions
 # Multiply hand targets before EMA; arm targets always retain scale 1.0.
-HAND_ACTION_SCALE = 1.005
+HAND_ACTION_SCALE = 1.0
 # --rtc: the expected inference delay is the most actions executed while waiting
 # for any of this many recent replies (the paper's conservative max).
 RTC_DELAY_HISTORY = 10
@@ -187,12 +188,61 @@ def load_hand_class(api_repo):
     return midas_hand_api.MidasHand
 
 
+class HandCommandWriter:
+    """Send the latest hand target at a fixed rate; serialize access to the bus."""
+
+    def __init__(self, hand, hz):
+        self.hand = hand
+        self.period = 1.0 / hz
+        self.lock = threading.RLock()
+        self.target = None
+        self.error = None
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="hand-command", daemon=True)
+        self.thread.start()
+
+    def check_error(self):
+        if self.error is not None:
+            raise RuntimeError("Hand command writer failed") from self.error
+
+    def submit(self, target):
+        with self.lock:
+            self.check_error()
+            self.target = vector(target, 13, "hand target").copy()
+
+    def pause(self):
+        with self.lock:
+            self.check_error()
+            self.target = None
+
+    def run(self):
+        deadline = time.perf_counter()
+        try:
+            while not self.stop.is_set():
+                with self.lock:
+                    if self.target is not None:
+                        self.hand.set_positions(self.target, clip=True)
+                # Skip missed ticks instead of sending catch-up bursts.
+                deadline += self.period
+                now = time.perf_counter()
+                if deadline < now:
+                    deadline = now + self.period
+                self.stop.wait(max(0.0, deadline - now))
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+
+
 class RobotIO:
     def __init__(self, args):
         from data_collection.collection.hand_common import load_hand_config, verify_connected_hand
         from scripts.piper_api.piper_api import PiperAPI
 
         self.hand = None
+        self.hand_writer = None
         self.piper = None
         self.piper_log = None
         self.joint_control = None
@@ -236,11 +286,15 @@ class RobotIO:
             if not args.no_start_move:
                 self.move_to_start(args)
             self.piper.set_speed_percent(args.piper_speed)
+            self.hand_writer = HandCommandWriter(self.hand, args.hand_command_hz)
         except BaseException:
             self.close()
             raise
 
-    def move_to_start(self, args, confirm=True):
+    def move_to_start(self, args, confirm=True, release_hand=False):
+        writer = getattr(self, "hand_writer", None)
+        if writer is not None:
+            writer.pause()
         from scripts.piper_api.replay_trajectory import POSITION_MODE_SETTLE_S, read_joint_angles
         from scripts.teleop.quest_teleop import CONTROLLER_LIMITS_DEG, go_home, home_warnings
 
@@ -265,13 +319,20 @@ class RobotIO:
                   "(Ctrl-C to abort)...")
         else:
             print(message, flush=True)
+        if release_hand:
+            self.hand.disable_torque()
+            print("Hand torque off while the arm returns to start.", flush=True)
         self.piper.set_position_mode()
         time.sleep(POSITION_MODE_SETTLE_S)
         self.piper.set_speed_percent(100)  # The ramp in go_home sets the actual speed.
         go_home(self.piper, np.radians(target), args.start_speed_deg_s, 50.0)
         print("Reached start joints.", flush=True)
         if not args.no_hand_start:
-            self.move_hand_to_start(hand_name)
+            self.move_hand_to_start(hand_name, enable_torque=release_hand)
+        elif release_hand:
+            # --no-hand-start: restore torque holding the relaxed, measured pose.
+            self.hand.set_positions(vector(self.hand.read_pos(), 13, "hand state"), clip=True)
+            self.hand.enable_torque()
         self.log_start(args, name, joints, target, offset_m, angle_deg, None if args.no_hand_start else hand_name)
 
     def log_start(self, args, name, base_deg, target_deg, offset_m, angle_deg, hand_name):
@@ -294,9 +355,13 @@ class RobotIO:
         print(f"Start #{start_id} logged in {args.start_log}; repeat it with --start-id {start_id} "
               f"(or --start-joints-deg {' '.join(f'{v:.2f}' for v in target_deg)}).", flush=True)
 
-    def move_hand_to_start(self, name, tolerance_rad=0.05, timeout_s=5.0):
+    def move_hand_to_start(self, name, tolerance_rad=0.05, timeout_s=5.0, enable_torque=False):
         # The motion profile set at startup limits the speed of this single target write.
         target = self.hand.clip_positions(vector(defaults.HAND_START_POSITIONS_RAD[name], 13, "hand start"))
+        if enable_torque:
+            # Replace the stale policy goal before torque is restored.
+            self.hand.set_positions(target, clip=False)
+            self.hand.enable_torque()
         try:
             self.hand.set_positions_blocking(target, clip=False, tolerance_rad=tolerance_rad, timeout_s=timeout_s)
             print(f"Reached {name} hand start.", flush=True)
@@ -307,8 +372,8 @@ class RobotIO:
                   flush=True)
 
     def return_to_start(self, args):
-        """Pedal reset: no Enter prompt, then restore the policy speed."""
-        self.move_to_start(args, confirm=False)
+        """Pedal reset: relax the hand during arm return, then restore its start."""
+        self.move_to_start(args, confirm=False, release_hand=True)
         self.piper.set_speed_percent(args.piper_speed)
         if self.joint_control is not None:
             self.joint_control.q = None  # restart joint targets from the measured start
@@ -323,7 +388,11 @@ class RobotIO:
         pose = self.piper.get_eef_pose()
         if pose is None:
             raise RuntimeError("Piper EEF feedback unavailable")
-        hand = vector(self.hand.read_pos(), 13, "hand state")
+        writer = getattr(self, "hand_writer", None)
+        with writer.lock if writer is not None else nullcontext():
+            if writer is not None:
+                writer.check_error()
+            hand = vector(self.hand.read_pos(), 13, "hand state")
         return np.concatenate((pose_to_policy(self.anchored_pose(pose, anchor)), hand)).astype(np.float32)
 
     def anchored_pose(self, measured, anchor=None):
@@ -370,6 +439,9 @@ class RobotIO:
 
     def apply_action(self, action):
         """Command the arm and hand; returns joint-control diagnostics (None with --arm-control pose)."""
+        writer = getattr(self, "hand_writer", None)
+        if writer is not None:
+            writer.check_error()
         action = vector(action, 19, "action")
         info = None
         if self.joint_control is None:
@@ -393,7 +465,10 @@ class RobotIO:
             self.commanded_pose = np.asarray(self.joint_control.fk(target), dtype=float)
         # Positions already use leader coordinates. Signs/offsets are applied
         # exactly once by the hand API, with no follower scaling or retargeting.
-        self.hand.set_positions(action[6:], clip=True)
+        if writer is None:
+            self.hand.set_positions(action[6:], clip=True)
+        else:
+            writer.submit(action[6:])
         return info
 
     def send_substep(self, fraction):
@@ -405,6 +480,8 @@ class RobotIO:
 
     def close(self):
         try:
+            if getattr(self, "hand_writer", None) is not None:
+                self.hand_writer.close()
             if self.hand is not None:
                 self.hand.shutdown()
         finally:
@@ -1291,6 +1368,8 @@ def parse_args(argv=None):
     p.add_argument("--hand-port", default=DEFAULT_HAND_PORT)
     p.add_argument("--hand-velocity", type=float, default=defaults.FOLLOWER_PROFILE_VELOCITY_RAD_S)
     p.add_argument("--hand-acceleration", type=float, default=defaults.FOLLOWER_PROFILE_ACCELERATION_RAD_S2)
+    p.add_argument("--hand-command-hz", type=float, default=100.0,
+                   help="Send the latest hand target at this rate, independently of --hz (default: %(default)s)")
     for name, default in (
         ("interface", defaults.DEFAULT_PIPER_INTERFACE), ("channel", defaults.DEFAULT_PIPER_CHANNEL),
         ("firmware", defaults.DEFAULT_PIPER_FIRMWARE), ("installation-pos", defaults.DEFAULT_PIPER_INSTALLATION_POS),
@@ -1379,7 +1458,7 @@ def parse_args(argv=None):
         p.error("--inference-latency-ms must be finite and nonnegative")
     if args.rtc and args.execute_steps:
         p.error("--execute-steps applies to synchronous/async playback; use --rtc-horizon with --rtc")
-    for name in ("hz", "timeout", "camera_timeout", "hand_velocity", "hand_acceleration", "start_speed_deg_s"):
+    for name in ("hz", "timeout", "camera_timeout", "hand_velocity", "hand_acceleration", "hand_command_hz", "start_speed_deg_s"):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             p.error(f"--{name.replace('_', '-')} must be finite and positive")
     from inference.executor.joint_control import DAMPING_SIGMA, DEFAULT_MAX_JOINT_SPEED_DEG_S

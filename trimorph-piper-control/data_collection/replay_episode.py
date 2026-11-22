@@ -209,9 +209,10 @@ def advance_current_sample_schedule(
 class ReplayCurrentRecorder:
     """Collect replay telemetry in gen_graphs_from_csvs.py's native schema."""
 
-    def __init__(self, motor_ids: tuple[int, ...]) -> None:
+    def __init__(self, motor_ids: tuple[int, ...], piper=None) -> None:
         self.motor_ids = tuple(int(motor_id) for motor_id in motor_ids)
-        self.rows: list[dict[str, float | int]] = []
+        self.piper = piper
+        self.rows: list[dict[str, float | int | str]] = []
         self._previous_time_s: float | None = None
         self._previous_targets: np.ndarray | None = None
 
@@ -247,7 +248,17 @@ class ReplayCurrentRecorder:
                 raise RuntimeError("Replay telemetry timestamps must increase")
             target_velocities = (targets - self._previous_targets) / delta_s
 
-        row: dict[str, float | int] = {"trial": 1, "elapsed_s": elapsed_s}
+        row = {"trial": 1, "elapsed_s": elapsed_s, "sample_monotonic_ns": time.monotonic_ns()}
+        if self.piper is not None:
+            joints = self.piper.get_joint_state()
+            eef = self.piper.get_eef_state()
+            row["piper_joint_timestamp_s"] = "" if joints is None else joints.timestamp
+            row["piper_eef_timestamp_s"] = "" if eef is None else eef.timestamp
+            for index in range(6):
+                row[f"piper_joint_{index + 1}_rad"] = "" if joints is None else float(joints.joints[index])
+            for index, field in enumerate(RAW_EEF_FIELDS):
+                unit = "m" if index < 3 else "rad"
+                row[f"piper_{field}_{unit}"] = "" if eef is None else float(eef.pose[index])
         for index, motor_id in enumerate(self.motor_ids):
             row.update(
                 {
@@ -274,7 +285,11 @@ def output_current_csv(recorder: ReplayCurrentRecorder, output: Path) -> None:
         raise RuntimeError("No replay current samples were recorded")
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["trial", "elapsed_s"]
+    fieldnames = ["trial", "elapsed_s", "sample_monotonic_ns"]
+    if recorder.piper is not None:
+        fieldnames.extend(("piper_joint_timestamp_s", "piper_eef_timestamp_s"))
+        fieldnames.extend(f"piper_joint_{i}_rad" for i in range(1, 7))
+        fieldnames.extend(f"piper_{field}_{'m' if i < 3 else 'rad'}" for i, field in enumerate(RAW_EEF_FIELDS))
     for motor_id in recorder.motor_ids:
         fieldnames.extend(
             (
@@ -311,6 +326,16 @@ def parse_args() -> argparse.Namespace:
         help="Replay N times total, or indefinitely when N is omitted (Ctrl-C stops).",
     )
     parser.add_argument("--dataset-root", default=str(DATASET_ROOT))
+    parser.add_argument(
+        "--piper-y-offset-mm", type=float, default=0.0,
+        help="Add this Piper-base Y offset to prepositioning and Cartesian replay targets (mm). "
+             "Use -5.4 for the measured episode 45 Vicon discrepancy; default: %(default)s.",
+    )
+    parser.add_argument(
+        "--piper-z-offset-mm", type=float, default=0.0,
+        help="Add this Piper-base Z offset to prepositioning and Cartesian replay targets (mm; positive raises the arm). "
+             "Use 15.5 for the measured episode 45 Vicon discrepancy; default: %(default)s.",
+    )
     parser.add_argument("--hand-config", "--leader-config", dest="hand_config")
     parser.add_argument("--hand-port", "--leader-port", dest="hand_port")
     parser.add_argument(
@@ -387,10 +412,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mocap-topic", dest="mocap_topics", action="append", default=[], help="Select a Vicon topic (repeatable); default: discover all supported topics.")
     parser.add_argument(
         "--output-current",
+        "--output-positions",
+        dest="output_current",
         type=Path,
         metavar="PATH",
         help=(
-            "Measure hand motor current during replay and write graph-compatible "
+            "Measure hand positions, velocity and current plus Piper joints/EEF pose during replay and write graph-compatible "
             "telemetry to PATH. No telemetry is saved when omitted."
         ),
     )
@@ -653,6 +680,20 @@ def sample_stream(times: np.ndarray, values: np.ndarray, query_t: float) -> np.n
     )
 
 
+def offset_piper_z(stream, offset_mm):
+    """Shift Cartesian replay targets without modifying the saved episode."""
+    return offset_piper_position(stream, z_mm=offset_mm)
+
+
+def offset_piper_position(stream, *, y_mm=0.0, z_mm=0.0):
+    """Apply replay-only base-frame Y/Z corrections to a copy of the trajectory."""
+    times, poses = stream
+    shifted = poses.copy()
+    shifted[:, 1] += y_mm / 1000.0
+    shifted[:, 2] += z_mm / 1000.0
+    return times, shifted
+
+
 def replay_piper_commands(
     api,
     piper_stream: tuple[np.ndarray, np.ndarray],
@@ -856,6 +897,14 @@ def main() -> int:
 
     if args.joint_level and not args.read_piper_raw:
         raise ValueError("--joint-level requires --read-piper-raw; processed poses contain EEF coordinates")
+    if not math.isfinite(args.piper_z_offset_mm):
+        raise ValueError("--piper-z-offset-mm must be finite")
+    if args.piper_z_offset_mm and (args.joint_level or args.hand_only):
+        raise ValueError("--piper-z-offset-mm requires Cartesian arm replay (not --joint-level or --hand-only)")
+    if not math.isfinite(args.piper_y_offset_mm):
+        raise ValueError("--piper-y-offset-mm must be finite")
+    if args.piper_y_offset_mm and (args.joint_level or args.hand_only):
+        raise ValueError("--piper-y-offset-mm requires Cartesian arm replay (not --joint-level or --hand-only)")
 
     replay_hand = not args.arm_only
     replay_arm = not args.hand_only
@@ -989,6 +1038,14 @@ def main() -> int:
             print(f"Anchored processed relative motion at measured Piper pose: {measured_start}")
         iteration = 1
 
+        # Apply after relative anchoring so its subtraction cannot cancel the offset.
+        # The same stream feeds prepositioning and every replay iteration.
+        if piper_stream is not None and (args.piper_y_offset_mm or args.piper_z_offset_mm):
+            piper_stream = offset_piper_position(
+                piper_stream, y_mm=args.piper_y_offset_mm, z_mm=args.piper_z_offset_mm)
+            print(f"Replay-only Piper target offsets: Y {args.piper_y_offset_mm:+.3f} mm, "
+                  f"Z {args.piper_z_offset_mm:+.3f} mm", flush=True)
+
         def loop_output(path: Path) -> Path:
             if args.loop == 1:
                 return path
@@ -999,7 +1056,7 @@ def main() -> int:
                 total = "indefinite" if args.loop is None else str(args.loop)
                 print(f"Replay iteration {iteration} ({total} total); Ctrl-C stops.")
             if args.output_current is not None:
-                current_recorder = ReplayCurrentRecorder(tuple(hand.motor_ids))
+                current_recorder = ReplayCurrentRecorder(tuple(hand.motor_ids), piper=api)
             move_to_first_pose(hand, api, hand_stream, piper_stream, start_s, args)
             if args.joint_level and api is not None and piper_stream is not None:
                 from scripts.piper_api.replay_trajectory import verify_joint_start

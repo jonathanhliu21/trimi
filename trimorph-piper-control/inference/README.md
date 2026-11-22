@@ -152,6 +152,18 @@ calibration, gains, and limits. It verifies the connected motor models.
 
 ## Coordinate contract
 
+The executor sends the latest hand target at `--hand-command-hz` (default 100 Hz),
+independently of the policy action rate (`--hz`, default 15 Hz) and Piper command
+rate. It repeats each target until the next action arrives, including during
+inference waits. Hand reads and writes share a lock on the serial bus. The writer
+pauses for start-pose resets and stops before hand shutdown. During a pedal reset,
+hand torque is disabled while the arm returns to start. The executor writes the
+hand start target before enabling hand torque again, then waits for the hand to
+reach it. With `--no-hand-start`, it restores torque at the measured hand pose
+after the arm returns. If the arm return fails, hand torque remains off.
+This rate is a host
+scheduling target; serial latency and reads can delay writes.
+
 - State and absolute actions are `[XYZ_m, rotvec_rad, hand_rad]`, shape `[19]`.
 - Hand elements are exactly motor IDs `0..12`, in leader coordinates. Use the
   same signs, home offsets, and zero calibration as collection. There is no

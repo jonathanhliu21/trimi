@@ -61,6 +61,9 @@ DEFAULT_PIPER_PAYLOAD = "half"
 # data_trimorph_unscrew_cap_0 (Vicon poses, one start group), median flange
 # (229, -249, 130) mm, mean Euler xyz (163, -1, 84) deg; starts spread ~20 mm / ~6 deg.
 PIPER_START_JOINTS_DEG = {
+    # Captured from passive can0 joint feedback, 2026-11-21 14:29:22 PST.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    "home_m3": (-34.219, 141.620, -97.148, -8.942, -38.237, 127.376),
     "quest_0": (-59.0, 73.0, -49.0, 20.0, 39.0, 19.0),
     "home_4a": (-34.6, 78.6, -72.0, -7.4, 52.9, 57.4),
     "home_4b": (-24.0, 124.9, -106.4, -24.7, 47.8, 72.2),
@@ -96,6 +99,9 @@ PIPER_START_JOINTS_DEG = {
 }
 # Median first processed_encoder_t row (motors 0..12, leader radians) of the same episodes.
 HAND_START_POSITIONS_RAD = {
+    # Captured from calibrated read_pos(), 2026-11-21 14:15:51 PST.
+    # Motors 0..12; calibration: xl330_new_hand_transparent.yaml.
+    "home_m3": (-1.015737, -0.128475, -3.443903, -7.904272, -0.465476, -1.329049, -0.151068, 0.025398, -0.170893, -0.240835, 0.017728, 0.025456, -0.140389),
     "quest_0": (0.005, -0.027, 0.663, 0.263, 0.013, -1.217, -0.117, 0.016, -0.225, 0.109, 0.018, 0.013, 0.235),
     "home_4a": (0.009, -0.004, 0.658, 0.368, 0.012, -0.420, 0.103, 0.018, -0.067, 0.025, 0.022, 0.004, 0.094),
     "home_4b": (-0.004, -0.005, 0.628, 0.374, 0.012, -0.292, 0.050, 0.018, -0.017, -0.037, 0.021, -0.028, 0.030),
@@ -264,7 +270,7 @@ class HandOnlyCollectionConfig(HandRuntimeConfig):
     follower_hand_config: Path | None = None
     follower_hand_port: str | None = None
     follower_measure_rate_hz: float = DEFAULT_FOLLOWER_MEASURE_RATE_HZ
-    follower_command_rate_hz: float = 50.0
+    follower_command_rate_hz: float = 100.0
     follower_configure_hardware: bool = True
     follower_max_step_rad: float = 0.15
     follower_interpolation_alpha: float = 0.4
