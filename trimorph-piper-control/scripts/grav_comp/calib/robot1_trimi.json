@@ -1,0 +1,848 @@
+{
+  "schema_version": 1,
+  "robot_id": "piper-1",
+  "firmware": {
+    "software_version": "S-V1.8-5",
+    "driver": "v183",
+    "output_scales": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "torque_limits_nm": [
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0
+    ],
+    "feedback_rate_hz": 328.3459175015455,
+    "feedback_max_gap_ms": 5.078315734863281,
+    "joint_motor_agreement_rad": 0.014155242299058735,
+    "forced": false,
+    "updated": "2026-11-22T05:49:49+00:00",
+    "source_run": "gravity_comp/calib/piper-1_probe_20261122T054949Z.npz",
+    "gates": {
+      "version_parseable": {
+        "value": "S-V1.8-5",
+        "threshold": "regex S-Vx.y-z",
+        "pass": true
+      },
+      "feedback_rate_hz": {
+        "value": 328.3459175015455,
+        "threshold": ">= 120.0",
+        "pass": true
+      },
+      "feedback_max_gap_ms": {
+        "value": 5.078315734863281,
+        "threshold": "< 30.0",
+        "pass": true
+      },
+      "joint_motor_agreement_rad": {
+        "value": 0.014155242299058735,
+        "threshold": "< 0.02",
+        "pass": true
+      },
+      "enable_roundtrip": {
+        "value": true,
+        "threshold": "True",
+        "pass": true
+      }
+    },
+    "gates_passed": true
+  },
+  "noise": {
+    "sigma_v": [
+      0.0005000245959842432,
+      0.0007386412170344392,
+      0.0019264751813323476,
+      0.0,
+      0.0024252957803392997,
+      0.0
+    ],
+    "duration_s": 10.0,
+    "q_hold": [
+      -0.8482300164692442,
+      1.70817119221937,
+      -1.2884893202848138,
+      -1.576451193571358,
+      -0.7568096702497812,
+      -3.1438615816173856
+    ],
+    "forced": false,
+    "updated": "2026-11-22T05:49:49+00:00",
+    "source_run": "gravity_comp/calib/piper-1_probe_20261122T054949Z.npz",
+    "gates": {
+      "sigma_v_max_rad_s": {
+        "value": 0.0024252957803392997,
+        "threshold": "< 0.1",
+        "pass": true
+      }
+    },
+    "gates_passed": true
+  },
+  "workspace": {
+    "table_depth_m": 0.49,
+    "margin_m": 0.05,
+    "hand_reach_m": 0.22,
+    "extra_planes": [],
+    "extra_boxes": [],
+    "updated": "2026-11-22T05:51:31+00:00",
+    "gates": {
+      "configured": {
+        "value": 0.49,
+        "threshold": "set",
+        "pass": true
+      }
+    },
+    "gates_passed": true
+  },
+  "feedback": {
+    "beta": [
+      1.0233737683214776,
+      1.0332542701620968,
+      1.0490804553660054,
+      1.285462129663743,
+      1.4235826635257753,
+      -171.50473252469655
+    ],
+    "offset": [
+      -0.008947285702131325,
+      0.0005427934206831964,
+      -0.008682007480231957,
+      -0.0027612950395295727,
+      -0.010292055311960549,
+      -0.038655693643990845
+    ],
+    "r_squared": [
+      0.9844435910531657,
+      0.9993835067515785,
+      0.9981680901717512,
+      0.9916537281585026,
+      0.9872839216122079,
+      0.07398648636901861
+    ],
+    "usable": true,
+    "fc_prior_nm": [
+      0.6071986607142856,
+      0.12280178571428713,
+      0.2889361607142849,
+      0.06561402,
+      0.10822058999999998,
+      0.11257513499999998
+    ],
+    "gravity_used_m_s2": [
+      -0.09894044666709415,
+      -9.797830545292834,
+      0.478359063612315
+    ],
+    "nuisance_fit": {
+      "gravity_vector": [
+        -0.09894044666709415,
+        -9.797830545292834,
+        0.478359063612315
+      ],
+      "raw_magnitude": 10.146218142428767,
+      "com_link6_m": null,
+      "mass_kg": null
+    },
+    "signal_std_nm": [
+      0.709794067632747,
+      4.303171763729609,
+      1.2581368613557657,
+      0.042350141187982825,
+      0.09742984716606627,
+      1.6284739337990845e-06
+    ],
+    "meas_std_nm": [
+      0.7321013841751985,
+      4.4476417820432745,
+      1.3210974117812067,
+      0.0546681181921222,
+      0.13958979826187545,
+      0.001026787843798244
+    ],
+    "resid_rms_nm": [
+      0.09131158967902886,
+      0.1104317523804229,
+      0.05654404689993231,
+      0.004994366254936087,
+      0.015740926020716688,
+      0.0009880737933299372
+    ],
+    "with_hand": false,
+    "n_poses": 16,
+    "forced": false,
+    "updated": "2026-11-22T06:58:50+00:00",
+    "source_run": "gravity_comp/calib/piper-1_feedback_20261122T065850Z.npz",
+    "gates": {
+      "resid_j1": {
+        "value": 0.09131158967902886,
+        "threshold": "<= 0.2 N*m",
+        "pass": true
+      },
+      "r2_j2": {
+        "value": 0.9993835067515785,
+        "threshold": ">= 0.95",
+        "pass": true
+      },
+      "r2_j3": {
+        "value": 0.9981680901717512,
+        "threshold": ">= 0.95",
+        "pass": true
+      },
+      "no_beta_sign_flip": {
+        "value": 1.0233737683214776,
+        "threshold": "> 0 (J[1, 2, 3])",
+        "pass": true
+      },
+      "beta_range": {
+        "value": [
+          1.023,
+          1.033,
+          1.049
+        ],
+        "threshold": "[0.7, 1.4] (J[1, 2, 3])",
+        "pass": true
+      }
+    },
+    "gates_passed": true
+  },
+  "gravity": {
+    "vector_m_s2": [
+      -0.08632051288698087,
+      -9.80516447842472,
+      0.2956320687831977
+    ],
+    "raw_magnitude_m_s2": 9.778655092472764,
+    "rms_residual_nm": 0.09765128157857995,
+    "condition_number": 1.7522321219384593,
+    "n_poses": 14,
+    "split_half_angle_deg": 0.6247819278648112,
+    "angle_to_nominal_deg": 1.7990475000902857,
+    "beta_corrected": true,
+    "joint_mask": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ],
+    "with_hand": false,
+    "forced": false,
+    "updated": "2026-11-22T07:01:18+00:00",
+    "source_run": "gravity_comp/calib/piper-1_gravity_20261122T070118Z.npz",
+    "gates": {
+      "rms_residual_nm": {
+        "value": 0.09765128157857995,
+        "threshold": "<= 0.150",
+        "pass": true
+      },
+      "condition_number": {
+        "value": 1.7522321219384593,
+        "threshold": "<= 30.0",
+        "pass": true
+      },
+      "split_half_angle_deg": {
+        "value": 0.6247819278648112,
+        "threshold": "<= 2.0",
+        "pass": true
+      },
+      "angle_to_nominal_deg": {
+        "value": 1.7990475000902857,
+        "threshold": "<= 10.0",
+        "pass": true
+      },
+      "raw_magnitude_dev": {
+        "value": 0.0031951995440607835,
+        "threshold": "<= 0.15",
+        "pass": true
+      }
+    },
+    "gates_passed": true
+  },
+  "delivery": {
+    "alpha": [
+      0.9883864591054465,
+      0.9796861483573134,
+      1.0366077914216314,
+      0.7931495945110396,
+      0.7399874554295509,
+      0.7399874554295509
+    ],
+    "measured": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "method": {
+      "1": "k-ramp",
+      "2": "k-ramp",
+      "3": "k-ramp",
+      "5": "k-ramp",
+      "4": "k-ramp",
+      "6": "assumed-equal-j5"
+    },
+    "per_pose": {
+      "J1": {
+        "J1 high-g": {
+          "alpha": 0.9883864591054465,
+          "alpha_per_trial": [
+            0.988386459105447,
+            0.9883864591054461
+          ],
+          "alpha_spread": 8.986145161316596e-16,
+          "k_up_mean": 1.4483750000001168,
+          "k_down_mean": 0.5751250000000139,
+          "fc_over_g": 0.4315542377069663
+        }
+      },
+      "J2": {
+        "J2 pose A": {
+          "alpha": 1.0292699000263554,
+          "alpha_per_trial": [
+            1.0294685368677885,
+            1.0290712631849224
+          ],
+          "alpha_spread": 0.0003859761981341879,
+          "k_up_mean": 1.3615000000000876,
+          "k_down_mean": 0.5816250000000132,
+          "fc_over_g": 0.4013509166934881
+        },
+        "J2 pose B": {
+          "alpha": 0.9301023966882713,
+          "alpha_per_trial": [
+            0.9246417013406256,
+            0.9355630920359169
+          ],
+          "alpha_spread": 0.011742137999190277,
+          "k_up_mean": 1.725125000000209,
+          "k_down_mean": 0.4252500000000303,
+          "fc_over_g": 0.6044875893739622
+        }
+      },
+      "J3": {
+        "J3 high-g": {
+          "alpha": 1.0219780456845071,
+          "alpha_per_trial": [
+            1.0238034297414222,
+            1.023541453428795,
+            1.0185892538833041
+          ],
+          "alpha_spread": 0.005102042925614645,
+          "k_up_mean": 1.4308333333334442,
+          "k_down_mean": 0.5261666666666859,
+          "fc_over_g": 0.4622721853176792
+        },
+        "J3 low-g": {
+          "alpha": 1.0804970286330047,
+          "alpha_per_trial": [
+            1.0804970286330047
+          ],
+          "alpha_spread": 0.0,
+          "k_up_mean": 1.8062500000002362,
+          "k_down_mean": 0.044750000000049445,
+          "fc_over_g": 0.9516477579686197
+        }
+      },
+      "J5": {
+        "J5 -": {
+          "alpha": 0.7399874554295509,
+          "alpha_per_trial": [
+            0.7394398742952027,
+            0.7405350365638991
+          ],
+          "alpha_spread": 0.0014799741004536376,
+          "k_up_mean": 1.495500000000082,
+          "k_down_mean": 1.2072499999999857,
+          "fc_over_g": 0.10665063361394471
+        }
+      },
+      "J4": {
+        "J4 +": {
+          "alpha": 0.7906526218780767,
+          "alpha_per_trial": [
+            0.7870142646335422,
+            0.7920007920007893,
+            0.7929428089998984
+          ],
+          "alpha_spread": 0.007498292173209887,
+          "k_up_mean": 1.4305833333333935,
+          "k_down_mean": 1.0989999999999496,
+          "fc_over_g": 0.1310821940372694
+        },
+        "J4 -": {
+          "alpha": 0.8006405124099282,
+          "alpha_per_trial": [
+            0.8006405124099282
+          ],
+          "alpha_spread": 0.0,
+          "k_up_mean": 1.4187500000000564,
+          "k_down_mean": 1.079249999999943,
+          "fc_over_g": 0.1359087269816307
+        }
+      },
+      "J6": {
+        "breakaway": {
+          "coulomb_nm": 0.30859999999998233,
+          "asymmetry": 0.13804277381723185,
+          "spread": 0.19248217757614017,
+          "n_trials": 4
+        }
+      }
+    },
+    "fc6_breakaway_nm": 0.30859999999998233,
+    "notes": {
+      "j6": "J6 is near-gravity-blind under the right-side wall mount (the hand CoM sits ~1.4 cm off the J6 axis -> model torque <= ~0.1 N*m everywhere), far too weak for a gravity k-ramp to observe its delivery scale. J5 and J6 share the same small-motor/driver class and firmware command path, so alpha6 := alpha5 is the best available estimate; the measured J6 breakaway (Fc6, commanded units) is recorded for the stage-5 friction cross-check."
+    },
+    "forced": false,
+    "updated": "2026-11-22T08:28:37+00:00",
+    "source_run": "gravity_comp/calib/piper-1_delivery_j6_20261122T082837Z.npz",
+    "gates": {
+      "J1_enough_trials": {
+        "value": 2,
+        "threshold": ">= 2",
+        "pass": true
+      },
+      "J1_cross_pose_spread": {
+        "value": 0.0,
+        "threshold": "<= 0.15",
+        "pass": true
+      },
+      "J1_not_clamp_limited": {
+        "value": false,
+        "threshold": "False",
+        "pass": true
+      },
+      "J1_alpha_in_range": {
+        "value": 0.9883864591054465,
+        "threshold": "[0.7, 1.3]",
+        "pass": true
+      },
+      "J1_not_on_lattice": {
+        "value": false,
+        "threshold": "False (off [4.0, 2.0, 0.5, 0.25] +-12%)",
+        "pass": true
+      },
+      "J2_enough_trials": {
+        "value": 4,
+        "threshold": ">= 2",
+        "pass": true
+      },
+      "J2_cross_pose_spread": {
+        "value": 0.10122374752808642,
+        "threshold": "<= 0.15",
+        "pass": true
+      },
+      "J2_not_clamp_limited": {
+        "value": false,
+        "threshold": "False",
+        "pass": true
+      },
+      "J2_alpha_in_range": {
+        "value": 0.9796861483573134,
+        "threshold": "[0.7, 1.3]",
+        "pass": true
+      },
+      "J2_not_on_lattice": {
+        "value": false,
+        "threshold": "False (off [4.0, 2.0, 0.5, 0.25] +-12%)",
+        "pass": true
+      },
+      "J3_enough_trials": {
+        "value": 4,
+        "threshold": ">= 2",
+        "pass": true
+      },
+      "J3_cross_pose_spread": {
+        "value": 0.05566675549529976,
+        "threshold": "<= 0.15",
+        "pass": true
+      },
+      "J3_not_clamp_limited": {
+        "value": false,
+        "threshold": "False",
+        "pass": true
+      },
+      "J3_alpha_in_range": {
+        "value": 1.0366077914216314,
+        "threshold": "[0.7, 1.3]",
+        "pass": true
+      },
+      "J3_not_on_lattice": {
+        "value": false,
+        "threshold": "False (off [4.0, 2.0, 0.5, 0.25] +-12%)",
+        "pass": true
+      },
+      "J5_enough_trials": {
+        "value": 2,
+        "threshold": ">= 2",
+        "pass": true
+      },
+      "J5_cross_pose_spread": {
+        "value": 0.0,
+        "threshold": "<= 0.15",
+        "pass": true
+      },
+      "J5_not_clamp_limited": {
+        "value": false,
+        "threshold": "False",
+        "pass": true
+      },
+      "J5_alpha_in_range": {
+        "value": 0.7399874554295509,
+        "threshold": "[0.7, 1.3]",
+        "pass": true
+      },
+      "J5_not_on_lattice": {
+        "value": false,
+        "threshold": "False (off [4.0, 2.0, 0.5, 0.25] +-12%)",
+        "pass": true
+      },
+      "J4_enough_trials": {
+        "value": 4,
+        "threshold": ">= 2",
+        "pass": true
+      },
+      "J4_cross_pose_spread": {
+        "value": 0.012553174919994046,
+        "threshold": "<= 0.15",
+        "pass": true
+      },
+      "J4_not_clamp_limited": {
+        "value": false,
+        "threshold": "False",
+        "pass": true
+      },
+      "J4_alpha_in_range": {
+        "value": 0.7931495945110396,
+        "threshold": "[0.7, 1.3]",
+        "pass": true
+      },
+      "J4_not_on_lattice": {
+        "value": false,
+        "threshold": "False (off [4.0, 2.0, 0.5, 0.25] +-12%)",
+        "pass": true
+      },
+      "J6_j5_measured": {
+        "value": true,
+        "threshold": "True (run J5 first)",
+        "pass": true
+      },
+      "J6_fc_range_nm": {
+        "value": 0.30859999999998233,
+        "threshold": "[0.05, 1.5]",
+        "pass": true
+      },
+      "J6_asymmetry": {
+        "value": 0.13804277381723185,
+        "threshold": "<= 0.5",
+        "pass": true
+      }
+    },
+    "gates_passed": true
+  },
+  "payload": {
+    "mass_kg": 0.823430284716241,
+    "com_m": [
+      0.018989088455364345,
+      0.01174542172260083,
+      0.11665563989501705
+    ],
+    "first_moment": [
+      0.015636190513302548,
+      0.009671535953153523,
+      0.09605778677250917
+    ],
+    "frame": "link6",
+    "mass_free_kg": 0.823430284716241,
+    "rms_residual_nm": 0.13979010899272223,
+    "condition_number": 1.2127313124041146,
+    "n_poses": 13,
+    "split_half_com_m": 0.005844464484263706,
+    "forced": false,
+    "updated": "2026-11-22T07:56:46+00:00",
+    "source_run": "gravity_comp/calib/piper-1_payload_20261122T075224Z.npz",
+    "gates": {
+      "rms_residual_nm": {
+        "value": 0.13979010899272223,
+        "threshold": "<= 0.15",
+        "pass": true
+      },
+      "condition_number": {
+        "value": 1.2127313124041146,
+        "threshold": "<= 100.0",
+        "pass": true
+      },
+      "com_norm_m": {
+        "value": 0.11877322396535041,
+        "threshold": "<= 0.15",
+        "pass": true
+      },
+      "mass_consistency": {
+        "value": 0.0,
+        "threshold": "<= 0.1",
+        "pass": true
+      },
+      "split_half_com_m": {
+        "value": 0.005844464484263706,
+        "threshold": "<= 0.01",
+        "pass": true
+      }
+    },
+    "gates_passed": true
+  },
+  "friction": {
+    "coulomb_nm": [
+      0.6692999999999426,
+      0.7840333333332633,
+      0.8565666666665886,
+      0.0,
+      0.08580000000000143,
+      0.0
+    ],
+    "measured": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
+    ],
+    "asymmetry": {
+      "1": 0.38193283236294767,
+      "2": 0.2914631267365159,
+      "3": 0.03940717569191374,
+      "5": 0.4215851602023519
+    },
+    "spread": {
+      "1": 0.7224852428631726,
+      "2": 0.6236766121270343,
+      "3": 0.3266255936826383,
+      "5": 0.5390157902805305
+    },
+    "viscous_nms": {},
+    "fc_prior_ratio": {
+      "1": 1.3624590877062766,
+      "2": 7.473696966170997,
+      "3": 3.0241397655909736,
+      "5": 1.0045839397721625
+    },
+    "forced": true,
+    "updated": "2026-11-22T08:55:51+00:00",
+    "source_run": "gravity_comp/calib/piper-1_friction_all_20261122T085103Z.npz",
+    "gates": {
+      "J1_fc_range_nm": {
+        "value": 0.8272833333332585,
+        "threshold": "[0.05, 1.5]",
+        "pass": true
+      },
+      "J1_asymmetry": {
+        "value": 0.38193283236294767,
+        "threshold": "<= 0.3",
+        "pass": false
+      },
+      "J1_spread": {
+        "value": 0.7224852428631726,
+        "threshold": "<= 0.5",
+        "pass": false
+      },
+      "J2_fc_range_nm": {
+        "value": 0.9177833333332486,
+        "threshold": "[0.05, 1.5]",
+        "pass": true
+      },
+      "J2_asymmetry": {
+        "value": 0.2914631267365159,
+        "threshold": "<= 0.3",
+        "pass": true
+      },
+      "J2_spread": {
+        "value": 0.6236766121270343,
+        "threshold": "<= 0.5",
+        "pass": false
+      },
+      "J3_fc_range_nm": {
+        "value": 0.8737833333332534,
+        "threshold": "[0.05, 1.5]",
+        "pass": true
+      },
+      "J3_asymmetry": {
+        "value": 0.03940717569191374,
+        "threshold": "<= 0.3",
+        "pass": true
+      },
+      "J3_spread": {
+        "value": 0.3266255936826383,
+        "threshold": "<= 0.5",
+        "pass": true
+      },
+      "J4_breakaway_data": {
+        "value": "0+/0-",
+        "threshold": ">= 1 each",
+        "pass": false
+      },
+      "J5_fc_range_nm": {
+        "value": 0.10871666666666786,
+        "threshold": "[0.05, 1.5]",
+        "pass": true
+      },
+      "J5_asymmetry": {
+        "value": 0.4215851602023519,
+        "threshold": "<= 0.3",
+        "pass": false
+      },
+      "J5_spread": {
+        "value": 0.5390157902805305,
+        "threshold": "<= 0.5",
+        "pass": false
+      },
+      "J6_breakaway_data": {
+        "value": "0+/0-",
+        "threshold": ">= 1 each",
+        "pass": false
+      }
+    },
+    "gates_passed": false
+  },
+  "runtime": {
+    "alpha": [
+      0.9883864591054465,
+      0.9796861483573134,
+      1.0366077914216314,
+      0.7931495945110396,
+      0.7399874554295509,
+      0.7399874554295509
+    ],
+    "assist_target_nm": [
+      0.2007899999999828,
+      0.235209999999979,
+      0.2569699999999766,
+      0.0,
+      0.02574000000000043,
+      0.0
+    ],
+    "assist_frac": 0.3,
+    "kd_soft": [
+      0.2509874999999785,
+      0.2940124999999737,
+      0.32121249999997076,
+      0.05,
+      0.05,
+      0.05
+    ],
+    "deadband_rad_s": 0.02,
+    "gravity_bound_nm": [
+      14.477142670979209,
+      14.737341121484711,
+      6.542561137724107,
+      1.7771743524576984,
+      1.914636420355816,
+      0.1803394062481254
+    ],
+    "requested_tau_cap_nm": [
+      15.350398379864155,
+      15.783007876134498,
+      7.05940577911249,
+      2.7406546819875635,
+      3.122174749204983,
+      0.7437060316697413
+    ],
+    "tau_cap_nm": [
+      7.2,
+      7.2,
+      7.05940577911249,
+      2.7406546819875635,
+      3.122174749204983,
+      0.7437060316697413
+    ],
+    "safe_tau_cap_nm": [
+      7.2,
+      7.2,
+      7.2,
+      7.2,
+      7.2,
+      7.2
+    ],
+    "cap_clamped": [
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ],
+    "underpowered_joints": [
+      1,
+      2
+    ],
+    "firmware_limits_nm": [
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0
+    ],
+    "command_scales_nm": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "cap_fraction_of_limit": [
+      0.9,
+      0.9,
+      0.8824257223890613,
+      0.34258183524844543,
+      0.3902718436506229,
+      0.09296325395871766
+    ],
+    "underpowered_diagnostic": true,
+    "rate_hz": 200.0,
+    "overrun_frac": 0.0,
+    "freeze_reason": "SIGINT",
+    "cycles": 66764,
+    "forced": true,
+    "updated": "2026-11-22T09:02:32+00:00",
+    "source_run": "gravity_comp/calib/piper-1_drag_20261122T090231Z.npz",
+    "gates": {
+      "caps_within_limits": {
+        "value": [
+          0.9,
+          0.9,
+          0.882,
+          0.343,
+          0.39,
+          0.093
+        ],
+        "threshold": "<= 0.9",
+        "pass": true
+      },
+      "full_power_runtime": {
+        "value": [
+          1,
+          2
+        ],
+        "threshold": "no clamped joints",
+        "pass": false
+      },
+      "overrun_fraction": {
+        "value": 0.0,
+        "threshold": "<= 0.2",
+        "pass": true
+      }
+    },
+    "gates_passed": false
+  }
+}

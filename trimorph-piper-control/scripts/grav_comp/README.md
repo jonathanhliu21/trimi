@@ -10,6 +10,8 @@ floor, the mount plate, the arm itself, the base's mounting face and the standin
 | `grav_comp_clearance.py` | Clearance table per pose for every stage (S1–S6); `--render` saves pictures of flagged poses |
 | `grav_comp_video.py` | The same motions as videos: one MP4 per stage plus `all_stages.mp4` / `.webm` |
 | `held_joint_drift.py` | The torque stages with the spring-held joints drifted to the 0.08 rad abort limit |
+| `run_gravity_comp.sh` | Runs the real bring-up on the arm (stages 0–6) as one guided session: stops before each stage, says when to take the hand off (0–3) and mount it (4a on), resumes from the calibration file |
+| `calib/robot1_trimi.json` | The Piper + TRIMI calibration from the 2026-11-22 bring-up, which `run_gravity_comp.sh` reads and writes (see the notes at the end) |
 | `tests/` | `python -m pytest scripts/grav_comp/tests` |
 
 ## Setup
@@ -31,6 +33,11 @@ python3 scripts/grav_comp/grav_comp_clearance.py --viscous            # all stag
 python3 scripts/grav_comp/grav_comp_clearance.py --stages S3 S5 --render
 python3 scripts/grav_comp/grav_comp_video.py --viscous                # output/grav_comp_clearance/video/
 python3 scripts/grav_comp/held_joint_drift.py --viscous
+
+# On the arm (CAN up, someone at the arm). Calibration: scripts/grav_comp/calib/robot1_trimi.json
+scripts/grav_comp/run_gravity_comp.sh --list        # what has passed, where it would start
+scripts/grav_comp/run_gravity_comp.sh               # guided run from the first unfinished stage
+scripts/grav_comp/run_gravity_comp.sh --from 4a --hand-mass 0.9
 ```
 
 Common options: `--base-above-desk` (0.49 m as built), `--desk-height` (0.75 m),
@@ -72,3 +79,28 @@ clearance gravity_comp's own guard computes (table plane only).
   operator has to catch the arm.
 - gravity_comp's own guard never trips: it checks a table plane only and does not see the
   hand's sides or anything behind the base.
+
+## Calibration of 2026-11-22 (`calib/robot1_trimi.json`)
+
+Firmware S-V1.8-5 with the `v183` driver, which caps torque-mode commands at 8 N·m on every
+joint. All stage settings below are built into `run_gravity_comp.sh`.
+
+- **Delivery alpha J1–J6:** 0.988, 0.980, 1.037, 0.793, 0.740, 0.740 (J6 set equal to J5 by
+  design). The wrist delivers only about 75–80% of the commanded torque.
+- **Payload:** 0.823 kg, CoM (19.0, 11.7, 116.7) mm in link6, from the arm's own fit (no scale
+  reading). The fit's rms (0.140 N·m) is over stage 4a's 0.10 limit, so it was saved with
+  `resolve_offline --rms-gate 0.15`, stage 2's limit. It is valid for the hand as mounted that
+  night; mounting it differently means redoing stage 4a.
+- **Friction:** J1 0.669, J2 0.784, J3 0.857, J5 0.086 N·m (weaker direction). J4 and J6 have
+  no data (the wrist trips the speed abort), so drag mode gives them no friction assist. J1, J2
+  and J5 fail the asymmetry/spread checks, so the section is saved forced and drag mode needs
+  `--force`.
+- **Drag mode is underpowered on J1/J2:** holding the arm everywhere needs up to ~15 N·m there,
+  against the 7.2 N·m usable cap, so it runs with `--allow-underpowered`. The arm holds around
+  the `quest_0`, `home_4a`, `home_cube_newhw` and `home_unscrew1` start poses and sags around
+  `home_4b`/`4c`/`4d`/`m3`. Firmware 1.8-8 or newer (16 N·m) would cover all start poses.
+- **Wrist hard stops** at about J4 ±1.79 and J5 ±1.31 rad, past the URDF limits. Stage 4b's J4
+  probe pose sits only 0.195 rad from J4's, hence its 0.15 rad catch radius.
+- **Needs these midas-piper-control changes** (not upstream as of this date): the bare-arm
+  (`--no-hand`) stages zero the model's 0.7 kg placeholder payload, and `resolve_offline`
+  takes `--rms-gate`.
