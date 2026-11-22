@@ -70,7 +70,8 @@ python replay_trajectory.py grasp01 --condition human
 python plot_trials.py grasp01
 ```
 
-Each session lives in `data/<session>/` (gitignored):
+Each session lives in `data/<session>/`. Sessions are gitignored except
+`t2_rss02`, the Trimi2 dataset behind the RSS table:
 
 ```
 trajectory/leader_hand.csv, metadata.json     # desired trajectory

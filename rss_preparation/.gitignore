@@ -1,1 +1,3 @@
-data/
+# Session data stays local, except t2_rss02: the dataset behind the RSS table.
+data/*
+!data/t2_rss02/
