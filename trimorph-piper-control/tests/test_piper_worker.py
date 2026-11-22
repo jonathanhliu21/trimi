@@ -7,6 +7,37 @@ from data_collection.collection.piper_worker import piper_workspace_warning, run
 
 
 class PiperWorkspaceWarningTests(unittest.TestCase):
+    def test_cartesian_worker_records_measured_pose_without_reading_joints(self):
+        shutdown = threading.Event()
+        rows = []
+        session = SimpleNamespace(elapsed_s=lambda _: 0., append_piper=rows.append)
+        config = SimpleNamespace(
+            piper_firmware="v183", piper_interface="socketcan", piper_channel="can0",
+            piper_installation_pos=None, piper_payload=None,
+            piper_rate_hz=250., teacher_mode_poll_hz=20., piper_joint_level=False,
+        )
+        pose = [.4, -.2, .3, .5, -.6, .7]
+        with patch("scripts.piper_api.piper_api.PiperAPI") as api_type:
+            api = api_type.return_value
+            api.is_ok.return_value = True
+            api.get_state.return_value = {"teach_status": "START_RECORDING"}
+
+            def read_pose():
+                shutdown.set()
+                return SimpleNamespace(pose=pose, timestamp=1., hz=250.)
+
+            api.get_eef_state.side_effect = read_pose
+            run_piper_worker(config, SimpleNamespace(shutdown=shutdown),
+                             SimpleNamespace(current=lambda: session), init_done=threading.Event())
+            api.get_joint_state.assert_not_called()
+            api.enable.assert_not_called()
+            api.move_eef.assert_not_called()
+            api.move_joint.assert_not_called()
+            api.disconnect.assert_called_once()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([float(rows[0][k]) for k in ("x", "y", "z", "roll", "pitch", "yaw")], pose)
+        self.assertFalse(any(k.startswith("joint_") for k in rows[0]))
+
     def test_normal_state_has_no_warning(self):
         self.assertIsNone(
             piper_workspace_warning(

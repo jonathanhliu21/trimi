@@ -272,6 +272,17 @@ class HandOnlyCollectionTests(unittest.TestCase):
         with patch("sys.argv", ["collect_hand_only.py", "--use-piper"]):
             self.assertTrue(parse_args().use_piper)
 
+    def test_piper_without_mocap_uses_only_camera_arm_and_hand(self):
+        with (patch("sys.argv", ["collect_hand_only.py", "--use-piper", "--no-mocap"]),
+              patch("data_collection.collect_hand_only.run_hand_only") as run):
+            main()
+        config = run.call_args.args[0]
+        self.assertFalse(config.use_quest)
+        self.assertFalse(config.use_mocap)
+        self.assertFalse(config.piper_joint_level)
+        self.assertEqual([name for name, _ in worker_specs(config)],
+                         ["task_camera", "piper", "leader_hand"])
+
     def test_quest_flag_is_on_by_default_and_mutually_exclusive_with_piper(self):
         with patch("sys.argv", ["collect_hand_only.py"]):
             self.assertTrue(parse_args().use_quest)
@@ -508,6 +519,9 @@ class HandOnlyCollectionTests(unittest.TestCase):
 
             metadata = json.loads(session.paths.metadata_path.read_text())
             self.assertEqual(metadata["piper"]["mode"], "passive_drag_teach_logging")
+            self.assertEqual(metadata["piper"]["eef_source"], "arm_flange_pose_feedback")
+            self.assertEqual(metadata["piper"]["eef_frame"], "piper_base")
+            self.assertEqual(metadata["piper"]["eef_orientation"], "Euler xyz radians")
             self.assertEqual(metadata["piper"]["target_rate_hz"], 250.0)
             self.assertEqual(metadata["counts"]["piper_samples"], 1)
             self.assertIsNone(metadata["piper"]["start_pose"])

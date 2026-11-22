@@ -16,6 +16,14 @@ their DepthAI capture time on that clock. Foot-pedal recording is the
 default; use `--episode-s` for a fixed duration or `--retarget-only` to run
 without recording. `replay_episode.py` replays saved hand and Piper streams.
 
+For direct 6-DoF arm-pose demonstrations without external tracking, use
+`--use-piper --no-mocap`, then postprocess with `--pose-source piper` and no
+calibration file. Keep the camera enabled for image-policy training. The arm's
+measured flange feedback supplies XYZ/Euler poses; postprocessing writes
+XYZ/rotation-vector actions. Arm joint logging is optional and does not change
+the Cartesian training action format. See [PIPELINE.md](PIPELINE.md#2-collecting)
+for the collection, postprocessing, and training commands.
+
 Each run saves its episodes to the next free `data_collection_n` folder
 (`n = 0, 1, 2, ...`), printed at startup as `Saving episodes to ...`. Use
 `--dataset-name NAME` to save to `NAME_n` instead; `NAME` may include parent

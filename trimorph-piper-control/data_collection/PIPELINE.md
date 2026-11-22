@@ -26,6 +26,69 @@ mocap) and [DATASET_SPEC.md](DATASET_SPEC.md) (the trainer's contract).
 
 ## 2. Collecting
 
+For direct arm demonstrations without mocap or Quest, record the arm's measured
+6-DoF flange feedback alongside the hand and camera:
+
+```bash
+python3 data_collection/collect_hand_only.py \
+  --dataset-root data_piper_fk --use-piper --no-mocap \
+  --hand-config config/xl330_test_config.yaml --hand-port /dev/serial/by-id/YOUR_GLOVE
+python3 data_collection/postprocess_dataset.py data_piper_fk --pose-source piper
+```
+
+Use the arm's built-in drag-teach button to demonstrate. The logger reads
+`PiperAPI.get_eef_state()` / SDK `get_flange_pose()` (arm-reported Cartesian
+feedback); it does not compute a separate FK model on the host. Raw `piper.csv`
+contains base-frame XYZ in metres and roll/pitch/yaw in radians. No external
+tracking, calibration, or start-pose anchoring is needed. Arm joint logging
+remains off unless `--piper-joint-level` is supplied; even with it, training
+actions use the six Cartesian pose fields. These poses describe the flange;
+a tool-tip offset would need a separate transform.
+
+Keep the camera enabled for the image-policy trainer. In the diffusion-policies
+repository, train on this output using the existing Trimi configuration:
+
+```bash
+python diffusion_policy/unet/train_unet_image_policy.py \
+  --config-name=train_unet_image_trimi_hand_cond_dinov2_policy \
+  tasks.dataset.dataset_path=/absolute/path/to/data_piper_fk
+```
+
+Postprocessing writes absolute XYZ + rotation-vector arrays, and the trainer
+converts them to window-relative SE(3) poses plus 13 hand-joint deltas (19
+action dimensions). `--no-camera` supports processing/replay only with these
+image-policy configs. `--pose-source auto` (the default) selects Piper when
+no calibration is supplied, preserving the existing command behavior.
+
+For the transparent XL330 hand on `/dev/ttyUSB0`, this complete test sequence
+uses the exact folder `data_trimorph_test_kinesthetic`:
+
+```bash
+python3 data_collection/collect_hand_only.py \
+  --hand-config config/xl330_new_hand_transparent.yaml \
+  --hand-port /dev/ttyUSB0 \
+  --dataset-root data_trimorph_test_kinesthetic \
+  --use-piper --no-mocap
+
+python3 data_collection/postprocess_dataset.py \
+  data_trimorph_test_kinesthetic --pose-source piper
+
+python3 data_collection/replay_episode.py 0 \
+  --dataset-root data_trimorph_test_kinesthetic \
+  --hand-config config/xl330_new_hand_transparent.yaml \
+  --hand-port /dev/ttyUSB0 --playback-speed 0.5
+```
+
+Collect with the pedal, then stop the collector before postprocessing/replay.
+`--dataset-root` appends episodes if the folder already exists. Replay `0`
+selects `episode_000000`; change the index for another episode or omit it for
+the latest. Replay enables and moves both devices, prepositions at the recorded
+start, and uses processed Cartesian poses without reanchoring. Arm Euler angles
+are unwrapped before interpolation to avoid jumps at ±pi. No mocap is opened
+unless `--use-mocap` is explicitly requested during replay. Hand targets retain
+the configured `ACTION_SCALE` / `JOINT_ACTION_SCALES` in
+`collection/replay_config.py` and hand joint-limit clipping.
+
 ```bash
 python3 data_collection/collect_hand_only.py \
   --hand-config config/xl330_test_config.yaml \

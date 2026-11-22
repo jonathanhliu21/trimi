@@ -138,8 +138,9 @@ def parse_args() -> argparse.Namespace:
         "--use-piper",
         action="store_true",
         help=(
-            "passively record Piper EEF and drag-teach state alongside the hand "
-            "instead of the Quest; the collector never commands or enables the arm"
+            "passively record measured Piper flange XYZ (m) and roll/pitch/yaw (rad) "
+            "instead of Quest; add --no-mocap for arm-only pose feedback. "
+            "Joint logging is opt-in with --piper-joint-level"
         ),
     )
     parser.add_argument(

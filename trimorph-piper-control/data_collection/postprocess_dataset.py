@@ -12,6 +12,8 @@ With --pose-source mocap the calibration's Vicon
 marker plate recorded in mocap.csv (collect_hand_only.py --use-mocap) is
 converted to the flange pose instead, using the calibration's Vicon-to-Piper
 and plate-to-flange transforms. Raw files are preserved.
+For direct arm demonstrations use --pose-source piper without a calibration:
+recorded base-frame flange XYZ/Euler feedback becomes XYZ/rotvec actions.
 Use --apply-calibration-latency to align Quest receipt timestamps to the reference
 clock using the calibration's latency_s before synchronizing with hand and camera.
 """
@@ -43,11 +45,27 @@ class PostprocessConfig(base.PostprocessConfig):
     piper_start_pose: tuple[float, ...] | None = None
     absolute: bool = False
     max_start_offset_mm: float = 150.0
-    pose_source: str = "quest"
+    pose_source: str = "auto"
     mocap_topic: str | None = None
     max_start_rotation_deg: float = 45.0
     mocap_smooth_s: float = 0.02
     apply_calibration_latency: bool = False
+
+
+def resolve_pose_source(config):
+    source = config.pose_source
+    if source == "auto":
+        source = "quest" if config.calibration_json is not None else "piper"
+    if source not in ("piper", "quest", "mocap"):
+        raise ValueError(f"Unknown pose source: {source}")
+    if source == "piper" and config.calibration_json is not None:
+        raise ValueError("--pose-source piper reads measured flange poses; omit --calibration-json")
+    if source != "piper" and config.calibration_json is None:
+        raise ValueError(f"--pose-source {source} requires --calibration-json")
+    if source == "piper" and (config.absolute or config.piper_start_pose is not None
+                              or config.apply_calibration_latency):
+        raise ValueError("Piper poses are already absolute in the arm base; omit calibration/anchor options")
+    return source
 
 
 def processed_episode_dir(episode_dir: Path) -> Path:
@@ -334,6 +352,7 @@ def validate_outputs(out, replay_csv, no_camera):
 
 
 def process_episode(config, episode):
+    source = resolve_pose_source(config)
     metadata = base.read_json(episode.metadata_path)
     if config.process_only_raw_statuses and metadata.get("status") not in config.process_only_raw_statuses:
         print(f"Skipping {episode.name}: status={metadata.get('status')!r}")
@@ -356,12 +375,12 @@ def process_episode(config, episode):
     # Collection with --piper-start-joints-deg records the arm's measured start pose.
     start_pose = config.piper_start_pose or (metadata.get("piper") or {}).get("start_pose")
     self_anchored = False
-    if config.calibration_json is not None:
+    if source != "piper":
         calibration = base.read_json(config.calibration_json)
         # Absolute poses that need no start pose: Vicon, or Quest when the calibration has C.
-        self_anchored = config.absolute and (config.pose_source == "mocap"
+        self_anchored = config.absolute and (source == "mocap"
                                              or controller_rotation(calibration) is not None)
-        if config.pose_source == "mocap":
+        if source == "mocap":
             converted, eef, eef_ns, start_offset, mocap_topic = convert_mocap(
                 episode, calibration, start_pose, config.mocap_topic, config.absolute, config.max_start_offset_mm,
                 config.max_start_rotation_deg, config.mocap_smooth_s)
@@ -394,11 +413,11 @@ def process_episode(config, episode):
     sync.update(encoder_monotonic_ns=hand_ns, pose_monotonic_ns=eef_ns,
                 start_pose=episode_start_pose(start_pose, eef, calibration, self_anchored),
                 pose_frame=np.array(pose_frame))
-    from_quest = calibration is not None and config.pose_source == "quest"
+    from_quest = source == "quest"
     quest_first = base.read_csv_rows(episode.path / "quest.csv")[0] if from_quest else None
     processing = dict(
         episode=episode.name, episode_index=episode.index, pose_frame=pose_frame,
-        source=("piper.csv" if calibration is None else "quest.csv" if from_quest else "mocap.csv"),
+        source=f"{source}.csv",
         mocap_topic=mocap_topic,
         replay_orientation="Euler xyz radians: Rz(yaw) Ry(pitch) Rx(roll)",
         action_orientation="rotation vector radians", camera_enabled=not config.no_camera,
@@ -406,7 +425,7 @@ def process_episode(config, episode):
         max_sync_error_s=config.max_sync_error_s,
         trim_camera_frames=0 if config.no_camera else config.trim_camera_frames,
         piper_start_pose=list(start_pose) if start_pose is not None else None,
-        position_mapping=(("absolute_vicon" if config.pose_source == "mocap" else "absolute_calibration_origin")
+        position_mapping=(("absolute_vicon" if source == "mocap" else "absolute_calibration_origin")
                           if config.absolute
                           else "relative_to_start_pose" if calibration is not None else None),
         first_pose_offset_from_start_m=start_offset.tolist() if start_offset is not None else None,
@@ -467,9 +486,9 @@ def main():
     parser.add_argument("--mocap-smooth-s", type=float, default=0.02,
                         help="Gaussian smoothing sigma for Vicon poses after removing single-frame spikes "
                              "(0 = raw poses, no filtering; default: %(default)s)")
-    parser.add_argument("--pose-source", choices=("quest", "mocap"), default="quest",
-                        help="Demonstration pose stream: quest.csv, or the calibration's Vicon marker plate in mocap.csv "
-                             "converted to the flange pose (needs a calibration fitted with --reference mocap)")
+    parser.add_argument("--pose-source", choices=("auto", "piper", "quest", "mocap"), default="auto",
+                        help="Pose stream: piper reads measured base-frame flange poses without calibration; "
+                             "quest/mocap require calibration. Default auto selects quest with calibration, otherwise piper.")
     parser.add_argument("--mocap-topic", help="Vicon pose topic of the tracked hand object, e.g. /vicon/Hand/Hand "
                                               "(required when mocap.csv has several pose topics)")
     parser.add_argument("--max-sync-error-s", type=float, default=base.MAX_SYNC_ERROR_S)
@@ -484,7 +503,7 @@ def main():
         parser.error("--absolute and --pose-source mocap require --calibration-json")
     if args.mocap_topic is not None and args.pose_source != "mocap":
         parser.error("--mocap-topic requires --pose-source mocap")
-    if args.apply_calibration_latency and (args.calibration_json is None or args.pose_source != "quest"):
+    if args.apply_calibration_latency and (args.calibration_json is None or args.pose_source not in ("auto", "quest")):
         parser.error("--apply-calibration-latency requires --calibration-json and --pose-source quest")
     if not np.isfinite(args.max_start_offset_mm) or args.max_start_offset_mm <= 0:
         parser.error("--max-start-offset-mm must be finite and positive")
@@ -499,6 +518,10 @@ def main():
                                args.absolute, args.max_start_offset_mm, args.pose_source, args.mocap_topic,
                                args.max_start_rotation_deg, args.mocap_smooth_s, args.apply_calibration_latency)
     base.validate_config(config)
+    try:
+        resolve_pose_source(config)
+    except ValueError as exc:
+        parser.error(str(exc))
     episodes = base.discover_raw_episodes(config)
     if args.episode is not None:
         name = f"episode_{int(args.episode):06d}" if args.episode.isdigit() else args.episode

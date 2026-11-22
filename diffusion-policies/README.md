@@ -68,6 +68,15 @@ include the current absolute 13-joint hand state. Targets remain window-relative
 6D EEF poses plus 13 joint deltas. Inference still needs the current EEF and hand
 state to convert relative predictions to absolute commands. The joint order and
 units must agree between data and inference.
+Direct Piper flange-feedback demonstrations are also supported: collect with
+`collect_hand_only.py --use-piper --no-mocap` and postprocess with
+`postprocess_dataset.py DATASET --pose-source piper` in trimorph-piper-control.
+Keep the camera enabled. No mocap, Quest, calibration, or arm joint logging is
+required. The arm reports XYZ + Euler angles; postprocessing converts orientation
+to rotation vectors. The same Trimi training command above consumes the resulting
+six Cartesian pose values plus 13 hand values, and trains relative SE(3) targets.
+This uses arm-reported flange feedback rather than a host-side FK model or tool-tip pose.
+
 Calibrated Quest-to-Piper poses are supported as XYZ plus rotation vectors;
 for deployment, use the actual Piper start pose during postprocessing so the
 training and execution frames agree. Camera-free output needs a separate loader.

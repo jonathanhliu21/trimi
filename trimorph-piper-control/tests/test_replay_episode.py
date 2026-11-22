@@ -42,6 +42,18 @@ from scripts.trimorph_api_test.gen_graphs_from_csvs import _load_telemetry
 
 
 class ReplayEpisodeTests(unittest.TestCase):
+    def test_cartesian_feedback_wrap_interpolates_continuously(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'piper.csv'
+            path.write_text('elapsed_s,x,y,z,roll,pitch,yaw\n'
+                            '0,.4,-.2,.3,3.13,.2,3.12\n'
+                            '1,.42,-.2,.3,-3.13,.3,-3.12\n')
+            before = path.read_bytes()
+            times, poses = load_piper_stream(path)
+            target = sample_stream(times, poses, .5)
+            np.testing.assert_allclose(target, [.41, -.2, .3, np.pi, .25, np.pi])
+            self.assertEqual(path.read_bytes(), before)
+
     def test_combined_y_z_offsets_preserve_other_coordinates_and_source(self):
         times = np.array([0., 1.])
         poses = np.array([[.4, -.3, .06, 1., 2., 3.], [.5, -.2, .08, 2., 3., 4.]])

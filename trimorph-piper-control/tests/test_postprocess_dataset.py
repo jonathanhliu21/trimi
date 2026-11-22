@@ -16,6 +16,51 @@ from data_collection.replay_episode import (
 
 
 class PostprocessTests(unittest.TestCase):
+    def test_piper_source_without_calibration_or_trackers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, raw, *_ = self.fixture(Path(directory))
+            config = replace(config, calibration_json=None, pose_source='piper')
+            (raw.path / 'quest.csv').unlink()
+            poses = np.array([[.4, -.1, .3, .5, -.6, .7], [.42, -.11, .31, .6, -.5, .8]])
+            fields = ['x', 'y', 'z', 'roll', 'pitch', 'yaw']
+            self.write_csv(raw.piper_path, ['monotonic_ns', 'elapsed_s', *fields],
+                           [dict(monotonic_ns=1_000_000_000+i*20_000_000, elapsed_s=i*.02,
+                                 **dict(zip(fields, pose))) for i, pose in enumerate(poses)])
+            original = raw.piper_path.read_bytes()
+            summary = post.process_episode(config, raw)
+            self.assertEqual(raw.piper_path.read_bytes(), original)
+            eef = np.load(summary['eef'])
+            np.testing.assert_allclose(eef[:, :3], poses[:, :3], atol=1e-7)
+            np.testing.assert_allclose(Rotation.from_rotvec(eef[:, 3:]).as_matrix(),
+                                       Rotation.from_euler('xyz', poses[:, 3:]).as_matrix(), atol=1e-7)
+            replay_path, frame = resolve_piper_source(raw.path)
+            self.assertEqual(frame, 'piper_base')
+            np.testing.assert_allclose(load_piper_stream(replay_path)[1], poses)
+            # Exercise real Cartesian command dispatch with a simulated arm.
+            # Base-frame feedback must retain the recorded pose, with no reanchoring.
+            api = MagicMock()
+            api.is_ok.return_value = True
+            api.enable.return_value = True
+            with (patch('sys.argv', ['replay_episode.py', '0', '--dataset-root', str(config.dataset_root),
+                                     '--arm-only', '--playback-speed', '.5']),
+                  patch('scripts.piper_api.piper_api.PiperAPI', return_value=api),
+                  patch('data_collection.replay_episode.move_to_first_pose') as preposition):
+                self.assertEqual(replay_main(), 0)
+            np.testing.assert_allclose(preposition.call_args.args[3][1], poses)
+            self.assertGreaterEqual(api.move_eef.call_count, 2)
+            np.testing.assert_allclose(api.move_eef.call_args.args[0], poses[-1])
+            api.get_eef_pose.assert_not_called()
+            api.move_joint.assert_not_called()
+            api.disconnect.assert_called_once()
+            with np.load(summary['sync']) as sync:
+                self.assertEqual(str(sync['pose_frame']), 'piper_base')
+                np.testing.assert_allclose(sync['start_pose'], eef[0])
+            self.assertEqual(post.resolve_pose_source(replace(config, pose_source='auto')), 'piper')
+            with self.assertRaisesRegex(ValueError, 'omit --calibration-json'):
+                post.resolve_pose_source(replace(config, calibration_json=Path('unused.json')))
+            with self.assertRaisesRegex(ValueError, 'requires --calibration-json'):
+                post.resolve_pose_source(replace(config, pose_source='quest'))
+
     def write_csv(self, path, fields, rows):
         with path.open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)

@@ -631,11 +631,18 @@ def build_replay_config(
 def load_piper_stream(
     path: Path, *, allow_empty: bool = False, joint_level: bool = False
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    return load_stream(
+    stream = load_stream(
         path,
         PIPER_JOINT_FIELDS if joint_level else RAW_EEF_FIELDS,
         allow_empty=allow_empty,
     )
+    if stream is not None and not joint_level:
+        # Arm feedback can wrap Euler angles at +/-pi. Keep interpolation on
+        # the continuous branch rather than sweeping through zero at a wrap.
+        times, poses = stream
+        poses[:, 3:] = np.unwrap(poses[:, 3:], axis=0)
+        return times, poses
+    return stream
 
 
 def resolve_piper_source(episode_dir: Path, *, read_piper_raw=False) -> tuple[Path, str]:

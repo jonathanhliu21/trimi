@@ -326,6 +326,10 @@ class EpisodeBuffer:
             },
             "piper": {
                 "mode": "passive_drag_teach_logging" if has_piper else None,
+                "eef_source": "arm_flange_pose_feedback" if has_piper else None,
+                "eef_frame": "piper_base" if has_piper else None,
+                "eef_position_units": "metres" if has_piper else None,
+                "eef_orientation": "Euler xyz radians" if has_piper else None,
                 "joint_level_recording": (
                     bool(getattr(self.config, "piper_joint_level", False))
                     if has_piper
