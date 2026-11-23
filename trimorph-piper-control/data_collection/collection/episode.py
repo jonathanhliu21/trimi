@@ -8,7 +8,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .config import QUEST_PACKET_FIELDS, RAW_EEF_FIELDS, TRIMORPH_MOTOR_IDS
+from .config import (
+    ARM_MODE_GRAVITY_COMP,
+    EEF_FRESH_S,
+    PIPER_CURRENT_FIELDS,
+    PIPER_ENABLE_FIELDS,
+    PIPER_JOINT_FIELDS,
+    PIPER_STATUS_FIELDS,
+    PIPER_TORQUE_FIELDS,
+    PIPER_VELOCITY_FIELDS,
+    QUEST_PACKET_FIELDS,
+    RAW_EEF_FIELDS,
+    TRIMORPH_MOTOR_IDS,
+)
 from .utils import WorkerError, utc_stamp, write_csv, write_json
 
 
@@ -86,10 +98,19 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _sha256_or_none(path: Path | None) -> str | None:
+    return _sha256(path) if path is not None and path.is_file() else None
+
+
 def _hand_metadata(path: Path, port: str) -> dict[str, Any]:
     from midas_hand_api import HandConfig
 
     hand_config = HandConfig.load(path)
+    motor_ids = [int(motor_id) for motor_id in hand_config.motor_ids]
+
+    def by_motor(values) -> dict[str, float]:
+        return {str(motor_id): float(value) for motor_id, value in zip(motor_ids, values)}
+
     return {
         "config_path": str(path.resolve()),
         "config_sha256": _sha256(path),
@@ -99,6 +120,57 @@ def _hand_metadata(path: Path, port: str) -> dict[str, Any]:
         "baudrate": hand_config.baudrate,
         "current_limit_ma": hand_config.goal_current_limit,
         "motor_ids": list(hand_config.motor_ids),
+        # The calibration itself, so a dataset stays readable if the YAML changes.
+        "operating_mode": int(hand_config.operating_mode),
+        "home_offsets": by_motor(hand_config.home_offsets_array),
+        "joint_signs": by_motor(hand_config.joint_signs_array),
+        "joint_lower_limits": by_motor(hand_config.joint_lower_limits_array),
+        "joint_upper_limits": by_motor(hand_config.joint_upper_limits_array),
+    }
+
+
+def hand_samples_outside_limits(
+    path: Path, rows: list[dict[str, object]]
+) -> dict[str, dict[str, int]]:
+    """Per motor, the leader samples below and above the YAML limits.
+
+    The rollout's set_positions clips to these limits, so these samples are
+    targets it would never reach.
+    """
+    from midas_hand_api import HandConfig
+
+    hand_config = HandConfig.load(path)
+    counts: dict[str, dict[str, int]] = {}
+    for motor_id, lower, upper in zip(
+        hand_config.motor_ids,
+        hand_config.joint_lower_limits_array,
+        hand_config.joint_upper_limits_array,
+    ):
+        key = f"pos_{int(motor_id)}"
+        values = [float(row[key]) for row in rows if row.get(key) not in (None, "")]
+        counts[str(int(motor_id))] = {
+            "below": int(sum(value < lower for value in values)),
+            "above": int(sum(value > upper for value in values)),
+        }
+    return counts
+
+
+def arm_health_summary(piper_rows: list[dict[str, object]]) -> dict[str, Any]:
+    """How the gravity-comp arm feedback looked over an episode (arm_ok: every
+    drive enabled and no error code)."""
+
+    def values(name: str) -> list[str]:
+        return sorted({str(row.get(name, "")) for row in piper_rows} - {""})
+
+    not_ok = [row for row in piper_rows if str(row.get("arm_ok")) == "0"]
+    return {
+        "samples": len(piper_rows),
+        "not_ok_samples": len(not_ok),
+        "first_not_ok_elapsed_s": float(not_ok[0]["elapsed_s"]) if not_ok else None,
+        "ctrl_modes": values("ctrl_mode"),
+        "arm_statuses": values("arm_status"),
+        "err_codes": values("err_code"),
+        "eef_samples": sum(1 for row in piper_rows if row.get("x") not in (None, "")),
     }
 
 
@@ -120,6 +192,11 @@ class EpisodeBuffer:
         self.quest_rows: list[dict[str, object]] = []
         self.mocap_rows: list[dict[str, object]] = []
         self.video_done = threading.Event()
+        self.grav_comp_calib_sha256_at_start = (
+            _sha256_or_none(getattr(config, "grav_comp_calib", None))
+            if getattr(config, "arm_mode", None) == ARM_MODE_GRAVITY_COMP
+            else None
+        )
 
     def elapsed_s(self, sample_ns: int) -> float:
         return (sample_ns - self.start_ns) / 1e9
@@ -210,9 +287,57 @@ class EpisodeBuffer:
             getattr(self.config, "use_piper", True)
         )
         has_quest = bool(getattr(self.config, "use_quest", False))
+        gravity_comp = has_piper and getattr(self.config, "arm_mode", None) == ARM_MODE_GRAVITY_COMP
+        joint_level = gravity_comp or (
+            has_piper and bool(getattr(self.config, "piper_joint_level", False))
+        )
+        flags: list[str] = []
+        gravity_comp_metadata = None
+        if gravity_comp:
+            calib = getattr(self.config, "grav_comp_calib", None)
+            calib_sha256 = _sha256_or_none(calib)
+            health = arm_health_summary(piper_rows)
+            if not piper_rows:
+                flags.append("no_piper_samples")
+            if health["not_ok_samples"]:
+                flags.append("arm_not_ok")
+            gravity_comp_metadata = {
+                "sends_can_frames": False,
+                "row_rate": (
+                    "one row per new joint feedback frame, deduplicated on its CAN "
+                    "receive time"
+                ),
+                "poll_rate_hz": getattr(self.config, "piper_rate_hz", None),
+                "timestamps": (
+                    "robot_timestamp_s: CAN receive time of the joint frame (host wall "
+                    "clock); joint_rx_monotonic_ns: the same instant on the host "
+                    "monotonic clock; monotonic_ns: when the collector saw the frame"
+                ),
+                "motor_fields": [
+                    *PIPER_VELOCITY_FIELDS,
+                    *PIPER_CURRENT_FIELDS,
+                    *PIPER_TORQUE_FIELDS,
+                ],
+                "motor_units": "vel rad/s, current A, torque N*m (current-derived)",
+                "enable_fields": list(PIPER_ENABLE_FIELDS),
+                "status_fields": [*PIPER_STATUS_FIELDS, "arm_ok"],
+                "eef_logged_when": (
+                    f"the firmware end pose arrived within {EEF_FRESH_S:g}s of the "
+                    "joint frame; blank otherwise"
+                ),
+                "calibration_path": str(calib.resolve()) if calib is not None else None,
+                "calibration_sha256": calib_sha256,
+                "calibration_changed_during_episode": (
+                    calib_sha256 != self.grav_comp_calib_sha256_at_start
+                ),
+                "drag_session_id": getattr(self.config, "drag_session_id", None),
+                "arm_health": health,
+            }
+        kinesthetic_hand = getattr(self.config, "arm_mode", None) == ARM_MODE_GRAVITY_COMP
         return {
             "episode_index": self.paths.episode_index,
             "status": "complete" if not self.errors else "error",
+            "flags": flags,
             "stop_reason": self.stop_reason,
             "started_utc": self.started_utc,
             "stopped_utc": self.stopped_utc,
@@ -297,6 +422,14 @@ class EpisodeBuffer:
                     getattr(self.config, "disabled_force_feedback_motor_ids", ())
                 ),
                 "training_uses": "measured positions from leader_hand.csv",
+                # Operating mode the positions were read in (None: left as found).
+                "read_operating_mode": getattr(self.config, "hand_operating_mode", None),
+                "torque": "off" if follower_config is None else "force_feedback",
+                "samples_outside_yaml_limits": (
+                    hand_samples_outside_limits(self.config.hand_config, leader_hand_rows)
+                    if kinesthetic_hand
+                    else None
+                ),
             },
             "follower": {
                 "enabled": follower_config is not None,
@@ -325,27 +458,23 @@ class EpisodeBuffer:
                 "max_step_rad": getattr(self.config, "follower_max_step_rad", None),
             },
             "piper": {
-                "mode": "passive_drag_teach_logging" if has_piper else None,
+                "mode": (
+                    ("gravity_comp_kinesthetic" if gravity_comp else "passive_drag_teach_logging")
+                    if has_piper
+                    else None
+                ),
                 "eef_source": "arm_flange_pose_feedback" if has_piper else None,
                 "eef_frame": "piper_base" if has_piper else None,
                 "eef_position_units": "metres" if has_piper else None,
                 "eef_orientation": "Euler xyz radians" if has_piper else None,
-                "joint_level_recording": (
-                    bool(getattr(self.config, "piper_joint_level", False))
-                    if has_piper
-                    else False
-                ),
+                "joint_level_recording": joint_level,
                 "target_rate_hz": (
                     getattr(self.config, "piper_rate_hz", None)
-                    if has_piper
+                    if has_piper and not gravity_comp
                     else None
                 ),
                 "raw_eef_fields": list(RAW_EEF_FIELDS),
-                "raw_joint_fields": (
-                    [f"joint_{joint}" for joint in range(1, 7)]
-                    if has_piper and getattr(self.config, "piper_joint_level", False)
-                    else []
-                ),
+                "raw_joint_fields": list(PIPER_JOINT_FIELDS) if joint_level else [],
                 "start_joints_deg": (
                     list(self.config.piper_start_joints_deg)
                     if getattr(self.config, "piper_start_joints_deg", None) is not None
@@ -356,6 +485,7 @@ class EpisodeBuffer:
                     if getattr(self.config, "piper_start_pose", None) is not None
                     else None
                 ),
+                "gravity_comp": gravity_comp_metadata,
             },
             "quest": {
                 "mode": "udp_pose_logging" if has_quest else None,

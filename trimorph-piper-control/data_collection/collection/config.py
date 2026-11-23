@@ -33,6 +33,15 @@ DEFAULT_DATASET_ROOT = Path("data_trimorph")
 # Each collection run saves to the next free <name>_<n> folder (n = 0, 1, 2, ...).
 DEFAULT_DATASET_NAME = "data_collection_1"
 PIPER_JOINT_FIELDS = tuple(f"joint_{joint}" for joint in range(1, 7))
+# gravity-comp rows: high-speed motor feedback, driver enable bits and arm status.
+PIPER_VELOCITY_FIELDS = tuple(f"vel_{joint}" for joint in range(1, 7))
+PIPER_CURRENT_FIELDS = tuple(f"current_{joint}" for joint in range(1, 7))
+PIPER_TORQUE_FIELDS = tuple(f"torque_{joint}" for joint in range(1, 7))
+PIPER_ENABLE_FIELDS = tuple(f"enable_{joint}" for joint in range(1, 7))
+PIPER_STATUS_FIELDS = ("ctrl_mode", "arm_status", "mode_feedback", "err_code")
+# gravity-comp logs the firmware end pose only while its frames are this close
+# in time to the joint frame; otherwise the SDK still holds an old cached pose.
+EEF_FRESH_S = 0.1
 
 
 WORKER_INIT_TIMEOUT_S = 60.0
@@ -48,6 +57,23 @@ DEFAULT_PIPER_CHANNEL = "can0"
 DEFAULT_PIPER_FIRMWARE = "v183"
 DEFAULT_PIPER_INSTALLATION_POS = "right"
 DEFAULT_PIPER_PAYLOAD = "half"
+# --arm-mode. drag-teach: the firmware drag-teach button moves the arm and the
+# collector polls its flange pose. gravity-comp: gravity_comp.drag_mode (midas-
+# piper-control) holds the arm in MIT torque mode and the collector only listens.
+ARM_MODE_DRAG_TEACH = "drag-teach"
+ARM_MODE_GRAVITY_COMP = "gravity-comp"
+ARM_MODES = (ARM_MODE_DRAG_TEACH, ARM_MODE_GRAVITY_COMP)
+# gravity-comp polls the SDK's cache this fast and keeps one row per new joint
+# feedback frame (about 200 Hz), so no frame is missed or repeated.
+DEFAULT_GRAVITY_COMP_POLL_HZ = 1000.0
+DEFAULT_GRAV_COMP_CALIB = (
+    Path(__file__).resolve().parents[2] / "scripts" / "grav_comp" / "calib" / "robot1_trimi.json"
+)
+# The hand and YAML the rollout uses, read in the executor's operating mode
+# (inference/executor/executor.py sets operating_mode=3), torque off.
+KINESTHETIC_HAND_CONFIG = Path("config/xl330_new_hand_transparent.yaml")
+KINESTHETIC_HAND_PORT = "/dev/ttyUSB0"
+KINESTHETIC_HAND_OPERATING_MODE = 3
 # Named Piper start configurations (J1..J6 degrees), each the IK solution of a
 # dataset's median start flange pose. quest_0: data_trimorph_hand_mocap_quest_0,
 # flange about (144, -202, 270) mm. data_trimorph_hand_mocap_quest_4 starts form
@@ -223,6 +249,12 @@ class HandOnlyCollectionConfig(HandRuntimeConfig):
     show_ui: bool = False
     add_camera: bool = False
     use_piper: bool = False
+    arm_mode: str = ARM_MODE_DRAG_TEACH
+    # gravity-comp only: the drag-mode calibration and the launcher's session id.
+    grav_comp_calib: Path | None = None
+    drag_session_id: str | None = None
+    # Leader hand operating mode while it is read torque-off; None leaves it unchanged.
+    hand_operating_mode: int | None = None
     use_quest: bool = False
     use_mocap: bool = False
     mocap_topics: tuple[str, ...] = ()

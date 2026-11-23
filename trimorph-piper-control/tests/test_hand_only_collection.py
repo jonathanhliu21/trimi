@@ -28,6 +28,15 @@ from data_collection.collect_hand_only import (
 )
 from data_collection.collection.episode import RecordingManager, next_dataset_root
 from data_collection.collection.config import TRIMORPH_MOTOR_IDS
+from data_collection.collection.config import (
+    ARM_MODE_DRAG_TEACH,
+    ARM_MODE_GRAVITY_COMP,
+    DEFAULT_GRAV_COMP_CALIB,
+    DEFAULT_HAND_CONFIG,
+    DEFAULT_HAND_PORT,
+    KINESTHETIC_HAND_CONFIG,
+    KINESTHETIC_HAND_PORT,
+)
 
 
 class HandOnlyCollectionTests(unittest.TestCase):
@@ -723,6 +732,167 @@ class HandOnlyCollectionTests(unittest.TestCase):
                 (Path(temp_dir) / "raw" / "episode_000000" / "metadata.json").read_text()
             )
             self.assertEqual(metadata["stop_reason"], "ui_closed")
+
+
+
+class GravityCompCollectionTests(unittest.TestCase):
+    def parse(self, *argv):
+        with patch("sys.argv", ["collect_hand_only.py", *argv]):
+            return parse_args()
+
+    def assert_rejected(self, *argv, message):
+        with (patch("sys.argv", ["collect_hand_only.py", *argv]),
+              patch("sys.stderr") as stderr, self.assertRaises(SystemExit)):
+            parse_args()
+        self.assertIn(message, "".join(call.args[0] for call in stderr.write.call_args_list))
+
+    def test_gravity_comp_implies_a_listening_piper_without_mocap_or_quest(self):
+        args = self.parse("--arm-mode", "gravity-comp")
+        self.assertEqual(args.arm_mode, ARM_MODE_GRAVITY_COMP)
+        self.assertTrue(args.use_piper)
+        self.assertFalse(args.use_mocap)
+        self.assertFalse(args.use_quest)
+        self.assertEqual((args.piper_installation_pos, args.piper_payload), ("unchanged", "unchanged"))
+        self.assertEqual(args.piper_rate_hz, 1000.0)
+        self.assertEqual((args.hand_config, args.hand_port), (KINESTHETIC_HAND_CONFIG, KINESTHETIC_HAND_PORT))
+        self.assertEqual(args.grav_comp_calib, DEFAULT_GRAV_COMP_CALIB)
+        self.assertTrue(args.show_tracking_monitor)
+        # An explicit "unchanged" is what gravity-comp does anyway.
+        self.assertEqual(self.parse("--arm-mode", "gravity-comp", "--piper-payload", "unchanged").piper_payload,
+                         "unchanged")
+        self.assertTrue(self.parse("--arm-mode", "gravity-comp", "--use-mocap").use_mocap)
+
+    def test_drag_teach_defaults_are_unchanged(self):
+        args = self.parse("--use-piper")
+        self.assertEqual(args.arm_mode, ARM_MODE_DRAG_TEACH)
+        self.assertEqual((args.piper_installation_pos, args.piper_payload), ("right", "half"))
+        self.assertEqual(args.piper_rate_hz, 250.0)
+        self.assertEqual((args.hand_config, args.hand_port), (DEFAULT_HAND_CONFIG, DEFAULT_HAND_PORT))
+        self.assertIsNone(args.grav_comp_calib)
+        self.assertEqual(self.parse().arm_mode, ARM_MODE_DRAG_TEACH)
+
+    def test_gravity_comp_refuses_anything_that_would_transmit_or_move(self):
+        gc = ("--arm-mode", "gravity-comp")
+        self.assert_rejected(*gc, "--piper-start-home", message="never moves the arm")
+        self.assert_rejected(*gc, "--piper-start-joints-deg", *["0"] * 6, message="never moves the arm")
+        self.assert_rejected(*gc, "--piper-payload", "half", message="remove --piper-payload")
+        self.assert_rejected(*gc, "--piper-installation-pos", "right", message="remove --piper-installation-pos")
+        self.assert_rejected(*gc, "--use-quest", message="remove --use-quest")
+        self.assert_rejected(*gc, "--follower-config", "f.yaml", "--follower-port", "/dev/f",
+                             message="no follower")
+        self.assert_rejected(*gc, "--show-ui", message="no follower")
+
+    def test_gravity_comp_only_options_need_gravity_comp(self):
+        self.assert_rejected("--use-piper", "--grav-comp-calib", "c.json", message="requires --arm-mode gravity-comp")
+        self.assert_rejected("--use-piper", "--drag-session-id", "s", message="requires --arm-mode gravity-comp")
+        self.assert_rejected("--arm-mode", "drag-teach", message="--arm-mode requires --use-piper")
+
+    def test_main_copies_gravity_comp_settings_to_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            calib = Path(temp_dir) / "calib.json"
+            calib.write_text("{}")
+            with (
+                patch("sys.argv", ["collect_hand_only.py", "--arm-mode", "gravity-comp", "--no-camera",
+                                   "--grav-comp-calib", str(calib), "--drag-session-id", "20261122_1530"]),
+                patch("data_collection.collect_hand_only.run_hand_only", return_value=0) as run,
+            ):
+                self.assertEqual(main(), 0)
+            config = run.call_args.args[0]
+            self.assertEqual(config.arm_mode, ARM_MODE_GRAVITY_COMP)
+            self.assertEqual(config.grav_comp_calib, calib)
+            self.assertEqual(config.drag_session_id, "20261122_1530")
+            self.assertEqual(config.hand_operating_mode, 3)
+            self.assertEqual((config.piper_installation_pos, config.piper_payload), ("unchanged", "unchanged"))
+            self.assertEqual(worker_specs(config)[0][0], "piper")
+
+            with (
+                patch("sys.argv", ["collect_hand_only.py", "--arm-mode", "gravity-comp",
+                                   "--grav-comp-calib", str(Path(temp_dir) / "missing.json")]),
+                patch("data_collection.collect_hand_only.run_hand_only", return_value=0),
+                self.assertRaisesRegex(ValueError, "calibration not found"),
+            ):
+                main()
+
+        with (patch("sys.argv", ["collect_hand_only.py", "--use-piper"]),
+              patch("data_collection.collect_hand_only.run_hand_only", return_value=0) as run):
+            main()
+        self.assertIsNone(run.call_args.args[0].hand_operating_mode)
+
+    def test_gravity_comp_episode_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            calib = Path(temp_dir) / "calib.json"
+            calib.write_text('{"gravity": {}}')
+            config = HandOnlyCollectionConfig(
+                dataset_root=Path(temp_dir),
+                hand_config=Path("config/xl330_new_hand_transparent.yaml"),
+                hand_port="/dev/ttyUSB0",
+                hand_measure_rate_hz=50.0,
+                warmup_time=0.0,
+                episode_time=30.0,
+                use_piper=True,
+                arm_mode=ARM_MODE_GRAVITY_COMP,
+                piper_rate_hz=1000.0,
+                piper_installation_pos="unchanged",
+                piper_payload="unchanged",
+                grav_comp_calib=calib,
+                drag_session_id="20261122_1530",
+                hand_operating_mode=3,
+            )
+            recorder = RecordingManager()
+            session = start_episode(config, recorder)
+            hand_row = {f"pos_{motor}": "0.0" for motor in range(13)}
+            # Motor 8 is limited to +/-0.01 and motor 11 to <= 0 in the transparent YAML.
+            session.append_leader_hand({**hand_row, "pos_8": "0.2"})
+            session.append_leader_hand({**hand_row, "pos_8": "-0.2", "pos_11": "0.3"})
+            session.append_piper({"sample_idx": 0, "elapsed_s": "0.000", "arm_ok": 1, "ctrl_mode": "CAN_CTRL",
+                                  "arm_status": "NORMAL", "err_code": 0, "x": ""})
+            session.append_piper({"sample_idx": 1, "elapsed_s": "0.005", "arm_ok": 0, "ctrl_mode": "CAN_CTRL",
+                                  "arm_status": "NORMAL", "err_code": 256, "x": "0.3"})
+            calib.write_text('{"gravity": {"changed": true}}')
+            stop_episode(recorder, "keyboard_interrupt")
+
+            metadata = json.loads(session.paths.metadata_path.read_text())
+        self.assertEqual(metadata["flags"], ["arm_not_ok"])
+        piper = metadata["piper"]
+        self.assertEqual(piper["mode"], "gravity_comp_kinesthetic")
+        self.assertTrue(piper["joint_level_recording"])
+        self.assertIsNone(piper["target_rate_hz"])
+        gravity = piper["gravity_comp"]
+        self.assertFalse(gravity["sends_can_frames"])
+        self.assertEqual(gravity["poll_rate_hz"], 1000.0)
+        self.assertEqual(gravity["calibration_path"], str(calib.resolve()))
+        self.assertEqual(len(gravity["calibration_sha256"]), 64)
+        self.assertTrue(gravity["calibration_changed_during_episode"])
+        self.assertEqual(gravity["drag_session_id"], "20261122_1530")
+        self.assertEqual(gravity["arm_health"]["not_ok_samples"], 1)
+        self.assertEqual(gravity["arm_health"]["first_not_ok_elapsed_s"], 0.005)
+        self.assertEqual(gravity["arm_health"]["err_codes"], ["0", "256"])
+        self.assertEqual(gravity["arm_health"]["eef_samples"], 1)
+        trimorph = metadata["trimorph"]
+        self.assertEqual(trimorph["read_operating_mode"], 3)
+        self.assertEqual(trimorph["torque"], "off")
+        self.assertEqual(trimorph["samples_outside_yaml_limits"]["8"], {"below": 1, "above": 1})
+        self.assertEqual(trimorph["samples_outside_yaml_limits"]["11"], {"below": 0, "above": 1})
+        self.assertEqual(trimorph["samples_outside_yaml_limits"]["0"], {"below": 0, "above": 0})
+        hand = trimorph["hand"]
+        self.assertEqual(hand["operating_mode"], 5)
+        self.assertEqual(hand["home_offsets"]["0"], 5.271)
+        self.assertEqual(hand["joint_signs"]["2"], -1.0)
+        self.assertEqual((hand["joint_lower_limits"]["8"], hand["joint_upper_limits"]["8"]), (-0.01, 0.01))
+
+    def test_episode_without_arm_samples_is_flagged(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = HandOnlyCollectionConfig(
+                dataset_root=Path(temp_dir), hand_config=Path("config/xl330_new_hand_transparent.yaml"),
+                hand_port="/dev/ttyUSB0", hand_measure_rate_hz=50.0, warmup_time=0.0, episode_time=30.0,
+                use_piper=True, arm_mode=ARM_MODE_GRAVITY_COMP, grav_comp_calib=None,
+            )
+            recorder = RecordingManager()
+            session = start_episode(config, recorder)
+            stop_episode(recorder, "keyboard_interrupt")
+            metadata = json.loads(session.paths.metadata_path.read_text())
+        self.assertEqual(metadata["flags"], ["no_piper_samples"])
+        self.assertIsNone(metadata["piper"]["gravity_comp"]["calibration_sha256"])
 
 
 if __name__ == "__main__":

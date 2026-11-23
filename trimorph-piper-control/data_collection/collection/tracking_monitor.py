@@ -1,5 +1,8 @@
 """Live 3D view of the Quest and Vicon poses with a per-stream signal status.
 
+With show_arm, an ARM box shows the gravity-comp arm feedback: green while every
+drive is enabled with no error code.
+
 Each stream is drawn relative to its pose when the view started (or was last
 re-centered), so both start at the origin. Displacements are shown in the
 Piper base axes when a calibration provides the mapping (linear_matrix for the
@@ -20,7 +23,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .quest_worker import QUEST_TRACKER_NAME
-from .shared_state import SharedState, TrackerSample
+from .shared_state import ArmHealth, SharedState, TrackerSample
 from .utils import import_cv2
 
 TRACKING_WINDOW_NAME = "trimorph_tracking"
@@ -40,6 +43,7 @@ OK_COLOR = (60, 170, 60)
 FAIL_COLOR = (40, 40, 210)
 QUEST_COLOR = (0, 165, 255)
 VICON_COLOR = (255, 200, 0)
+ARM_COLOR = (200, 120, 255)
 AXIS_COLORS = ((60, 60, 230), (60, 200, 60), (230, 120, 40))
 
 
@@ -77,6 +81,30 @@ def stream_status(
     ):
         return StreamStatus(False, "POSITION FROZEN")
     return StreamStatus(True, "OK")
+
+
+def arm_status(
+    now_ns: int, health: ArmHealth | None, *, timeout_s: float = SIGNAL_TIMEOUT_S
+) -> StreamStatus:
+    """Green only while arm feedback is fresh, every drive is enabled and there is no error code."""
+
+    if health is None:
+        return StreamStatus(False, "NO DATA")
+    age_s = (now_ns - health.monotonic_ns) / 1e9
+    if age_s > timeout_s:
+        return StreamStatus(False, f"NO SIGNAL {age_s:.1f}s")
+    if not health.ok:
+        return StreamStatus(False, health.problem)
+    return StreamStatus(True, f"OK {health.rate_hz:.0f} Hz")
+
+
+@dataclass(frozen=True)
+class _ArmBox:
+    """Status-bar entry for the arm; it has no pose in the 3D view."""
+
+    label: str = "ARM"
+    color: tuple[int, int, int] = ARM_COLOR
+    pose: None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +204,7 @@ class TrackingMonitor:
         *,
         show_quest: bool,
         show_vicon: bool,
+        show_arm: bool = False,
         recorder=None,
         calibration: dict | None = None,
         window_name: str = TRACKING_WINDOW_NAME,
@@ -185,7 +214,7 @@ class TrackingMonitor:
         self.cv2 = cv2 or import_cv2()
         self.shared, self.recorder, self.window_name = shared, recorder, window_name
         self.width, self.height = size
-        self.show_quest, self.show_vicon = show_quest, show_vicon
+        self.show_quest, self.show_vicon, self.show_arm = show_quest, show_vicon, show_arm
         self.quest_frame, self.vicon_frame = display_frames(calibration)
         self.streams: dict[str, _Stream] = {}
         self.yaw, self.pitch, self.scale = math.radians(-35), math.radians(25), 900.0
@@ -233,6 +262,8 @@ class TrackingMonitor:
                     for name in names]
         if self.show_vicon and not any(name != QUEST_TRACKER_NAME for name in names):
             statuses.append((None, StreamStatus(False, "NO DATA")))
+        if self.show_arm:
+            statuses.append((_ArmBox(), arm_status(now_ns, self.shared.latest_arm_health())))
 
         image = np.full((self.height, self.width, 3), 28, dtype=np.uint8)
         center = (self.width // 2, (self.height + 70) // 2)
@@ -263,7 +294,8 @@ class TrackingMonitor:
             cv2.circle(image, tuple(tip0), 5, stream.color, -1, cv2.LINE_AA)
 
         self._draw_status_bar(image, statuses, now_ns)
-        legend = [f"{stream.label}: {stream.frame.label}" for stream, _ in statuses if stream is not None]
+        legend = [f"{stream.label}: {stream.frame.label}" for stream, _ in statuses
+                  if isinstance(stream, _Stream)]
         cv2.putText(image, "   ".join(legend), (12, self.height - 34), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.putText(image, "drag: rotate   right-drag/scroll: zoom   double-click: re-center   grid 10 cm",

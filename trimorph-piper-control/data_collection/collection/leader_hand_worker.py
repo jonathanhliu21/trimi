@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -275,6 +276,23 @@ class TrimorphForceFeedbackController:
         self._last_raw_currents = values
 
 
+def set_operating_mode_torque_off(hand: Any, operating_mode: int) -> None:
+    """Disable torque on every motor, then switch them to operating_mode.
+
+    Torque stays off. The mode decides how the motors report their position, so
+    reading the leader in the rollout's mode makes its positions comparable with
+    the rollout's.
+    """
+
+    hand.disable_torque()
+    hand.dxl_client.sync_write(
+        hand.motor_ids,
+        [int(operating_mode)] * len(hand.motor_ids),
+        ct.ADDR_OPERATING_MODE,
+        ct.LEN_OPERATING_MODE,
+    )
+
+
 def run_leader_hand_worker(
     config: HandOnlyCollectionConfig,
     shared: SharedState,
@@ -287,6 +305,13 @@ def run_leader_hand_worker(
     hand_config = load_hand_config(
         config.hand_config, config.hand_port, config.active_motors
     )
+    yaml_operating_mode = int(hand_config.operating_mode)
+    read_operating_mode = getattr(config, "hand_operating_mode", None)
+    if read_operating_mode is not None:
+        # Kinesthetic teaching: read in the executor's mode, torque off.
+        if config.follower_hand_config is not None:
+            raise ValueError("hand_operating_mode needs a torque-off leader (no follower)")
+        hand_config = replace(hand_config, operating_mode=int(read_operating_mode))
     hand = MidasHand(config=hand_config, autoconnect=True)
     verify_connected_hand(hand, role="primary")
     force_feedback = TrimorphForceFeedbackController(
@@ -315,7 +340,17 @@ def run_leader_hand_worker(
     next_feedback_ns = next_read_ns
     sample_idx = 0
     sample_session: EpisodeBuffer | None = None
+    mode_changed = False
     try:
+        if read_operating_mode is not None:
+            # Set first, so a configure() that fails part-way still restores the mode.
+            mode_changed = read_operating_mode != yaml_operating_mode
+            # The executor's own call (mode, drive mode, gains, current cap), torque left off.
+            hand.configure(enable_torque=False)
+            print(
+                f"TRIMORPH hand: torque off, read in operating mode {read_operating_mode} "
+                f"(the YAML's mode {yaml_operating_mode} is restored on exit)."
+            )
         initial_positions = np.asarray(hand.read_pos(), dtype=np.float64)
         force_feedback.start(initial_positions)
         if config.follower_hand_config is None:
@@ -376,6 +411,9 @@ def run_leader_hand_worker(
             force_feedback.shutdown()
         finally:
             try:
-                hand.disable_torque()
+                if mode_changed:
+                    set_operating_mode_torque_off(hand, yaml_operating_mode)
+                else:
+                    hand.disable_torque()
             finally:
                 hand.shutdown()

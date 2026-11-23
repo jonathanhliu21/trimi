@@ -67,6 +67,18 @@ class PiperEefState:
     hz: float
 
 
+@dataclass(frozen=True)
+class PiperArmStatus:
+    ctrl_mode: str
+    arm_status: str
+    mode_feedback: str
+    teach_status: str
+    motion_status: str
+    err_code: int
+    timestamp: float
+    hz: float
+
+
 def _as_float_list(values: Sequence[float], *, name: str, length: int) -> list[float]:
     if isinstance(values, (str, bytes)):
         raise ValueError(f"{name} must be a sequence of {length} numeric values")
@@ -287,6 +299,37 @@ class PiperAPI:
             hz=float(flange.hz),
         )
 
+    def get_arm_status(self) -> PiperArmStatus | None:
+        status = self.robot.get_arm_status()
+        if status is None:
+            return None
+        msg = status.msg
+        try:
+            err_code = int(msg.err_code)
+        except (TypeError, ValueError):
+            err_code = 0
+        return PiperArmStatus(
+            ctrl_mode=str(msg.ctrl_mode),
+            arm_status=str(msg.arm_status),
+            mode_feedback=str(msg.mode_feedback),
+            teach_status=str(msg.teach_status),
+            motion_status=str(msg.motion_status),
+            err_code=err_code,
+            timestamp=float(status.timestamp),
+            hz=float(status.hz),
+        )
+
+    def get_driver_enable_status(self) -> list[bool | None]:
+        """Per-joint driver enable bit from the low-speed feedback; None until it arrives."""
+
+        result: list[bool | None] = []
+        for joint in range(1, 7):
+            state = self.robot.get_driver_states(joint)
+            result.append(
+                None if state is None else bool(state.msg.foc_status.driver_enable_status)
+            )
+        return result
+
     def get_state(self) -> dict[str, object]:
         return collect_robot_state(self.robot)
 
@@ -381,3 +424,87 @@ class PiperAPI:
             )
             for joint_index, torque in enumerate(target_torques, start=1)
         ]
+
+
+# The SDK calls ReceiveOnlyPiperAPI makes. Each one returns feedback the SDK's
+# reader thread has cached, or opens and closes the socket; none transmits.
+RECEIVE_ONLY_ROBOT_CALLS = frozenset(
+    {
+        "connect",
+        "disconnect",
+        "is_ok",
+        "get_fps",
+        "get_joint_angles",
+        "get_motor_states",
+        "get_driver_states",
+        "get_arm_status",
+        "get_flange_pose",
+    }
+)
+
+
+class ReceiveOnlyPiperAPI:
+    """Listen to the Piper's CAN feedback without sending a single frame.
+
+    For when another process commands the arm (gravity_comp.drag_mode holds it
+    in MIT torque mode). SocketCAN gives every socket a copy of every frame and
+    the arm broadcasts its feedback unpolled, so listening cannot disturb that
+    process.
+
+    The installation position and payload are left unchanged, so connect() sends
+    no 0x151 mode frame and no 0x477 payload frame: it only opens the socket and
+    starts the SDK's reader threads. Everything that transmits (enable, disable,
+    mode and payload settings, motion, the 0x472 joint-limit queries) is left out
+    of this class on purpose, so calling it is an AttributeError.
+    """
+
+    def __init__(
+        self,
+        *,
+        firmware: str = "default",
+        interface: str = "socketcan",
+        channel: str = "can0",
+        robot=None,
+    ):
+        self._api = PiperAPI(
+            firmware=firmware,
+            interface=interface,
+            channel=channel,
+            installation_pos=None,
+            payload=None,
+            robot=robot,
+        )
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.disconnect()
+
+    def connect(self, *, settle_s: float = 0.5) -> bool:
+        return self._api.connect(settle_s=settle_s)
+
+    def disconnect(self) -> None:
+        self._api.disconnect()
+
+    def is_ok(self) -> bool:
+        return self._api.is_ok()
+
+    def get_fps(self) -> float:
+        return self._api.get_fps()
+
+    def get_joint_state(self) -> PiperJointState | None:
+        return self._api.get_joint_state()
+
+    def get_motor_state(self) -> PiperMotorState | None:
+        return self._api.get_motor_state()
+
+    def get_driver_enable_status(self) -> list[bool | None]:
+        return self._api.get_driver_enable_status()
+
+    def get_arm_status(self) -> PiperArmStatus | None:
+        return self._api.get_arm_status()
+
+    def get_eef_state(self) -> PiperEefState | None:
+        return self._api.get_eef_state()

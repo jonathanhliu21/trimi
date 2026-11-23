@@ -11,6 +11,7 @@ floor, the mount plate, the arm itself, the base's mounting face and the standin
 | `grav_comp_video.py` | The same motions as videos: one MP4 per stage plus `all_stages.mp4` / `.webm` |
 | `held_joint_drift.py` | The torque stages with the spring-held joints drifted to the 0.08 rad abort limit |
 | `run_gravity_comp.sh` | Runs the real bring-up on the arm (stages 0–6) as one guided session: stops before each stage, says when to take the hand off (0–3) and mount it (4a on), resumes from the calibration file |
+| `listener_bench_report.py` | Bench check of the receive-only kinesthetic collector (`collect_hand_only.py --arm-mode gravity-comp`) while drag mode runs: joint rate and gaps, drive and error state, whether the firmware end pose streams in MIT mode |
 | `calib/robot1_trimi.json` | The Piper + TRIMI calibration from the 2026-11-22 bring-up, which `run_gravity_comp.sh` reads and writes (see the notes at the end) |
 | `tests/` | `python -m pytest scripts/grav_comp/tests` |
 

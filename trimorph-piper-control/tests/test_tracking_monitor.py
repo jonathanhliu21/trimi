@@ -5,10 +5,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from data_collection.collection.quest_worker import QUEST_TRACKER_NAME
-from data_collection.collection.shared_state import SharedState, TrackerSample
+from data_collection.collection.shared_state import ArmHealth, SharedState, TrackerSample
 from data_collection.collection.tracking_monitor import (
+    arm_status,
     FAIL_COLOR,
     OK_COLOR,
+    StreamStatus,
     TrackingMonitor,
     display_frames,
     project,
@@ -119,6 +121,30 @@ class TrackingMonitorTests(unittest.TestCase):
         monitor._on_mouse(monitor.cv2.EVENT_LBUTTONDBLCLK, 0, 0, 0, None)
         self.assertIsNone(stream.pose)
         self.assertEqual(len(stream.trail), 0)
+
+
+class ArmBoxTests(unittest.TestCase):
+    def test_arm_status_text(self):
+        now = 100 * SECOND
+        self.assertEqual(arm_status(now, None).text, "NO DATA")
+        self.assertEqual(arm_status(now, ArmHealth(now, True, "", 199.6)), StreamStatus(True, "OK 200 Hz"))
+        self.assertEqual(arm_status(now, ArmHealth(now, False, "DRIVES OFF J2", 200.0)),
+                         StreamStatus(False, "DRIVES OFF J2"))
+        self.assertFalse(arm_status(now + SECOND, ArmHealth(now, True, "", 200.0)).ok)
+
+    def test_arm_box_alone_follows_the_arm_health(self):
+        import cv2
+
+        shared = SharedState()
+        with patch.object(cv2, "namedWindow"), patch.object(cv2, "setMouseCallback"):
+            monitor = TrackingMonitor(shared, show_quest=False, show_vicon=False, show_arm=True)
+        box = TrackingMonitorTests.box_color
+        now = 100 * SECOND
+        self.assertEqual(box(None, monitor.render(now), 0, 1), FAIL_COLOR)
+        shared.set_arm_health(ArmHealth(now, True, "", 200.0))
+        self.assertEqual(box(None, monitor.render(now), 0, 1), OK_COLOR)
+        shared.set_arm_health(ArmHealth(now, False, "ERR 0x0100", 200.0))
+        self.assertEqual(box(None, monitor.render(now), 0, 1), FAIL_COLOR)
 
 
 class MonitorCliTests(unittest.TestCase):

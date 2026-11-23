@@ -25,6 +25,14 @@ from data_collection.collection.config import (
     DEFAULT_PIPER_FIRMWARE,
     DEFAULT_PIPER_INSTALLATION_POS,
     DEFAULT_PIPER_PAYLOAD,
+    DEFAULT_GRAVITY_COMP_POLL_HZ,
+    DEFAULT_GRAV_COMP_CALIB,
+    ARM_MODE_DRAG_TEACH,
+    ARM_MODE_GRAVITY_COMP,
+    ARM_MODES,
+    KINESTHETIC_HAND_CONFIG,
+    KINESTHETIC_HAND_OPERATING_MODE,
+    KINESTHETIC_HAND_PORT,
     DEFAULT_TEACHER_MODE_POLL_HZ,
     DEFAULT_HAND_CONFIG,
     DEFAULT_HAND_PORT,
@@ -101,9 +109,22 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Save to exactly this folder, adding episodes after any already there.",
     )
-    parser.add_argument("--hand-config", type=Path, default=DEFAULT_HAND_CONFIG)
     parser.add_argument(
-        "--hand-port", default=DEFAULT_HAND_PORT
+        "--hand-config",
+        type=Path,
+        default=None,
+        help=(
+            f"hand YAML (default: {DEFAULT_HAND_CONFIG}; with --arm-mode gravity-comp, "
+            f"the rollout's {KINESTHETIC_HAND_CONFIG})"
+        ),
+    )
+    parser.add_argument(
+        "--hand-port",
+        default=None,
+        help=(
+            f"hand serial port (default: {DEFAULT_HAND_PORT}; with --arm-mode "
+            f"gravity-comp, {KINESTHETIC_HAND_PORT})"
+        ),
     )
     parser.add_argument("--follower-config", type=Path)
     parser.add_argument("--follower-port")
@@ -142,6 +163,33 @@ def parse_args() -> argparse.Namespace:
             "instead of Quest; add --no-mocap for arm-only pose feedback. "
             "Joint logging is opt-in with --piper-joint-level"
         ),
+    )
+    parser.add_argument(
+        "--arm-mode",
+        choices=ARM_MODES,
+        default=None,
+        help=(
+            "how the arm is moved while --use-piper records it. drag-teach (default): "
+            "the firmware drag-teach button. gravity-comp: gravity_comp.drag_mode runs "
+            "in another process and commands the arm; the collector only listens and "
+            "sends nothing on the CAN bus. gravity-comp implies --use-piper --no-mocap, "
+            "records joints, motor feedback and arm status for every joint frame, and "
+            "reads the hand torque-off in the rollout's operating mode."
+        ),
+    )
+    parser.add_argument(
+        "--grav-comp-calib",
+        type=Path,
+        default=None,
+        help=(
+            "gravity-comp: the calibration drag mode runs on, recorded with its sha256 "
+            f"(default: {DEFAULT_GRAV_COMP_CALIB})"
+        ),
+    )
+    parser.add_argument(
+        "--drag-session-id",
+        default=None,
+        help="gravity-comp: the launcher's drag-mode session id, recorded in metadata",
     )
     parser.add_argument(
         "--use-quest",
@@ -197,8 +245,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--piper-rate-hz",
         type=float,
-        default=DEFAULT_PIPER_RATE_HZ,
-        help="Piper sampling rate in Hz (default: %(default)s).",
+        default=None,
+        help=(
+            f"Piper sampling rate in Hz (default: {DEFAULT_PIPER_RATE_HZ:g}). With "
+            "--arm-mode gravity-comp, how often the SDK cache is checked for a new "
+            f"joint frame (default: {DEFAULT_GRAVITY_COMP_POLL_HZ:g})."
+        ),
     )
     parser.add_argument(
         "--piper-teacher-mode-poll-hz",
@@ -216,12 +268,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--piper-installation-pos",
         choices=("unchanged", "horizontal", "left", "right"),
-        default=DEFAULT_PIPER_INSTALLATION_POS,
+        default=None,
+        help=(
+            f"set on connect (default: {DEFAULT_PIPER_INSTALLATION_POS}; always "
+            "unchanged with --arm-mode gravity-comp)"
+        ),
     )
     parser.add_argument(
         "--piper-payload",
         choices=("unchanged", "empty", "half", "full"),
-        default=DEFAULT_PIPER_PAYLOAD,
+        default=None,
+        help=(
+            f"set on connect (default: {DEFAULT_PIPER_PAYLOAD}; always unchanged with "
+            "--arm-mode gravity-comp)"
+        ),
     )
     start_group = parser.add_mutually_exclusive_group()
     start_group.add_argument(
@@ -328,6 +388,55 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    gravity_comp = args.arm_mode == ARM_MODE_GRAVITY_COMP
+    if gravity_comp:
+        # Drag mode holds the arm in MIT torque mode and is the only writer on can0.
+        # Anything that would transmit is refused rather than silently dropped.
+        if args.use_quest:
+            parser.error("--arm-mode gravity-comp records the arm pose; remove --use-quest")
+        if args.piper_start_joints_deg is not None or args.piper_start_home:
+            parser.error(
+                "--arm-mode gravity-comp never moves the arm; remove --piper-start-* "
+                "and bring it to the start pose by hand"
+            )
+        for flag, value in (
+            ("--piper-installation-pos", args.piper_installation_pos),
+            ("--piper-payload", args.piper_payload),
+        ):
+            if value not in (None, "unchanged"):
+                parser.error(f"--arm-mode gravity-comp sends no settings frames; remove {flag}")
+        if args.follower_config is not None or args.follower_port is not None or args.show_ui:
+            parser.error(
+                "--arm-mode gravity-comp reads the hand torque-off; it has no follower "
+                "(remove --follower-config/--follower-port/--show-ui)"
+            )
+        args.use_piper = True
+        args.piper_installation_pos = args.piper_payload = "unchanged"
+        if args.use_mocap is None:
+            args.use_mocap = False
+    else:
+        if args.arm_mode is not None and not args.use_piper:
+            parser.error("--arm-mode requires --use-piper")
+        for flag, value in (
+            ("--grav-comp-calib", args.grav_comp_calib),
+            ("--drag-session-id", args.drag_session_id),
+        ):
+            if value is not None:
+                parser.error(f"{flag} requires --arm-mode gravity-comp")
+        if args.piper_installation_pos is None:
+            args.piper_installation_pos = DEFAULT_PIPER_INSTALLATION_POS
+        if args.piper_payload is None:
+            args.piper_payload = DEFAULT_PIPER_PAYLOAD
+    if args.arm_mode is None:
+        args.arm_mode = ARM_MODE_DRAG_TEACH
+    if args.hand_config is None:
+        args.hand_config = KINESTHETIC_HAND_CONFIG if gravity_comp else DEFAULT_HAND_CONFIG
+    if args.hand_port is None:
+        args.hand_port = KINESTHETIC_HAND_PORT if gravity_comp else DEFAULT_HAND_PORT
+    if args.piper_rate_hz is None:
+        args.piper_rate_hz = DEFAULT_GRAVITY_COMP_POLL_HZ if gravity_comp else DEFAULT_PIPER_RATE_HZ
+    if gravity_comp and args.grav_comp_calib is None:
+        args.grav_comp_calib = DEFAULT_GRAV_COMP_CALIB
     # Quest and mocap only record, so retarget-only mode leaves them off unless asked.
     recording = args.mode == DATA_COLLECTION_MODE
     if args.use_quest and args.use_piper:
@@ -348,9 +457,9 @@ def parse_args() -> argparse.Namespace:
         if not math.isfinite(args.mocap_ik_start_tolerance_deg) or args.mocap_ik_start_tolerance_deg <= 0:
             parser.error('--mocap-ik-start-tolerance-deg must be finite and positive')
     if args.show_tracking_monitor is None:
-        args.show_tracking_monitor = args.use_quest or args.use_mocap
-    elif args.show_tracking_monitor and not (args.use_quest or args.use_mocap):
-        parser.error("--monitor requires Quest or mocap")
+        args.show_tracking_monitor = args.use_quest or args.use_mocap or gravity_comp
+    elif args.show_tracking_monitor and not (args.use_quest or args.use_mocap or gravity_comp):
+        parser.error("--monitor requires Quest, mocap or --arm-mode gravity-comp")
     if args.monitor_calibration is not None and not args.show_tracking_monitor:
         parser.error("--monitor-calibration requires the tracking monitor")
     if args.episode_time is not None:
@@ -692,6 +801,9 @@ def move_piper_to_start(config: HandOnlyCollectionConfig) -> tuple[float, ...]:
 def run_hand_only(config: HandOnlyCollectionConfig) -> int:
     if config.mocap_ik_calibration is not None and not config.use_mocap:
         raise ValueError('Mocap IK monitoring requires mocap')
+    gravity_comp = config.arm_mode == ARM_MODE_GRAVITY_COMP
+    if gravity_comp and getattr(config, "piper_start_joints_deg", None) is not None:
+        raise ValueError("--arm-mode gravity-comp never moves the arm (no start move)")
     shared = SharedState()
     recorder = RecordingManager()
     errors: queue.Queue[WorkerError] = queue.Queue()
@@ -716,7 +828,12 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
     elif config.mode != RETARGET_ONLY_MODE:
         raise ValueError(f"Unknown hand-only mode: {config.mode!r}")
 
-    if config.use_piper:
+    if gravity_comp:
+        print(
+            "Piper logging is receive-only: gravity_comp.drag_mode commands the arm "
+            "and this process sends nothing on the CAN bus."
+        )
+    elif config.use_piper:
         print(
             "Piper logging is passive: use the arm's built-in drag-teach control."
         )
@@ -765,6 +882,7 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
                 shared,
                 show_quest=config.use_quest,
                 show_vicon=config.use_mocap,
+                show_arm=gravity_comp,
                 recorder=recorder,
                 calibration=load_monitor_calibration(config.monitor_calibration),
             )
@@ -890,6 +1008,16 @@ def main() -> int:
         show_ui=args.show_ui,
         add_camera=args.add_camera,
         use_piper=args.use_piper,
+        arm_mode=args.arm_mode,
+        grav_comp_calib=(
+            args.grav_comp_calib.expanduser() if args.grav_comp_calib is not None else None
+        ),
+        drag_session_id=args.drag_session_id,
+        hand_operating_mode=(
+            KINESTHETIC_HAND_OPERATING_MODE
+            if args.arm_mode == ARM_MODE_GRAVITY_COMP
+            else None
+        ),
         use_quest=args.use_quest,
         use_mocap=args.use_mocap,
         mocap_topics=tuple(args.mocap_topics),
@@ -949,6 +1077,13 @@ def main() -> int:
         validate_camera_settings(config)
     if config.piper_joint_level and not config.use_piper:
         raise ValueError("--piper-joint-level requires --use-piper")
+    if config.arm_mode == ARM_MODE_GRAVITY_COMP:
+        if not config.use_piper:
+            raise ValueError("--arm-mode gravity-comp requires the Piper")
+        if config.piper_installation_pos != "unchanged" or config.piper_payload != "unchanged":
+            raise ValueError("--arm-mode gravity-comp must leave installation and payload unchanged")
+        if config.grav_comp_calib is not None and not config.grav_comp_calib.is_file():
+            raise ValueError(f"Gravity-comp calibration not found: {config.grav_comp_calib}")
     if config.use_piper:
         if config.piper_rate_hz <= 0:
             raise ValueError("PIPER_RATE_HZ must be greater than 0")

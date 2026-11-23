@@ -45,6 +45,38 @@ remains off unless `--piper-joint-level` is supplied; even with it, training
 actions use the six Cartesian pose fields. These poses describe the flange;
 a tool-tip offset would need a separate transform.
 
+### Kinesthetic teaching under gravity comp (receive-only arm logging)
+
+With the TRIMI hand mounted on the Piper, `gravity_comp.drag_mode`
+(midas-piper-control, calibration `scripts/grav_comp/calib/robot1_trimi.json`)
+holds the arm in MIT torque mode while the operator moves it, and the hand's
+torque is off. Start drag mode first and wait for "assist at target", then:
+
+```bash
+python3 data_collection/collect_hand_only.py --arm-mode gravity-comp \
+  --dataset-root data_trimorph_kinesthetic_0
+```
+
+`--arm-mode gravity-comp` implies `--use-piper --no-mocap`. The collector
+then sends nothing on the CAN bus: no 0x151 or 0x477 frame on connect (it
+refuses `--piper-installation-pos`/`--piper-payload` values other than
+`unchanged`), no 0x472 limit queries, and no start move (`--piper-start-*` is
+refused). Drag mode stays the only writer. Every new joint feedback frame
+(about 200 Hz) becomes one `piper.csv` row with joints, velocity, current and
+torque, the drive enable bits, arm status and error code, and the firmware end
+pose when it arrives. The hand defaults to the rollout's
+`config/xl330_new_hand_transparent.yaml` on `/dev/ttyUSB0`, read torque-off in
+the executor's operating mode 3; the YAML's mode is restored on exit. The
+monitor's ARM box is green while all drives are enabled with no error code.
+Episodes where that is not true get `"arm_not_ok"` in `metadata.json`'s
+`flags`. Stop the collector first, so the episode is saved, then stop drag mode.
+
+Not finished yet (data_collection/KINESTHETIC_PLAN.md): the launcher (1.4),
+the start pose the arm holds by itself (1.5), and `--pose-source piper_fk` in
+postprocessing (1.6). The firmware end pose may be missing in MIT mode, so do
+not postprocess these datasets with `--pose-source piper`. Check a short
+recording with `scripts/grav_comp/listener_bench_report.py` (1.3) first.
+
 Keep the camera enabled for the image-policy trainer. In the diffusion-policies
 repository, train on this output using the existing Trimi configuration:
 
@@ -108,6 +140,7 @@ camera. Each run writes to a new folder `<name>_<n>`; the name defaults to
 | `--mocap-topic /vicon/Yori/Yori` | record only the hand-held marker plate |
 | `--no-quest`, `--no-mocap`, `--no-camera` | drop a default stream |
 | `--use-piper` | record Piper drag-teach poses instead of the Quest |
+| `--arm-mode gravity-comp` | receive-only arm logging while gravity_comp drag mode holds the arm (see section 2) |
 | `--episode-s 30` | one fixed-length episode instead of the pedal |
 | `--monitor-calibration calibration.json` | show Quest (and Vicon, if calibrated) motion in Piper axes |
 
@@ -145,6 +178,7 @@ uses.
 | `quest.csv` | raw controller packets `seq, px, py, pz, qx, qy, qz, qw`, unconverted | ~72 Hz |
 | `mocap.csv` | Vicon `Position` rows (plate pose in mm, quaternion, `frame_number`) and `MarkerPositions` rows (each marker, `occluded`) | ~220 Hz received |
 | `piper.csv` | Piper flange `x..yaw` (and joints with `--piper-joint-level`) | 250 Hz, only with `--use-piper` |
+| `piper.csv` (`--arm-mode gravity-comp`) | joints, `vel_*`, `current_*`, `torque_*`, `enable_*`, arm status, `err_code`, `arm_ok`, firmware `x..yaw` when streaming; `robot_timestamp_s` / `joint_rx_monotonic_ns` = CAN receive time | one row per joint frame, ~200 Hz |
 | `follower.csv` | MIDAS measured angles | only with a follower |
 | `metadata.json` | status, stop reason, durations, sample counts, hardware settings and config hashes, `piper.start_pose`, errors | |
 

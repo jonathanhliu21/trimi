@@ -24,6 +24,16 @@ class TrackerSample:
     count: int
 
 
+@dataclass(frozen=True)
+class ArmHealth:
+    """Latest Piper feedback health: ok while every drive is enabled with no error code."""
+
+    monotonic_ns: int
+    ok: bool
+    problem: str
+    rate_hz: float
+
+
 class SharedState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -34,7 +44,16 @@ class SharedState:
         self._latest_follower_contact_snapshot: FollowerContactSnapshot | None = None
         self._latest_tactile_contacts: tuple[bool, ...] | None = None
         self._latest_task_bgr: np.ndarray | None = None
+        self._latest_arm_health: ArmHealth | None = None
         self.shutdown = threading.Event()
+
+    def set_arm_health(self, health: ArmHealth) -> None:
+        with self._lock:
+            self._latest_arm_health = health
+
+    def latest_arm_health(self) -> ArmHealth | None:
+        with self._lock:
+            return self._latest_arm_health
 
     def set_hand_target(self, target: np.ndarray) -> None:
         value = np.asarray(target, dtype=np.float64)

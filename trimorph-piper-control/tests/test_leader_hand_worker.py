@@ -130,6 +130,82 @@ class LeaderHandWorkerTests(unittest.TestCase):
                 hand.shutdown.assert_called_once()
 
 
+class KinestheticLeaderHandTests(unittest.TestCase):
+    """Torque-off leader read in the executor's operating mode (kinesthetic teaching)."""
+
+    def make_config(self, **kwargs):
+        return HandOnlyCollectionConfig(
+            dataset_root=Path("unused"),
+            hand_config=Path("config/xl330_new_hand_transparent.yaml"),
+            hand_port="/dev/ttyUSB0",
+            hand_measure_rate_hz=1000.0,
+            warmup_time=0.0,
+            episode_time=30.0,
+            hand_operating_mode=3,
+            **kwargs,
+        )
+
+    def test_reads_in_mode_3_with_torque_off_and_restores_the_yaml_mode(self):
+        from midas_hand_api import HandConfig
+
+        yaml_config = HandConfig.load(Path("config/xl330_new_hand_transparent.yaml"))
+        self.assertEqual(yaml_config.operating_mode, ct.OPERATING_MODE_CURRENT_BASED_POSITION)
+        shared = SharedState()
+        hand = Mock()
+        hand.motor_ids = list(range(13))
+        hand.port = "/dev/ttyUSB0"
+        hand.config = SimpleNamespace(
+            joint_signs_array=np.ones(13), home_offsets_array=np.zeros(13), current_unit_ma=1.0,
+            max_current_limit_ma=1700.0, motor_model="xl330-m077-t", baudrate=1_000_000,
+        )
+
+        def read_pos():
+            if hand.read_pos.call_count > 2:
+                shared.shutdown.set()
+            return np.zeros(13)
+
+        hand.read_pos.side_effect = read_pos
+        session = Mock()
+        session.elapsed_s.return_value = 0.0
+        recorder = Mock()
+        recorder.current.return_value = session
+        with (
+            patch("midas_hand_api.MidasHand", return_value=hand) as hand_type,
+            patch("data_collection.collection.leader_hand_worker.load_hand_config", return_value=yaml_config),
+            patch("data_collection.collection.leader_hand_worker.verify_connected_hand"),
+        ):
+            run_leader_hand_worker(self.make_config(), shared, recorder, init_done=threading.Event())
+
+        self.assertEqual(hand_type.call_args.kwargs["config"].operating_mode, ct.OPERATING_MODE_POSITION)
+        hand.configure.assert_called_once_with(enable_torque=False)
+        hand.enable_torque.assert_not_called()
+        names = [name for name, _args, _kwargs in hand.mock_calls]
+        self.assertLess(names.index("configure"), names.index("read_pos"))
+        restore = names.index("dxl_client.sync_write")
+        self.assertEqual(
+            hand.mock_calls[restore].args,
+            (list(range(13)), [ct.OPERATING_MODE_CURRENT_BASED_POSITION] * 13,
+             ct.ADDR_OPERATING_MODE, ct.LEN_OPERATING_MODE),
+        )
+        self.assertEqual(names[restore - 1], "disable_torque")
+        self.assertEqual(names[-1], "shutdown")
+
+    def test_rejects_a_follower(self):
+        from midas_hand_api import HandConfig
+
+        with (
+            patch("midas_hand_api.MidasHand") as hand_type,
+            patch("data_collection.collection.leader_hand_worker.load_hand_config",
+                  return_value=HandConfig.load(Path("config/xl330_new_hand_transparent.yaml"))),
+            self.assertRaisesRegex(ValueError, "torque-off leader"),
+        ):
+            run_leader_hand_worker(
+                self.make_config(follower_hand_config=Path("f.yaml"), follower_hand_port="/dev/f"),
+                SharedState(), Mock(), init_done=threading.Event(),
+            )
+        hand_type.assert_not_called()
+
+
 class ForceFeedbackCurrentTests(unittest.TestCase):
     @staticmethod
     def controller(hand):
