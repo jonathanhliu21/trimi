@@ -5,6 +5,7 @@ scripts/recordings/*.csv
 __pycache__
 data_midas*/
 data_trimorph*/
+data_kinesthetic*/
 data_collection_*/
 config/leader_hand.yaml
 config/follower_hand.yaml
@@ -13,6 +14,7 @@ output/
 *.csv
 *.json
 !thumb_retarget_model.json
+!config/kinesthetic_starts/*.json
 *.zip
 .venv-mocap/
 /ros2/build/

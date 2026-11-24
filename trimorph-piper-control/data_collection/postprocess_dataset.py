@@ -56,16 +56,75 @@ def resolve_pose_source(config):
     source = config.pose_source
     if source == "auto":
         source = "quest" if config.calibration_json is not None else "piper"
-    if source not in ("piper", "quest", "mocap"):
+    if source not in ("piper", "piper_fk", "quest", "mocap"):
         raise ValueError(f"Unknown pose source: {source}")
-    if source == "piper" and config.calibration_json is not None:
-        raise ValueError("--pose-source piper reads measured flange poses; omit --calibration-json")
-    if source != "piper" and config.calibration_json is None:
+    if source in ("piper", "piper_fk") and config.calibration_json is not None:
+        raise ValueError(f"--pose-source {source} uses the arm base frame; omit --calibration-json")
+    if source not in ("piper", "piper_fk") and config.calibration_json is None:
         raise ValueError(f"--pose-source {source} requires --calibration-json")
-    if source == "piper" and (config.absolute or config.piper_start_pose is not None
+    if source in ("piper", "piper_fk") and (config.absolute or config.piper_start_pose is not None
                               or config.apply_calibration_latency):
         raise ValueError("Piper poses are already absolute in the arm base; omit calibration/anchor options")
     return source
+
+
+def convert_piper_fk(episode):
+    """Use the executor's pure MDH model and the joint CAN receipt clock.
+
+    Keep one output row per joint sample. Sync selects nearest rows; it never
+    interpolates Euler angles or rotation vectors across a branch cut.
+    """
+    from data_collection.replay_actions import piper_model
+
+    rows = base.read_csv_rows(episode.piper_path)
+    if not rows:
+        raise ValueError(f"No Piper joint samples in {episode.piper_path}")
+    try:
+        stamps = np.array([int(row["joint_rx_monotonic_ns"]) for row in rows], dtype=np.int64)
+        joints = np.array([[float(row[f"joint_{j}"]) for j in range(1, 7)] for row in rows])
+    except (KeyError, ValueError, OverflowError) as exc:
+        raise ValueError("piper_fk needs joint_1..joint_6 and integer joint_rx_monotonic_ns in every row") from exc
+    if np.any(stamps <= 0) or np.any(np.diff(stamps) <= 0):
+        raise ValueError("Piper CAN receive timestamps must be positive and strictly increasing")
+    if not np.isfinite(joints).all():
+        raise ValueError("Piper joint samples must be finite radians")
+    fk, _ = piper_model()
+    poses = np.asarray([fk(q) for q in joints])
+    rotations = Rotation.from_euler("xyz", poses[:, 3:])
+    converted, eef = replay_rows(episode, rows, stamps, poses[:, :3], rotations)
+    merged = []
+    errors, time_offsets = [], []
+    for raw, output, pose, rotation in zip(rows, converted, poses, rotations):
+        row = dict(raw)
+        row["recorded_monotonic_ns"] = raw.get("monotonic_ns", "")
+        for key in base.RAW_EEF_FIELDS:
+            row[f"firmware_{key}"] = raw.get(key, "")
+        row.update(output)
+        merged.append(row)
+        try:
+            firmware = np.array([float(raw[key]) for key in base.RAW_EEF_FIELDS])
+            offset = float(raw["eef_timestamp_s"]) - float(raw["robot_timestamp_s"])
+        except (KeyError, ValueError):
+            continue
+        if not np.isfinite(firmware).all() or not np.isfinite(offset) or abs(offset) > 0.1:
+            continue
+        errors.append((1000 * np.linalg.norm(firmware[:3] - pose[:3]),
+                       np.degrees((Rotation.from_euler("xyz", firmware[3:]) * rotation.inv()).magnitude())))
+        time_offsets.append(abs(offset) * 1000)
+    comparison = {"compared_rows": len(errors), "total_rows": len(rows),
+                  "comparison": "asynchronous feedback; receive timestamps within 100 ms"}
+    if errors:
+        values = np.asarray(errors)
+        for name, data in (("position_mm", values[:, 0]), ("rotation_deg", values[:, 1]),
+                           ("receive_time_difference_ms", np.asarray(time_offsets))):
+            comparison[name] = dict(median=float(np.median(data)), p95=float(np.percentile(data, 95)),
+                                    max=float(np.max(data)))
+        print(f"  FK vs firmware: {len(errors)} pairs; position median/max "
+              f"{np.median(values[:, 0]):.2f}/{np.max(values[:, 0]):.2f} mm; rotation "
+              f"{np.median(values[:, 1]):.2f}/{np.max(values[:, 1]):.2f} deg")
+    else:
+        print("  FK poses computed; no fresh firmware poses available for comparison.")
+    return merged, eef, stamps, comparison
 
 
 def processed_episode_dir(episode_dir: Path) -> Path:
@@ -375,7 +434,11 @@ def process_episode(config, episode):
     # Collection with --piper-start-joints-deg records the arm's measured start pose.
     start_pose = config.piper_start_pose or (metadata.get("piper") or {}).get("start_pose")
     self_anchored = False
-    if source != "piper":
+    fk_comparison = None
+    if source == "piper_fk":
+        converted, eef, eef_ns, fk_comparison = convert_piper_fk(episode)
+        pose_frame = "piper_base"
+    elif source != "piper":
         calibration = base.read_json(config.calibration_json)
         # Absolute poses that need no start pose: Vicon, or Quest when the calibration has C.
         self_anchored = config.absolute and (source == "mocap"
@@ -417,7 +480,11 @@ def process_episode(config, episode):
     quest_first = base.read_csv_rows(episode.path / "quest.csv")[0] if from_quest else None
     processing = dict(
         episode=episode.name, episode_index=episode.index, pose_frame=pose_frame,
-        source=f"{source}.csv",
+        source="piper.csv" if source == "piper_fk" else f"{source}.csv",
+        pose_source=source,
+        kinematic_model="pyAgxArm piper MDH (executor JointController)" if source == "piper_fk" else None,
+        pose_clock="joint_rx_monotonic_ns" if source == "piper_fk" else "monotonic_ns",
+        fk_firmware_comparison=fk_comparison,
         mocap_topic=mocap_topic,
         replay_orientation="Euler xyz radians: Rz(yaw) Ry(pitch) Rx(roll)",
         action_orientation="rotation vector radians", camera_enabled=not config.no_camera,
@@ -486,8 +553,9 @@ def main():
     parser.add_argument("--mocap-smooth-s", type=float, default=0.02,
                         help="Gaussian smoothing sigma for Vicon poses after removing single-frame spikes "
                              "(0 = raw poses, no filtering; default: %(default)s)")
-    parser.add_argument("--pose-source", choices=("auto", "piper", "quest", "mocap"), default="auto",
+    parser.add_argument("--pose-source", choices=("auto", "piper", "piper_fk", "quest", "mocap"), default="auto",
                         help="Pose stream: piper reads measured base-frame flange poses without calibration; "
+                             "piper_fk computes poses from joints using the rollout MDH model and CAN receive time; "
                              "quest/mocap require calibration. Default auto selects quest with calibration, otherwise piper.")
     parser.add_argument("--mocap-topic", help="Vicon pose topic of the tracked hand object, e.g. /vicon/Hand/Hand "
                                               "(required when mocap.csv has several pose topics)")

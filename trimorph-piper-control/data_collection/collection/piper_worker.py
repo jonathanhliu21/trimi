@@ -20,7 +20,7 @@ from .config import (
     HandOnlyCollectionConfig,
 )
 from .episode import EpisodeBuffer, RecordingManager
-from .shared_state import ArmHealth, SharedState
+from .shared_state import ArmHealth, PiperControllerStatus, PiperJointSample, SharedState
 
 
 PIPER_LIMIT_WARNING_INTERVAL_S = 2.0
@@ -56,17 +56,37 @@ def piper_workspace_warning(state: dict[str, object]) -> str | None:
     if not reasons:
         return None
     return (
-        "WARNING: Piper reached a workspace/kinematic limit ("
+        "WARNING: Piper reports a workspace/kinematic limit ("
         + ", ".join(reasons)
-        + "). Move the arm away from the boundary before recording/replay."
+        + "). This may refer to a rejected motion target, rather than the measured joint configuration."
     )
 
 
-def arm_health_problem(enable: list[bool | None], err_code: int | None) -> str:
-    """Empty while every drive is enabled with no error code, else what is wrong."""
+def controller_status_problem(arm_status: str | None, err_code: int | None) -> str:
+    """A zero error bitmask does not clear a non-normal firmware arm status."""
+    problems = []
+    if not arm_status:
+        problems.append("NO ARM STATUS")
+    elif arm_status.split("(", 1)[0].strip() != "NORMAL":
+        problems.append(f"STATUS {arm_status}")
+    if err_code is None:
+        problems.append("NO ERROR FEEDBACK")
+    elif err_code:
+        problems.append(f"ERR 0x{err_code:04X}")
+    return " ".join(problems)
+
+
+def arm_health_problem(enable: list[bool | None], err_code: int | None, *, disable_j6=False,
+                       arm_status: str | None = None) -> str:
+    """Require the selected enable state for all six drives and no arm error."""
 
     problems = []
-    off = [joint for joint, enabled in enumerate(enable, start=1) if enabled is False]
+    if len(enable) != 6:
+        problems.append("INCOMPLETE DRIVER STATE")
+    off = [joint for joint, enabled in enumerate(enable, start=1)
+           if enabled is False and not (disable_j6 and joint == 6)]
+    if disable_j6 and len(enable) == 6 and enable[5] is True:
+        problems.append("J6 UNEXPECTEDLY ENABLED")
     unknown = [joint for joint, enabled in enumerate(enable, start=1) if enabled is None]
     if off:
         problems.append("DRIVES OFF J" + ",".join(map(str, off)))
@@ -76,6 +96,8 @@ def arm_health_problem(enable: list[bool | None], err_code: int | None) -> str:
         problems.append("NO ARM STATUS")
     elif err_code:
         problems.append(f"ERR 0x{err_code:04X}")
+    if arm_status is not None and arm_status.split("(", 1)[0].strip() != "NORMAL":
+        problems.append(f"STATUS {arm_status}")
     return " ".join(problems)
 
 
@@ -83,7 +105,8 @@ def _fmt(value: float) -> str:
     return f"{float(value):.9f}"
 
 
-def gravity_comp_sample(joints, motors, enable, status, eef, *, now_ns: int, wall_s: float):
+def gravity_comp_sample(joints, motors, enable, status, eef, *, now_ns: int, wall_s: float,
+                        disable_j6=False):
     """One piper.csv row (without the per-episode index fields) and its health problem.
 
     Every row has the same columns; values that have not arrived yet are blank.
@@ -124,7 +147,9 @@ def gravity_comp_sample(joints, motors, enable, status, eef, *, now_ns: int, wal
             "err_code": status.err_code if status is not None else "",
         }
     )
-    problem = arm_health_problem(enable, None if status is None else status.err_code)
+    problem = arm_health_problem(enable, None if status is None else status.err_code,
+                                 disable_j6=disable_j6,
+                                 arm_status=None if status is None else status.arm_status)
     row["arm_ok"] = int(not problem)
     fresh = eef is not None and abs(float(eef.timestamp) - rx_s) <= EEF_FRESH_S
     row.update(zip(RAW_EEF_FIELDS, [_fmt(value) for value in eef.pose] if fresh else [""] * 6))
@@ -196,6 +221,10 @@ def run_gravity_comp_listener(
             gap_warned = False
             wall_s = time.time()
             status = api.get_arm_status()
+            if status is not None:
+                shared.set_piper_controller_status(PiperControllerStatus(
+                    now_ns - int(round(max(0., wall_s - float(status.timestamp)) * 1e9)),
+                    str(status.arm_status), status.err_code))
             row, problem = gravity_comp_sample(
                 joints,
                 api.get_motor_state(),
@@ -204,8 +233,11 @@ def run_gravity_comp_listener(
                 api.get_eef_state(),
                 now_ns=now_ns,
                 wall_s=wall_s,
+                disable_j6=config.grav_comp_disable_j6,
             )
-            shared.set_arm_health(ArmHealth(now_ns, not problem, problem, float(joints.hz)))
+            shared.set_arm_health(ArmHealth(now_ns, not problem, problem, float(joints.hz), tuple(joints.joints)))
+            shared.set_piper_joints(PiperJointSample(
+                int(row["joint_rx_monotonic_ns"] or now_ns), tuple(joints.joints)))
             session = recorder.current()
             if problem != last_problem:
                 if problem:
@@ -309,6 +341,7 @@ def run_piper_worker(
     last_limit_warning_t = float("-inf")
     last_joint_limit_state: dict[int, str] = {}
     last_joint_limit_warning_ns: dict[int, int] = {}
+    last_joint_stamp: float | None = None
     try:
         while not shared.shutdown.is_set():
             now_ns = time.monotonic_ns()
@@ -316,6 +349,9 @@ def run_piper_worker(
             if now_ns >= next_teacher_ns:
                 state = api.get_state()
                 teach_status = state.get("teach_status")
+                if getattr(config, "show_piper_joint_monitor", False):
+                    shared.set_piper_controller_status(PiperControllerStatus(
+                        now_ns, str(state.get("arm_status", "")), state.get("err_code")))
                 limit_warning = piper_workspace_warning(state)
                 now_s = now_ns / 1e9
                 if limit_warning is not None and (
@@ -336,10 +372,18 @@ def run_piper_worker(
                 eef = api.get_eef_state()
                 joints = (
                     api.get_joint_state()
-                    if session is not None and getattr(config, "piper_joint_level", False)
+                    if (getattr(config, "show_piper_joint_monitor", False)
+                        or (session is not None and getattr(config, "piper_joint_level", False)))
                     else None
                 )
                 sample_ns = time.monotonic_ns()
+                if (getattr(config, "show_piper_joint_monitor", False)
+                        and joints is not None and joints.timestamp != last_joint_stamp):
+                    last_joint_stamp = joints.timestamp
+                    age_s = time.time() - float(joints.timestamp)
+                    receipt_ns = (sample_ns - int(round(age_s * 1e9))
+                                  if abs(age_s) <= RX_CLOCK_SANITY_S else sample_ns)
+                    shared.set_piper_joints(PiperJointSample(receipt_ns, tuple(joints.joints)))
                 if (
                     session is not None
                     and eef is not None

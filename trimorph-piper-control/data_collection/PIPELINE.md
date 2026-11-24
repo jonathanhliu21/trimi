@@ -50,12 +50,87 @@ a tool-tip offset would need a separate transform.
 With the TRIMI hand mounted on the Piper, `gravity_comp.drag_mode`
 (midas-piper-control, calibration `scripts/grav_comp/calib/robot1_trimi.json`)
 holds the arm in MIT torque mode while the operator moves it, and the hand's
-torque is off. Start drag mode first and wait for "assist at target", then:
+torque is off. Use the launcher from the repository root:
 
 ```bash
-python3 data_collection/collect_hand_only.py --arm-mode gravity-comp \
-  --dataset-root data_trimorph_kinesthetic_0
+scripts/kinesthetic/run_kinesthetic_collection.sh \
+  --define-start --passive-j6 --dataset-root data_trimorph_kinesthetic
 ```
+
+Each task gets its own recorded arm and hand start. `--define-start` is the
+launcher's default when no profile or explicit legacy start is supplied. It
+shows `DEFINE START`, with no saved target or target skeleton. After assist is
+at target, position the arm and hand for `multi_pick_and_place`, hold that pose,
+and use the pedal to record a short stationary clip (about 1–2 seconds). The
+operator chooses the capture moment. The definition episode is marked
+`start_definition` and is not a training demonstration.
+
+Once the clip is saved, extract its measured start offline. Replace
+`episode_XXXXXX` with that definition episode:
+
+```bash
+.venv/bin/python scripts/kinesthetic/capture_task_start.py \
+  --task multi_pick_and_place \
+  --from-episode data_trimorph_kinesthetic/raw/episode_XXXXXX \
+  --output config/kinesthetic_starts/multi_pick_and_place.json
+```
+
+The default sample is at episode start; use `--at-s SECONDS` to select a later
+stationary moment. The file preserves measured arm joints, hand positions and
+motor IDs, the hand YAML hash, source timestamps and warnings; it does not clip
+the measurements. Capture does not prove that the pose is suitable for rollout.
+Review its warnings, particularly the unresolved hand-limit findings below.
+The current `multi_pick_and_place` profile is saved at that path from the
+6.772-second definition episode 000002. Its arm target passes the nominal
+torque/limit check (J1 +5.935, J2 -2.915 N*m). Recorded hand motors 4, 7 and 8
+are outside YAML limits; their raw values and warnings are preserved. The
+profile can guide receive-only collection, but its hand target is not cleared
+for rollout.
+
+Use that saved profile to collect this task's demonstrations:
+
+```bash
+scripts/kinesthetic/run_kinesthetic_collection.sh --passive-j6 \
+  --start-profile config/kinesthetic_starts/multi_pick_and_place.json \
+  --dataset-root data_trimorph_kinesthetic
+```
+
+For a later policy rollout, after collection and drag mode have stopped and
+supported disable has completed, select the same profile with the executor:
+
+```bash
+inference/executor/run_kinesthetic.sh \
+  --start-profile config/kinesthetic_starts/multi_pick_and_place.json \
+  --predictor PREDICTOR_HOST
+```
+
+The executor validates the recorded hand target against its configuration and
+limits before motion; an unreplayable target is rejected, not silently clipped.
+The kinesthetic executor wrapper requires an explicit task profile or legacy
+start and selects no universal task start.
+
+The launcher checks CAN, the hand configuration and the gravity-comp tests.
+With a saved profile it also checks calibrated torque at that profile's arm
+pose. Definition mode has no target yet: its start-torque check is explicitly
+`not_checked`, not passed. Confirm the mounted payload when prompted. A tmux session
+opens with drag mode on the left and collection on the right; the collector
+waits for drag mode's "assist at target" message. Complete the support/arming
+ritual in the drag pane. Switch panes with Ctrl-b then an arrow key.
+The default uses the foot pedal for episodes and keeps the camera on.
+`--episode-s 30` instead records one timed episode; `--no-camera` is for bench
+work only. `--dry-run` prints commands; `--preflight-only` runs the checks
+without starting either process. `--midas-repo` selects a different gravity-comp
+checkout. Both processes use their own repository's Python environment.
+
+Each launch stores logs, a session manifest, an initial calibration snapshot,
+and the drag session's working calibration under `DATASET/sessions/SESSION_ID`.
+With `--start-profile`, it also saves the exact task JSON and its SHA-256; both
+the preflight check and collector use that session snapshot.
+Drag mode updates that copy, leaving the versioned calibration alone. The
+launcher refuses a second drag process on the same CAN interface. If drag exits
+or prints a freeze/stop message, the supervisor interrupts the collector so it
+saves the episode. Readiness is based on drag-mode terminal output; keep watching
+that terminal. Detaching tmux leaves its processes running.
 
 `--arm-mode gravity-comp` implies `--use-piper --no-mocap`. The collector
 then sends nothing on the CAN bus: no 0x151 or 0x477 frame on connect (it
@@ -67,15 +142,141 @@ torque, the drive enable bits, arm status and error code, and the firmware end
 pose when it arrives. The hand defaults to the rollout's
 `config/xl330_new_hand_transparent.yaml` on `/dev/ttyUSB0`, read torque-off in
 the executor's operating mode 3; the YAML's mode is restored on exit. The
-monitor's ARM box is green while all drives are enabled with no error code.
-Episodes where that is not true get `"arm_not_ok"` in `metadata.json`'s
-`flags`. Stop the collector first, so the episode is saved, then stop drag mode.
+monitor shows drive/error health as secondary text. Episodes where the expected
+drive enable state or error status is unhealthy get `"arm_not_ok"` in `metadata.json`'s
+`flags`. Stop the collector first, so the episode is saved, then press `q` in
+drag mode, support the arm and press Enter at the disable prompt. Do not kill
+the tmux session while drag torque is live.
 
-Not finished yet (data_collection/KINESTHETIC_PLAN.md): the launcher (1.4),
-the start pose the arm holds by itself (1.5), and `--pose-source piper_fk` in
-postprocessing (1.6). The firmware end pose may be missing in MIT mode, so do
-not postprocess these datasets with `--pose-source piper`. Check a short
-recording with `scripts/grav_comp/listener_bench_report.py` (1.3) first.
+The monitor guides the arm to the saved task start by showing flange position
+distance and total rotation error from the recorded start. Its prominent START
+box and filled banner are red `NOT AT START` until the flange is within 10 cm
+and 45 degrees with healthy, fresh feedback; then they turn green and show
+`AT START TASK`. The position check uses Euclidean distance; orientation uses
+the shortest 3D rotation angle, rather than separate Euler-axis differences.
+Both poses use the executor's SDK MDH flange model in Piper base coordinates.
+Feedback health is secondary text, so healthy feedback alone cannot make start readiness
+green. Move the arm there by hand before pressing the pedal; recording has no
+start-position interlock.
+The collector never commands this start. Metadata records the task, explicit
+target joints, profile snapshot/hash, and episode's first measured joints; the
+quality report compares against those recorded target values and thresholds.
+The hand pose is not part of this arm readiness check. The limits can be set on
+the collector with `--kinesthetic-start-position-tolerance-m` (default 0.10) and
+`--kinesthetic-start-orientation-tolerance-deg` (default 45). Launch preflight
+requires the saved pose's J1/J2 nominal commands below 6.5 N*m and every joint
+within its limits and torque cap. This checks the pose, not the approach or the
+whole workspace. `--start-home NAME` (launcher) and `--kinesthetic-start NAME`
+(direct collector) remain explicit legacy options; `kinesthetic` was used in
+the older trials below and is no longer a default for new tasks. A direct
+collector without an explicit target has no start guide. The executor wrapper
+refuses to run against an active drag controller; unrelated executor defaults
+remain unchanged.
+
+Check every pilot episode, then process its poses from joints:
+
+```bash
+.venv/bin/python scripts/dataset/check_episodes.py data_trimorph_kinesthetic_0
+.venv/bin/python data_collection/postprocess_dataset.py data_trimorph_kinesthetic_0 \
+  --pose-source piper_fk
+```
+
+Add `--no-camera` to postprocessing only for camera-free recordings. The quality
+report checks arm rate/gaps, status changes, SDK joint limits, hand YAML limits,
+cross-stream synchronization, and time near the J1/J2 current-derived torque
+cap. High measured torque suggests saturation/support; it does not prove either.
+Warnings return exit status 1 and should be reviewed before training or replay.
+
+`piper_fk` uses the executor's pyAgxArm MDH model and synchronizes on
+`joint_rx_monotonic_ns`. Processed `piper.csv` keeps the joints and motor/status
+columns, preserves receipt time as `recorded_monotonic_ns`, and preserves the
+firmware poses as `firmware_x` through `firmware_yaw`; its main pose fields are
+FK poses. Processing metadata reports FK/firmware differences and their timing
+offsets. Firmware poses are optional for FK processing. The 2026-11-22 listener
+bench passed at 199 Hz; its static recording is not a cleared training pilot
+(joint-limit, torque and hand-limit warnings remain). Plan Part 2, replay through
+the deployed executor, follows pilot collection.
+
+For the free-wrist profile checked on 2026-11-22, add `--passive-j6`:
+
+```bash
+scripts/kinesthetic/run_kinesthetic_collection.sh --passive-j6 \
+  --start-profile config/kinesthetic_starts/multi_pick_and_place.json \
+  --dataset-root data_trimorph_kinesthetic
+```
+
+This keeps all six drives electrically enabled and retains the original MIT
+command sequence. J6 receives zero requested kp, kd, velocity and torque in
+drag, braking and hold. Firmware quantization means a zero request is not
+exactly zero physical torque. Support the free wrist throughout, and support
+the whole arm during the four-second ramp from zero feed-forward. J1/J2 are
+still torque-capped, so operator support remains necessary. Collection logs
+all six joints, expects all drives enabled, and guides all six to the named
+start. Metadata records `gravity_comp.passive_j6: true`,
+`zero_torque_joints: [6]` and `disabled_joints: []`. The matching controller
+changes are carried in `scripts/kinesthetic/midas_disable_j6.patch`; preflight
+checks the selected option is available.
+
+To make both wrist joints passive, use `--passive-j5-j6` instead:
+
+```bash
+scripts/kinesthetic/run_kinesthetic_collection.sh --passive-j5-j6 \
+  --start-profile config/kinesthetic_starts/multi_pick_and_place.json \
+  --dataset-root data_trimorph_kinesthetic
+```
+
+All six drives remain electrically enabled. J5 and J6 receive zero requested
+MIT kp, kd, velocity and feed-forward torque in every control state, including
+braking, freeze-hold and exception braking. This also removes their gravity,
+friction and software damping torque commands. J1-J4 commands and all six-joint
+feedback/guards remain unchanged. Support both free wrist joints throughout;
+freeze-hold holds J1-J4 only. The collector records `passive_j5_j6: true`,
+`zero_torque_joints: [5, 6]`, and `disabled_joints: []`. This option is mutually
+exclusive with `--passive-j6` and `--disable-j6`, overrides J5's `--j5-kd` at
+the send boundary, and has only been verified offline. It does not resolve the
+reported startup drop; review the startup incident in the kinesthetic plan
+before another powered trial.
+
+The collection launcher defaults to J5 MIT `Kd=0.005` during ramp-in and drag.
+Pass `--j5-kd 0` on the launcher to request zero J5 MIT damping; J5's active
+`Kp` is already zero, and gravity feed-forward and software damping still apply.
+The selected value is forwarded to drag mode and saved in the session command.
+Other joints retain their normal gains, and J6 stays
+at zero requested gains in the passive profile. Software damping, braking
+and freeze-hold gains are unchanged. Firmware v183 encodes this J5 request
+as approximately 0.003663. The exact launch command and derived damping
+vector are saved with the session. Standalone drag mode defaults to 0.01
+unless the override is explicitly supplied. The 2026-11-22 camera pilot exercised
+this override on hardware with no operator-reported behavior issues; its data
+remain flagged for the separate quality findings below.
+
+`--disable-j6` is a separate, mutually exclusive diagnostic that electrically
+disables J6. Its hardware trial left J1-J5 stiff and did not pass validation;
+use `--passive-j6` for the next pilot. A safety freeze is latched: Enter
+cannot resume assist; press q and follow the support/disable prompt.
+Automatic freezes print their reason and stop collection. Before restarting,
+resolve the reported fault. In the first electrically-disabled wrist trial, J6 approached
+360 degrees and joint feedback disappeared; the SDK rejects readings outside
++/-360 degrees. Position the wrist within its configured joint range before
+arming; do not mask this by wrapping angles or changing the encoder zero.
+The +55.604-degree J6 target belonged to
+the legacy `kinesthetic` trials; new tasks use their recorded profile target.
+
+The first camera pilot (`data_kinesthetic_pilot_20261122`) is **flagged**, with
+start-pose, J1 cap, joint/hand-limit and camera-to-hand sync issues; see the
+pilot findings in `KINESTHETIC_PLAN.md`. Do not treat its processed output as
+cleared training data. The subsequent passive-J6 camera episode
+`data_trimorph_kinesthetic/raw/episode_000000` also remains diagnostic because
+of start mismatch, joint/hand-limit, J1-cap and synchronization findings.
+A USB latency timer of 16 ms produced alternating 16/32 ms hand-read intervals
+in those recordings. On 2026-11-22 the operator set it to 1 ms with sudo, and
+readback confirmed `1`. The repeat `episode_000001` had 0/862 retained camera
+frames beyond 10 ms from a hand sample (maximum 8.56 ms), improved from
+106/703 and 15.74 ms in episode 000000. It still has a legacy-start mismatch,
+J5 limit excursions, J1 torque-cap exposure and hand-limit violations; both
+episodes remain diagnostic. Recheck the timer after a USB
+reconnect; if needed, set it in an operator terminal with the arm stopped:
+`echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer`.
 
 Keep the camera enabled for the image-policy trainer. In the diffusion-policies
 repository, train on this output using the existing Trimi configuration:

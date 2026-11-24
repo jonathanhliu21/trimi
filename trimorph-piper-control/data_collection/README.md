@@ -4,6 +4,91 @@ For the end-to-end workflow (preparing, collecting, checking, postprocessing,
 and the output files) start with [PIPELINE.md](PIPELINE.md); this file holds
 the details.
 
+For gravity-comp kinesthetic teaching, first define the start separately for
+each task with `scripts/kinesthetic/run_kinesthetic_collection.sh --define-start
+--dataset-root DATASET` (definition is also the launcher's default).
+Add `--passive-j6` for the checked free-wrist profile: J6 stays electrically
+enabled with zero requested MIT gains and torque. Support the whole arm
+during ramp-in and the free wrist throughout.
+Use `--passive-j5-j6` instead to request zero MIT gains, velocity and torque on
+both J5 and J6, including braking and freeze-hold. Both wrist joints need support;
+this option has only been checked offline and does not fix the reported startup drop.
+It opens drag mode and the receive-only collector in tmux and saves a session
+calibration copy. After assist reaches target, choose the task's arm and hand
+start and record a short stationary pedal clip. Extract the measured start with
+`scripts/kinesthetic/capture_task_start.py`; use the resulting JSON with
+`--start-profile PATH` for subsequent collection and policy rollout. Definition
+clips are reference recordings, not training demonstrations. No universal start
+is selected. The `multi_pick_and_place` profile is saved from definition episode
+000002; its hand-limit warnings remain unresolved and prevent rollout approval.
+With a saved profile, the START box and filled banner turn green
+(`AT START multi_pick_and_place`) only when the flange is within 10 cm of the
+recorded start position and its total rotation error is within 45 degrees,
+with fresh, healthy feedback. Feedback health is secondary text; the guide does
+not prevent a pedal press. Follow the
+[kinesthetic collection instructions](PIPELINE.md#kinesthetic-teaching-under-gravity-comp-receive-only-arm-logging)
+for operator prompts, stop order, episode checks, and `--pose-source piper_fk`.
+
+The separate `trimorph_piper_joints` window opens by default with
+`--arm-mode gravity-comp` or `--use-piper --piper-joint-level`. Each row shows
+the measured angle, SDK preset minimum/maximum, and distance to the nearest
+limit, in degrees. It is green more than 3 degrees from both limits and red
+at or within 3 degrees, outside the range, or with invalid/missing feedback.
+The overall banner and joint rows also turn red when firmware reports a
+non-normal arm status (including `TARGET_POS_EXCEEDS_LIMIT`, even with
+`err_code=0`) or controller feedback is missing/stale. A firmware target fault
+may refer to a rejected command; it does not establish that a measured joint
+is outside its limits. Feedback older than 0.5 seconds is red and marked stale.
+The display runs between episodes; joint angles are saved in radians as
+`joint_1` through `joint_6` in each active episode's raw `piper.csv`.
+`--piper-joint-monitor` explicitly opens it and enables joint logging;
+`--no-piper-joint-monitor` hides it without disabling requested joint logging.
+The launcher's `--no-monitor` hides both monitor windows.
+
+`collect_hand_only.py --arm-mode gravity-comp` does **not** launch, tune,
+enable, disable or stop arm gravity compensation. Its arm connection only
+receives cached feedback. It can run alone to test the UI with the arm powered
+and CAN connected; it still connects to the leader hand and sets its operating
+mode with torque off. Disabled drives can make the separate arm-health display
+red, even with valid measured joints. From this repository, a UI-only run
+without camera, Quest, mocap, pedal or recording is:
+
+```bash
+.venv/bin/python data_collection/collect_hand_only.py \
+  --arm-mode gravity-comp --retarget-only --no-camera --no-monitor
+```
+
+For a short collection/replay check, run the existing gravity-comp controller
+separately if you need assisted hand guidance, then collect one 15-second
+episode (the joint window opens automatically):
+
+```bash
+.venv/bin/python data_collection/collect_hand_only.py \
+  --arm-mode gravity-comp --no-camera \
+  --dataset-root data_joint_ui_check --episode-s 15
+```
+
+After collection exits, stop the gravity-comp controller with its normal
+`q`, support-arm, Enter-to-disable sequence before replay. Replay the latest
+episode's measured EEF poses at quarter speed, with a 10-second preposition
+phase and firmware Cartesian control:
+
+```bash
+.venv/bin/python data_collection/replay_episode.py \
+  --dataset-root data_joint_ui_check --arm-only --read-piper-raw --arm-control pose \
+  --playback-speed 0.25 --preposition-seconds 10 --settle-seconds 2 \
+  --preposition-speed-percent 10 --replay-speed-percent 10 \
+  --arm-diag
+```
+
+This sends raw recorded EEF targets to firmware Cartesian IK, without
+postprocessing. An episode number before the options selects that episode;
+omitting it selects the latest. Replay keeps Euler angles unwrapped while
+interpolating; `PiperAPI.move_eef` converts each command to an equivalent
+orientation in the SDK's roll/yaw +/-pi and pitch +/-pi/2 ranges. This avoids
+the SDK clamping an unwrapped angle into a different orientation. Actual
+smooth motion still needs to be observed on the arm.
+
 `collect_hand_only.py` records, by default, the TRIMORPH leader hand, Quest
 UDP poses, ROS 2 Vicon mocap, and the OAK wrist camera. Turn the defaults off
 with `--no-quest`, `--no-mocap`, or `--no-camera`. Optional streams: add
@@ -100,6 +185,11 @@ Quest (`linear_matrix`) and, if present, Vicon (`vicon_reference`) motion to
 Piper base axes. Drag to rotate, right-drag or scroll to zoom, double-click to
 re-center; `q`/Escape stops collection as in the camera view. Disable it with
 `--no-monitor`. The window only displays; it does not change what is recorded.
+
+For gravity-comp collection, the primary START box shows saved task-start readiness,
+and arm feedback health appears below it. A healthy arm away from the start
+still shows red `NOT AT START`; a green feedback indication alone does not
+establish the start pose.
 
 For a live IK warning window, add these options to your collection command:
 

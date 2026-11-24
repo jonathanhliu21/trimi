@@ -1,0 +1,62 @@
+{
+  "arm": {
+    "joints_deg": [
+      -47.621999977956044,
+      101.20399998920884,
+      -44.75900000572145,
+      -58.97900002671498,
+      -57.855999998061144,
+      -53.21900002183759
+    ]
+  },
+  "captured_utc": "2026-11-23T02:36:37.633264+00:00",
+  "hand": {
+    "config_sha256": "8fe3bcb433d3ee713b73cb331f2315fa27e7226d884ca6d68956d028553c6a76",
+    "motor_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12
+    ],
+    "positions_rad": [
+      -0.632242097,
+      0.241214041,
+      -3.57122352,
+      -7.057514959,
+      0.008524269,
+      -2.158932335,
+      0.115844886,
+      0.020796115,
+      -1.586757501,
+      0.17487381,
+      -0.373436947,
+      -2.728039207,
+      2.62231082
+    ]
+  },
+  "schema_version": 1,
+  "source": {
+    "arm_monotonic_ns": 189856120464236,
+    "at_s": 0.0,
+    "calibration_sha256": "65b61a129ee4c93bee8b008b36817ad46dc36367885ef1ef6217ebf5a03faa13",
+    "episode_path": "/home/grasswonder/Jonathan/trimi/trimorph-piper-control/data_trimorph_kinesthetic/raw/episode_000002",
+    "hand_monotonic_ns": 189856125289938,
+    "selected_at_s": 0.003697438,
+    "sync_error_ms": 4.825702
+  },
+  "task": "multi_pick_and_place",
+  "warnings": [
+    "Hand motor 4 0.008524269 rad is outside recorded YAML limits -2.9..0 rad.",
+    "Hand motor 7 0.020796115 rad is outside recorded YAML limits -2.88..0 rad.",
+    "Hand motor 8 -1.586757501 rad is outside recorded YAML limits -0.01..0.01 rad."
+  ]
+}

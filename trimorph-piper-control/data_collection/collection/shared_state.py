@@ -32,6 +32,22 @@ class ArmHealth:
     ok: bool
     problem: str
     rate_hz: float
+    joints: tuple[float, ...] | None = None
+
+
+@dataclass(frozen=True)
+class PiperJointSample:
+    """Latest measured joints (radians), timestamped at feedback receipt."""
+
+    monotonic_ns: int
+    joints: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class PiperControllerStatus:
+    monotonic_ns: int
+    arm_status: str
+    err_code: int | None
 
 
 class SharedState:
@@ -45,7 +61,25 @@ class SharedState:
         self._latest_tactile_contacts: tuple[bool, ...] | None = None
         self._latest_task_bgr: np.ndarray | None = None
         self._latest_arm_health: ArmHealth | None = None
+        self._latest_piper_joints: PiperJointSample | None = None
+        self._latest_piper_controller_status: PiperControllerStatus | None = None
         self.shutdown = threading.Event()
+
+    def set_piper_controller_status(self, status: PiperControllerStatus) -> None:
+        with self._lock:
+            self._latest_piper_controller_status = status
+
+    def latest_piper_controller_status(self) -> PiperControllerStatus | None:
+        with self._lock:
+            return self._latest_piper_controller_status
+
+    def set_piper_joints(self, sample: PiperJointSample) -> None:
+        with self._lock:
+            self._latest_piper_joints = sample
+
+    def latest_piper_joints(self) -> PiperJointSample | None:
+        with self._lock:
+            return self._latest_piper_joints
 
     def set_arm_health(self, health: ArmHealth) -> None:
         with self._lock:

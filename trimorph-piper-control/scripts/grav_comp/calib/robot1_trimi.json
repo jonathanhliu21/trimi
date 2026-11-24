@@ -810,12 +810,12 @@
     ],
     "underpowered_diagnostic": true,
     "rate_hz": 200.0,
-    "overrun_frac": 0.0,
-    "freeze_reason": "SIGINT",
-    "cycles": 66764,
+    "overrun_frac": 4.1636306859581554e-05,
+    "freeze_reason": "operator quit",
+    "cycles": 48035,
     "forced": true,
-    "updated": "2026-11-22T09:02:32+00:00",
-    "source_run": "gravity_comp/calib/piper-1_drag_20261122T090231Z.npz",
+    "updated": "2026-11-23T00:51:21+00:00",
+    "source_run": "gravity_comp/calib/piper-1_drag_20261123T005121Z.npz",
     "gates": {
       "caps_within_limits": {
         "value": [
@@ -838,7 +838,7 @@
         "pass": false
       },
       "overrun_fraction": {
-        "value": 0.0,
+        "value": 4.1636306859581554e-05,
         "threshold": "<= 0.2",
         "pass": true
       }

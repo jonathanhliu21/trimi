@@ -17,6 +17,7 @@ from data_collection.collection.tracking_monitor import (
     stream_status,
 )
 from data_collection.collect_hand_only import main, parse_args
+from data_collection.collection.config import PIPER_START_JOINTS_DEG
 
 SECOND = 1_000_000_000
 
@@ -145,6 +146,38 @@ class ArmBoxTests(unittest.TestCase):
         self.assertEqual(box(None, monitor.render(now), 0, 1), OK_COLOR)
         shared.set_arm_health(ArmHealth(now, False, "ERR 0x0100", 200.0))
         self.assertEqual(box(None, monitor.render(now), 0, 1), FAIL_COLOR)
+
+    def test_start_readiness_controls_prominent_box_and_banner(self):
+        import cv2
+
+        shared = SharedState()
+        with patch.object(cv2, "namedWindow"), patch.object(cv2, "setMouseCallback"):
+            monitor = TrackingMonitor(shared, show_quest=False, show_vicon=False, show_arm=True,
+                                      start_name="kinesthetic", passive_j6=True)
+        now = 100 * SECOND
+        target = np.radians(PIPER_START_JOINTS_DEG["kinesthetic"])
+        far = target + np.radians([-15.08, -8.58, 32.84, -25.86, -119.94, -94.71])
+        for joints, ok, problem, render_time, color, label, health in (
+            (far, True, "", now, FAIL_COLOR, "NOT AT START kinesthetic", "ARM FEEDBACK: OK 200 Hz"),
+            (target, True, "", now, OK_COLOR, "AT START kinesthetic", "ARM FEEDBACK: OK 200 Hz"),
+            (target, False, "ERR 0x0100", now, FAIL_COLOR, "NOT AT START kinesthetic",
+             "ARM FEEDBACK: ERR 0x0100"),
+            (target, True, "", now + SECOND, FAIL_COLOR, "NOT AT START kinesthetic",
+             "ARM FEEDBACK: NO SIGNAL 1.0s"),
+        ):
+            with self.subTest(label=label, health=health):
+                shared.set_arm_health(ArmHealth(now, ok, problem, 200., tuple(joints)))
+                with patch.object(cv2, "putText", wraps=cv2.putText) as put_text:
+                    image = monitor.render(render_time)
+                self.assertEqual(tuple(image[14, 30]), color)  # Prominent START status box.
+                self.assertEqual(tuple(image[82, 30]), color)  # Filled readiness banner.
+                labels = [call.args[1] for call in put_text.call_args_list]
+                self.assertIn("START", labels)
+                self.assertIn(label + " (J6 passive: align manually)", labels)
+                self.assertTrue(any(text.startswith(health) for text in labels))
+                if render_time == now:
+                    self.assertTrue(any(text.startswith("End effector:") for text in labels))
+                    self.assertIn("Ready within 10 cm AND 45 deg total rotation (flange frame)", labels)
 
 
 class MonitorCliTests(unittest.TestCase):

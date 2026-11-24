@@ -21,8 +21,9 @@ TASK_CAMERA_FPS = 30
 # "180" is the readable alias for flipping both axes.
 TASK_CAMERA_FLIP = "both"
 # Fixed exposure, sensitivity and white balance (auto-exposure and auto white
-# balance are off). Before was 5829 us, now is 7000 for screw task
-TASK_CAMERA_EXPOSURE_US = 7000
+# balance are off). Measured from the auto values under the lab lighting on
+# 2026-11-01; no frame-to-frame flicker at this exposure.
+TASK_CAMERA_EXPOSURE_US = 5829
 TASK_CAMERA_ISO = 100
 TASK_CAMERA_WHITE_BALANCE_K = 2634
 TASK_VIEW_WINDOW_NAME = "trimorph_task_view"
@@ -55,7 +56,7 @@ DEFAULT_PIPER_RATE_HZ = 250.0
 DEFAULT_PIPER_INTERFACE = "socketcan"
 DEFAULT_PIPER_CHANNEL = "can0"
 DEFAULT_PIPER_FIRMWARE = "v183"
-DEFAULT_PIPER_INSTALLATION_POS = "right"
+DEFAULT_PIPER_INSTALLATION_POS = "horizontal"
 DEFAULT_PIPER_PAYLOAD = "half"
 # --arm-mode. drag-teach: the firmware drag-teach button moves the arm and the
 # collector polls its flange pose. gravity-comp: gravity_comp.drag_mode (midas-
@@ -87,6 +88,9 @@ KINESTHETIC_HAND_OPERATING_MODE = 3
 # data_trimorph_unscrew_cap_0 (Vicon poses, one start group), median flange
 # (229, -249, 130) mm, mean Euler xyz (163, -1, 84) deg; starts spread ~20 mm / ~6 deg.
 PIPER_START_JOINTS_DEG = {
+    # home_cube_newhw geometry, checked with robot1_trimi.json on 2026-11-22:
+    # |g/alpha| J1=5.002, J2=3.110 N*m (<6.5). Validate again at launch.
+    "kinesthetic": (-42.630, 98.166, -69.691, -29.638, 50.366, 55.604),
     # Captured from passive can0 joint feedback, 2026-11-21 14:29:22 PST.
     # J1..J6 degrees (CAN millidegrees divided by 1000).
     "home_m3": (-34.219, 141.620, -97.148, -8.942, -38.237, 127.376),
@@ -125,6 +129,9 @@ PIPER_START_JOINTS_DEG = {
 }
 # Median first processed_encoder_t row (motors 0..12, leader radians) of the same episodes.
 HAND_START_POSITIONS_RAD = {
+    # Transparent-hand home_cube_newhw start clipped to its recorded YAML limits.
+    "kinesthetic": (-0.000242, 0.268826, -3.327321, -7.528447, 0.0, -0.370311,
+                    0.019204, 0.0, -0.01, -0.030680, 0.0, 0.0, 0.198621),
     # Captured from calibrated read_pos(), 2026-11-21 14:15:51 PST.
     # Motors 0..12; calibration: xl330_new_hand_transparent.yaml.
     "home_m3": (-1.015737, -0.128475, -3.443903, -7.904272, -0.465476, -1.329049, -0.151068, 0.025398, -0.170893, -0.240835, 0.017728, 0.025456, -0.140389),
@@ -141,6 +148,7 @@ HAND_START_POSITIONS_RAD = {
 # home_4c and home_4d were tested with the home_4b hand start.
 HAND_START_POSITIONS_RAD["home_4c"] = HAND_START_POSITIONS_RAD["home_4d"] = HAND_START_POSITIONS_RAD["home_4b"]
 DEFAULT_EXECUTOR_START = "home_4c"
+KINESTHETIC_START = "kinesthetic"
 DEFAULT_TEACHER_MODE_POLL_HZ = 20.0
 DEFAULT_HOLD_DELETE_S = 2.0
 DEFAULT_READY_SECONDS = 0.2
@@ -253,6 +261,17 @@ class HandOnlyCollectionConfig(HandRuntimeConfig):
     # gravity-comp only: the drag-mode calibration and the launcher's session id.
     grav_comp_calib: Path | None = None
     drag_session_id: str | None = None
+    kinesthetic_start: str | None = None
+    start_profile: Path | None = None
+    start_profile_snapshot: dict | None = None
+    start_profile_sha256: str | None = None
+    no_start_guide: bool = False
+    define_start: bool = False
+    kinesthetic_start_position_tolerance_m: float = 0.10
+    kinesthetic_start_orientation_tolerance_deg: float = 45.0
+    grav_comp_disable_j6: bool = False
+    grav_comp_passive_j6: bool = False
+    grav_comp_passive_j5_j6: bool = False
     # Leader hand operating mode while it is read torque-off; None leaves it unchanged.
     hand_operating_mode: int | None = None
     use_quest: bool = False
@@ -271,6 +290,7 @@ class HandOnlyCollectionConfig(HandRuntimeConfig):
     quest_jump_threshold: float = DEFAULT_QUEST_JUMP_THRESHOLD
     quest_startup_timeout_s: float = DEFAULT_QUEST_STARTUP_TIMEOUT_S
     piper_joint_level: bool = False
+    show_piper_joint_monitor: bool = False
     piper_rate_hz: float = DEFAULT_PIPER_RATE_HZ
     piper_interface: str = DEFAULT_PIPER_INTERFACE
     piper_channel: str = DEFAULT_PIPER_CHANNEL

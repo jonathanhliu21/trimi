@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import math
 import queue
 import shutil
@@ -191,6 +193,28 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="gravity-comp: the launcher's drag-mode session id, recorded in metadata",
     )
+    start = parser.add_mutually_exclusive_group()
+    start.add_argument("--kinesthetic-start", choices=sorted(PIPER_START_JOINTS_DEG),
+                       help="gravity-comp: explicit legacy named start (no motion command)")
+    start.add_argument("--start-profile", type=Path,
+                       help="gravity-comp: saved task start JSON to guide by hand")
+    start.add_argument("--no-start-guide", action="store_true",
+                       help="gravity-comp: log without a start target")
+    start.add_argument("--define-start", action="store_true",
+                       help="gravity-comp: record a task-start definition clip, without a saved target")
+    wrist = parser.add_mutually_exclusive_group()
+    wrist.add_argument("--grav-comp-disable-j6", action="store_true",
+                        help="expect J6 disabled by drag mode; this collector still sends no commands")
+    wrist.add_argument("--grav-comp-passive-j6", action="store_true",
+                        help="expect drag mode to keep all six drives enabled with zero J6 MIT gains/torque; "
+                             "this collector still sends no commands")
+    wrist.add_argument("--grav-comp-passive-j5-j6", action="store_true",
+                        help="expect drag mode to keep all six drives enabled with zero J5/J6 MIT gains/torque; "
+                             "this collector still sends no commands")
+    parser.add_argument("--kinesthetic-start-position-tolerance-m", type=float, default=0.10,
+                        help="maximum flange position distance from the recorded start (default: 0.10 m)")
+    parser.add_argument("--kinesthetic-start-orientation-tolerance-deg", type=float, default=45.0,
+                        help="maximum total flange rotation error from the recorded start (default: 45 degrees)")
     parser.add_argument(
         "--use-quest",
         "--quest",
@@ -241,6 +265,17 @@ def parse_args() -> argparse.Namespace:
         dest="piper_joint_level",
         action="store_true",
         help="Record measured Piper joint angles alongside EEF poses for joint-space replay (still passive).",
+    )
+    parser.add_argument(
+        "--piper-joint-monitor",
+        dest="show_piper_joint_monitor",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Show measured Piper joints against SDK limits in a separate window "
+            "(red within 3 degrees of either limit). Enables joint recording; "
+            "defaults to on with --piper-joint-level or --arm-mode gravity-comp."
+        ),
     )
     parser.add_argument(
         "--piper-rate-hz",
@@ -390,6 +425,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     gravity_comp = args.arm_mode == ARM_MODE_GRAVITY_COMP
     if gravity_comp:
+        if args.kinesthetic_start is None and args.start_profile is None:
+            args.no_start_guide = True
         # Drag mode holds the arm in MIT torque mode and is the only writer on can0.
         # Anything that would transmit is refused rather than silently dropped.
         if args.use_quest:
@@ -415,11 +452,20 @@ def parse_args() -> argparse.Namespace:
         if args.use_mocap is None:
             args.use_mocap = False
     else:
+        for flag, enabled in (("--grav-comp-disable-j6", args.grav_comp_disable_j6),
+                              ("--grav-comp-passive-j6", args.grav_comp_passive_j6),
+                              ("--grav-comp-passive-j5-j6", args.grav_comp_passive_j5_j6),
+                              ("--no-start-guide", args.no_start_guide),
+                              ("--define-start", args.define_start)):
+            if enabled:
+                parser.error(f"{flag} requires --arm-mode gravity-comp")
         if args.arm_mode is not None and not args.use_piper:
             parser.error("--arm-mode requires --use-piper")
         for flag, value in (
             ("--grav-comp-calib", args.grav_comp_calib),
             ("--drag-session-id", args.drag_session_id),
+            ("--kinesthetic-start", args.kinesthetic_start),
+            ("--start-profile", args.start_profile),
         ):
             if value is not None:
                 parser.error(f"{flag} requires --arm-mode gravity-comp")
@@ -429,6 +475,12 @@ def parse_args() -> argparse.Namespace:
             args.piper_payload = DEFAULT_PIPER_PAYLOAD
     if args.arm_mode is None:
         args.arm_mode = ARM_MODE_DRAG_TEACH
+    if (not math.isfinite(args.kinesthetic_start_position_tolerance_m)
+            or args.kinesthetic_start_position_tolerance_m <= 0):
+        parser.error("--kinesthetic-start-position-tolerance-m must be finite and positive")
+    if (not math.isfinite(args.kinesthetic_start_orientation_tolerance_deg)
+            or not 0 < args.kinesthetic_start_orientation_tolerance_deg <= 180):
+        parser.error("--kinesthetic-start-orientation-tolerance-deg must be finite and in (0, 180]")
     if args.hand_config is None:
         args.hand_config = KINESTHETIC_HAND_CONFIG if gravity_comp else DEFAULT_HAND_CONFIG
     if args.hand_port is None:
@@ -462,6 +514,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--monitor requires Quest, mocap or --arm-mode gravity-comp")
     if args.monitor_calibration is not None and not args.show_tracking_monitor:
         parser.error("--monitor-calibration requires the tracking monitor")
+    if args.show_piper_joint_monitor is None:
+        args.show_piper_joint_monitor = args.piper_joint_level or gravity_comp
+    if args.show_piper_joint_monitor:
+        if not args.use_piper:
+            parser.error("--piper-joint-monitor requires --use-piper or --arm-mode gravity-comp")
+        args.piper_joint_level = True
     if args.episode_time is not None:
         args.use_foot_pedal = False
     return args
@@ -798,10 +856,26 @@ def move_piper_to_start(config: HandOnlyCollectionConfig) -> tuple[float, ...]:
     return pose
 
 
+def _load_start_profile(path: Path):
+    from data_collection.collection.task_start import validate_task_start
+    raw = path.read_bytes()
+    return validate_task_start(json.loads(raw)), hashlib.sha256(raw).hexdigest()
+
+
 def run_hand_only(config: HandOnlyCollectionConfig) -> int:
     if config.mocap_ik_calibration is not None and not config.use_mocap:
         raise ValueError('Mocap IK monitoring requires mocap')
+    if config.show_piper_joint_monitor and not config.use_piper:
+        raise ValueError('Piper joint monitoring requires --use-piper')
+    if config.show_piper_joint_monitor and not config.piper_joint_level:
+        config = replace(config, piper_joint_level=True)
     gravity_comp = config.arm_mode == ARM_MODE_GRAVITY_COMP
+    if config.start_profile is not None and config.start_profile_snapshot is None:
+        profile, profile_hash = _load_start_profile(config.start_profile)
+        config = replace(config, start_profile_snapshot=profile, start_profile_sha256=profile_hash)
+    gravity_vector = None
+    if gravity_comp and config.grav_comp_calib is not None:
+        gravity_vector = json.loads(config.grav_comp_calib.read_text()).get("gravity", {}).get("vector_m_s2")
     if gravity_comp and getattr(config, "piper_start_joints_deg", None) is not None:
         raise ValueError("--arm-mode gravity-comp never moves the arm (no start move)")
     shared = SharedState()
@@ -863,8 +937,12 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
     if isinstance(threads, threading.Thread) or hasattr(threads, "join"):
         threads = [threads]
     reason = "duration_complete"
-    monitor = ik_monitor = None
+    monitor = ik_monitor = joint_monitor = None
     try:
+        if config.show_piper_joint_monitor:
+            from data_collection.collection.piper_joint_monitor import PiperJointMonitor
+
+            joint_monitor = PiperJointMonitor(shared, recorder=recorder)
         if config.mocap_ik_calibration is not None:
             from data_collection.collection.mocap_ik_monitor import MocapIKMonitor
 
@@ -883,6 +961,17 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
                 show_quest=config.use_quest,
                 show_vicon=config.use_mocap,
                 show_arm=gravity_comp,
+                start_name=(config.start_profile_snapshot["task"]
+                            if config.start_profile_snapshot is not None else
+                            (None if config.no_start_guide else config.kinesthetic_start)),
+                start_joints_deg=(config.start_profile_snapshot["arm"]["joints_deg"]
+                                  if config.start_profile_snapshot is not None else None),
+                definition_mode=config.define_start,
+                gravity_vector=gravity_vector,
+                start_position_tolerance_m=config.kinesthetic_start_position_tolerance_m,
+                start_orientation_tolerance_deg=config.kinesthetic_start_orientation_tolerance_deg,
+                passive_j6=config.grav_comp_disable_j6 or config.grav_comp_passive_j6,
+                passive_j5_j6=config.grav_comp_passive_j5_j6,
                 recorder=recorder,
                 calibration=load_monitor_calibration(config.monitor_calibration),
             )
@@ -892,6 +981,7 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
                 pedal_controller.poll if pedal_controller is not None else None,
                 monitor.update if monitor is not None else None,
                 ik_monitor.update if ik_monitor is not None else None,
+                joint_monitor.update if joint_monitor is not None else None,
             )
             if tick is not None
         ]
@@ -915,9 +1005,9 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
                 show_camera=config.add_camera,
                 camera_window_name=config.task_view_window_name,
                 on_tick=on_tick if ticks else None,
-                poll_windows=monitor is not None or ik_monitor is not None,
+                poll_windows=any(view is not None for view in (monitor, ik_monitor, joint_monitor)),
             )
-        elif config.add_camera or monitor is not None or ik_monitor is not None:
+        elif config.add_camera or any(view is not None for view in (monitor, ik_monitor, joint_monitor)):
             reason = run_camera_view(
                 shared,
                 duration_s=duration_s,
@@ -951,6 +1041,8 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
             monitor.close()
         if ik_monitor is not None:
             ik_monitor.close()
+        if joint_monitor is not None:
+            joint_monitor.close()
         for thread in threads:
             thread.join(timeout=3.0)
         if config.mode == DATA_COLLECTION_MODE:
@@ -960,6 +1052,8 @@ def run_hand_only(config: HandOnlyCollectionConfig) -> int:
 
 def main() -> int:
     args = parse_args()
+    profile, profile_hash = (_load_start_profile(args.start_profile.expanduser())
+                             if args.start_profile is not None else (None, None))
     disabled_force_feedback_motor_ids = tuple(
         dict.fromkeys(args.disable_force_feedback_motors)
     )
@@ -1013,6 +1107,17 @@ def main() -> int:
             args.grav_comp_calib.expanduser() if args.grav_comp_calib is not None else None
         ),
         drag_session_id=args.drag_session_id,
+        kinesthetic_start=args.kinesthetic_start,
+        start_profile=args.start_profile.expanduser() if args.start_profile is not None else None,
+        start_profile_snapshot=profile,
+        start_profile_sha256=profile_hash,
+        no_start_guide=args.no_start_guide,
+        define_start=args.define_start,
+        kinesthetic_start_position_tolerance_m=args.kinesthetic_start_position_tolerance_m,
+        kinesthetic_start_orientation_tolerance_deg=args.kinesthetic_start_orientation_tolerance_deg,
+        grav_comp_disable_j6=args.grav_comp_disable_j6,
+        grav_comp_passive_j6=args.grav_comp_passive_j6,
+        grav_comp_passive_j5_j6=args.grav_comp_passive_j5_j6,
         hand_operating_mode=(
             KINESTHETIC_HAND_OPERATING_MODE
             if args.arm_mode == ARM_MODE_GRAVITY_COMP
@@ -1035,6 +1140,7 @@ def main() -> int:
         ),
         quest_jump_threshold=args.quest_jump_threshold,
         piper_joint_level=args.piper_joint_level,
+        show_piper_joint_monitor=args.show_piper_joint_monitor,
         piper_rate_hz=args.piper_rate_hz,
         teacher_mode_poll_hz=args.piper_teacher_mode_poll_hz,
         piper_channel=args.piper_channel,

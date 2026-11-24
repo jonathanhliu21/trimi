@@ -294,6 +294,21 @@ class EpisodeBuffer:
         flags: list[str] = []
         gravity_comp_metadata = None
         if gravity_comp:
+            profile = getattr(self.config, "start_profile_snapshot", None)
+            definition = bool(getattr(self.config, "define_start", False))
+            guided_start = (profile["task"] if profile is not None else
+                            getattr(self.config, "kinesthetic_start", None))
+            if getattr(self.config, "no_start_guide", False) or definition:
+                guided_start = None
+            target = None
+            if guided_start is not None:
+                if profile is not None:
+                    target = profile["arm"]["joints_deg"]
+                else:
+                    from .config import PIPER_START_JOINTS_DEG
+                    target = list(PIPER_START_JOINTS_DEG[guided_start])
+            if definition:
+                flags.append("start_definition")
             calib = getattr(self.config, "grav_comp_calib", None)
             calib_sha256 = _sha256_or_none(calib)
             health = arm_health_summary(piper_rows)
@@ -320,6 +335,11 @@ class EpisodeBuffer:
                 ],
                 "motor_units": "vel rad/s, current A, torque N*m (current-derived)",
                 "enable_fields": list(PIPER_ENABLE_FIELDS),
+                "disabled_joints": [6] if getattr(self.config, "grav_comp_disable_j6", False) else [],
+                "passive_j6": bool(getattr(self.config, "grav_comp_passive_j6", False)),
+                "passive_j5_j6": bool(getattr(self.config, "grav_comp_passive_j5_j6", False)),
+                "zero_torque_joints": ([5, 6] if getattr(self.config, "grav_comp_passive_j5_j6", False)
+                                       else ([6] if getattr(self.config, "grav_comp_passive_j6", False) else [])),
                 "status_fields": [*PIPER_STATUS_FIELDS, "arm_ok"],
                 "eef_logged_when": (
                     f"the firmware end pose arrived within {EEF_FRESH_S:g}s of the "
@@ -331,11 +351,26 @@ class EpisodeBuffer:
                     calib_sha256 != self.grav_comp_calib_sha256_at_start
                 ),
                 "drag_session_id": getattr(self.config, "drag_session_id", None),
+                "guided_start": guided_start,
+                "guided_start_joints_deg": target,
+                "start_guide_enabled": target is not None,
+                "task": profile["task"] if profile is not None else None,
+                "episode_role": "start_definition" if definition else "demonstration",
+                "start_profile_path": (str(self.config.start_profile.resolve())
+                                       if getattr(self.config, "start_profile", None) is not None else None),
+                "start_profile_sha256": getattr(self.config, "start_profile_sha256", None),
+                "start_profile": profile,
+                "start_criterion": "end_effector_pose",
+                "start_reference": "piper_base flange pose from recorded start joints (SDK MDH FK)",
+                "start_position_tolerance_m": getattr(self.config, "kinesthetic_start_position_tolerance_m", 0.10),
+                "start_orientation_tolerance_deg": getattr(self.config, "kinesthetic_start_orientation_tolerance_deg", 45.0),
                 "arm_health": health,
             }
         kinesthetic_hand = getattr(self.config, "arm_mode", None) == ARM_MODE_GRAVITY_COMP
         return {
             "episode_index": self.paths.episode_index,
+            "episode_role": ("start_definition" if getattr(self.config, "define_start", False)
+                             else "demonstration"),
             "status": "complete" if not self.errors else "error",
             "flags": flags,
             "stop_reason": self.stop_reason,
@@ -483,6 +518,11 @@ class EpisodeBuffer:
                 "start_pose": (
                     list(self.config.piper_start_pose)
                     if getattr(self.config, "piper_start_pose", None) is not None
+                    else None
+                ),
+                "measured_start_joints_rad": (
+                    [float(piper_rows[0][key]) for key in PIPER_JOINT_FIELDS]
+                    if piper_rows and all(piper_rows[0].get(key) not in (None, "") for key in PIPER_JOINT_FIELDS)
                     else None
                 ),
                 "gravity_comp": gravity_comp_metadata,

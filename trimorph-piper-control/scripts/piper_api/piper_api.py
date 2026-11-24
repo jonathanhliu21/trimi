@@ -131,8 +131,29 @@ def move_joint(robot, joints: Sequence[float], *, mode: str = "exact") -> None:
             robot.move_cpv_pos(joint_index, joint_pos)
 
 
+def normalize_eef_pose(pose: Sequence[float]) -> list[float]:
+    """Return equivalent XYZ/Euler pose in the SDK's accepted angle ranges.
+
+    Replay retains unwrapped angles for interpolation. Normalize only at the
+    command boundary so the SDK cannot clamp them into a different rotation.
+    """
+    target = _as_float_list(pose, name="pose", length=6)
+
+    def wrap(angle):
+        return angle if -math.pi <= angle <= math.pi else (angle + math.pi) % math.tau - math.pi
+
+    roll, pitch, yaw = (wrap(angle) for angle in target[3:])
+    # Equivalent Euler branch: Rz(y+pi) Ry(pi-p) Rx(r+pi).
+    if pitch > math.pi / 2:
+        roll, pitch, yaw = roll + math.pi, math.pi - pitch, yaw + math.pi
+    elif pitch < -math.pi / 2:
+        roll, pitch, yaw = roll + math.pi, -math.pi - pitch, yaw + math.pi
+    target[3:] = [wrap(roll), pitch, wrap(yaw)]
+    return target
+
+
 def move_eef(robot, pose: Sequence[float]) -> None:
-    target_pose = _as_float_list(pose, name="pose", length=6)
+    target_pose = normalize_eef_pose(pose)
     robot.move_p(target_pose)
 
 

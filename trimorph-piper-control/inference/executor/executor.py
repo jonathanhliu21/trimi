@@ -25,6 +25,7 @@ from collections import deque
 from contextlib import nullcontext
 import csv
 from datetime import datetime
+import hashlib
 import json
 from dataclasses import replace
 import math
@@ -165,13 +166,53 @@ def append_start_log(path, record):
 
 
 def start_base(args):
-    """(base joints deg, hand start name, label) chosen by --start-joints-deg, --start-id, or --start-home."""
+    """Return start joints, the saved hand start, and its display label."""
+    profile = getattr(args, "task_start_profile", None)
+    if getattr(args, "start_profile", None) is not None:
+        return vector(profile["arm"]["joints_deg"], 6, "task start joints"), profile, profile["task"]
     if args.start_joints_deg:
         return vector(args.start_joints_deg, 6, "start joints"), args.start_home, "custom"
     if args.start_id is not None:
-        record = load_start_log(args.start_log)[args.start_id]
-        return vector(record["joints_deg"], 6, "logged start joints"), record["hand_start"], f"start #{args.start_id}"
+        record = getattr(args, "saved_start_record", None)
+        if record is None:
+            record = load_start_log(args.start_log)[args.start_id]
+        hand_start = profile if profile is not None else record["hand_start"]
+        return vector(record["joints_deg"], 6, "logged start joints"), hand_start, f"start #{args.start_id}"
     return vector(defaults.PIPER_START_JOINTS_DEG[args.start_home], 6, "start joints"), args.start_home, args.start_home
+
+
+def task_hand_positions(profile):
+    """Map a task's measured hand start into the executor's motor order."""
+    hand = profile["hand"]
+    positions = dict(zip(hand["motor_ids"], hand["positions_rad"]))
+    return vector([positions[motor] for motor in MOTOR_IDS], 13, "task hand start")
+
+
+def validate_task_start_for_executor(args, profile):
+    """Check a recorded start before connecting or enabling any actuator."""
+    from data_collection.collection.hand_common import load_hand_config
+    from data_collection.collection.task_start import validate_task_start
+    from data_collection.replay_actions import piper_model
+
+    profile = validate_task_start(profile)
+    q = np.radians(vector(profile["arm"]["joints_deg"], 6, "task start joints"))
+    _, bounds = piper_model()
+    invalid = np.flatnonzero((q < bounds[:, 0]) | (q > bounds[:, 1]))
+    if len(invalid):
+        raise ValueError("Task start outside SDK joint limits: " + ", ".join(f"J{i+1}" for i in invalid))
+    config_path = Path(args.hand_config).expanduser()
+    actual_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    if actual_hash != profile["hand"]["config_sha256"]:
+        raise ValueError("Task start hand calibration differs from --hand-config; use the configuration recorded with the task")
+    if not args.no_hand_start:
+        config = load_hand_config(config_path, args.hand_port, MOTOR_IDS)
+        target = task_hand_positions(profile)
+        invalid = np.flatnonzero((target < config.joint_lower_limits_array)
+                                | (target > config.joint_upper_limits_array))
+        if len(invalid):
+            raise ValueError("Recorded task hand start exceeds YAML limits on motors "
+                             + ", ".join(str(MOTOR_IDS[i]) for i in invalid)
+                             + "; review the start/configuration before replay")
 
 
 def load_hand_class(api_repo):
@@ -343,21 +384,31 @@ class RobotIO:
             "time": datetime.now().isoformat(timespec="seconds"),
             "base": name,
             "base_joints_deg": np.round(base_deg, 3).tolist(),
-            "joints_deg": np.round(target_deg, 3).tolist(),
+            "joints_deg": (np.asarray(target_deg).tolist() if getattr(args, "task_start_profile", None) is not None
+                           else np.round(target_deg, 3).tolist()),
             "random_offset_mm": round(offset_m * 1000, 1),
             "random_angle_deg": round(angle_deg, 2),
             "measured_joints_deg": np.round(np.degrees(read_joint_angles(self.piper)), 3).tolist(),
             "flange_xyz_mm": None if pose is None else np.round(np.multiply(pose[:3], 1000), 1).tolist(),
             "flange_euler_xyz_deg": None if pose is None else np.round(np.degrees(pose[3:]), 2).tolist(),
-            "hand_start": hand_name or args.start_home,
+            "hand_start": hand_name["task"] if isinstance(hand_name, dict) else (hand_name or args.start_home),
             "hand_moved": hand_name is not None,
+            "task_start_profile": getattr(args, "task_start_profile", None),
+            "task_start_sha256": getattr(args, "task_start_sha256", None),
         })
         print(f"Start #{start_id} logged in {args.start_log}; repeat it with --start-id {start_id} "
               f"(or --start-joints-deg {' '.join(f'{v:.2f}' for v in target_deg)}).", flush=True)
 
     def move_hand_to_start(self, name, tolerance_rad=0.05, timeout_s=5.0, enable_torque=False):
         # The motion profile set at startup limits the speed of this single target write.
-        target = self.hand.clip_positions(vector(defaults.HAND_START_POSITIONS_RAD[name], 13, "hand start"))
+        if isinstance(name, dict):
+            target = task_hand_positions(name)
+            clipped = np.asarray(self.hand.clip_positions(target.copy()))
+            if not np.allclose(clipped, target, atol=1e-9, rtol=0):
+                raise ValueError("Task hand start exceeds the connected hand's limits; refusing to clip the recorded start")
+            name = name["task"]
+        else:
+            target = self.hand.clip_positions(vector(defaults.HAND_START_POSITIONS_RAD[name], 13, "hand start"))
         if enable_torque:
             # Replace the stale policy goal before torque is restored.
             self.hand.set_positions(target, clip=False)
@@ -1410,6 +1461,8 @@ def parse_args(argv=None):
     p.add_argument("--start-home", choices=sorted(defaults.PIPER_START_JOINTS_DEG),
                    default=defaults.DEFAULT_EXECUTOR_START,
                    help="Named joint-space start before the first observation (default: %(default)s)")
+    p.add_argument("--start-profile", type=Path,
+                   help="Recorded task-specific arm and hand start JSON; overrides the default named start")
     p.add_argument("--start-joints-deg", type=float, nargs=6, metavar="DEG", default=None,
                    help="Explicit J1..J6 start in degrees; overrides --start-home")
     p.add_argument("--start-speed-deg-s", type=float, default=10.0,
@@ -1450,6 +1503,23 @@ def parse_args(argv=None):
                         "(default: %(default)s)")
     p.add_argument("--no-log", action="store_true", help="Do not save the run log")
     args = p.parse_args(argv)
+    args.task_start_profile = None
+    args.task_start_sha256 = None
+    args.saved_start_record = None
+    raw_args = sys.argv[1:] if argv is None else argv
+    if args.start_profile is not None:
+        if args.start_joints_deg or args.start_id is not None or any(
+                value == "--start-home" or value.startswith("--start-home=") for value in raw_args):
+            p.error("Use --start-profile alone, without --start-home, --start-joints-deg, or --start-id")
+        try:
+            from data_collection.collection.task_start import validate_task_start
+            args.start_profile = args.start_profile.expanduser().resolve()
+            profile_bytes = args.start_profile.read_bytes()
+            args.task_start_profile = validate_task_start(json.loads(profile_bytes))
+            args.task_start_sha256 = hashlib.sha256(profile_bytes).hexdigest()
+            validate_task_start_for_executor(args, args.task_start_profile)
+        except (OSError, ValueError, KeyError) as exc:
+            p.error(str(exc))
     if args.record_video and args.fake:
         p.error("--record-video requires the real wrist camera; remove --fake")
     if args.execute_steps < 0:
@@ -1486,6 +1556,15 @@ def parse_args(argv=None):
         logged = load_start_log(args.start_log)
         if not 0 <= args.start_id < len(logged):
             p.error(f"--start-id {args.start_id} is not in {args.start_log} ({len(logged)} starts logged)")
+        args.saved_start_record = logged[args.start_id]
+        saved_profile = args.saved_start_record.get("task_start_profile")
+        if saved_profile is not None:
+            try:
+                validate_task_start_for_executor(args, saved_profile)
+            except (OSError, ValueError, KeyError) as exc:
+                p.error(str(exc))
+            args.task_start_profile = saved_profile
+            args.task_start_sha256 = logged[args.start_id].get("task_start_sha256")
     if args.max_cycles < 0 or not 1 <= args.jpeg_quality <= 100 or not 1 <= args.piper_speed <= 100:
         p.error("Require max-cycles >= 0, jpeg-quality 1..100, piper-speed 1..100")
     if args.cam_fps <= 0 or not 0 < args.cam_exposure_us <= 1_000_000 / args.cam_fps:

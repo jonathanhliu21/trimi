@@ -632,6 +632,7 @@ class HandOnlyCollectionTests(unittest.TestCase):
                 warmup_time=0.0,
                 episode_time=30.0,
                 add_camera=True,
+                task_camera_exposure_us=5829,
             )
             recorder = RecordingManager()
             session = start_episode(config, recorder)
@@ -765,7 +766,7 @@ class GravityCompCollectionTests(unittest.TestCase):
     def test_drag_teach_defaults_are_unchanged(self):
         args = self.parse("--use-piper")
         self.assertEqual(args.arm_mode, ARM_MODE_DRAG_TEACH)
-        self.assertEqual((args.piper_installation_pos, args.piper_payload), ("right", "half"))
+        self.assertEqual((args.piper_installation_pos, args.piper_payload), ("horizontal", "half"))
         self.assertEqual(args.piper_rate_hz, 250.0)
         self.assertEqual((args.hand_config, args.hand_port), (DEFAULT_HAND_CONFIG, DEFAULT_HAND_PORT))
         self.assertIsNone(args.grav_comp_calib)
@@ -786,6 +787,42 @@ class GravityCompCollectionTests(unittest.TestCase):
         self.assert_rejected("--use-piper", "--grav-comp-calib", "c.json", message="requires --arm-mode gravity-comp")
         self.assert_rejected("--use-piper", "--drag-session-id", "s", message="requires --arm-mode gravity-comp")
         self.assert_rejected("--arm-mode", "drag-teach", message="--arm-mode requires --use-piper")
+        self.assert_rejected("--grav-comp-passive-j6", message="requires --arm-mode gravity-comp")
+        self.assert_rejected("--grav-comp-passive-j5-j6", message="requires --arm-mode gravity-comp")
+        self.assert_rejected("--arm-mode", "gravity-comp", "--grav-comp-passive-j6",
+                             "--grav-comp-disable-j6", message="not allowed with argument")
+        for other in ("--grav-comp-passive-j6", "--grav-comp-disable-j6"):
+            self.assert_rejected("--arm-mode", "gravity-comp", "--grav-comp-passive-j5-j6",
+                                 other, message="not allowed with argument")
+
+    def test_main_copies_passive_j5_j6_without_disabling_any_drive(self):
+        with (patch("sys.argv", ["collect_hand_only.py", "--arm-mode", "gravity-comp",
+                                 "--no-camera", "--grav-comp-passive-j5-j6"]),
+              patch("data_collection.collect_hand_only.run_hand_only", return_value=0) as run):
+            self.assertEqual(main(), 0)
+        config = run.call_args.args[0]
+        self.assertTrue(config.grav_comp_passive_j5_j6)
+        self.assertFalse(config.grav_comp_passive_j6)
+        self.assertFalse(config.grav_comp_disable_j6)
+
+    def test_passive_j5_j6_episode_records_both_zero_torque_joints(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = HandOnlyCollectionConfig(
+                dataset_root=Path(temp_dir), use_piper=True,
+                warmup_time=0.0, episode_time=30.0,
+                hand_config=Path("config/xl330_new_hand_transparent.yaml"),
+                hand_port="/dev/ttyUSB0", hand_measure_rate_hz=50.0,
+                arm_mode=ARM_MODE_GRAVITY_COMP, grav_comp_passive_j5_j6=True,
+            )
+            recorder = RecordingManager()
+            session = start_episode(config, recorder)
+            stop_episode(recorder, "test")
+            gravity = json.loads(session.paths.metadata_path.read_text())["piper"]["gravity_comp"]
+        self.assertTrue(gravity["passive_j5_j6"])
+        self.assertFalse(gravity["passive_j6"])
+        self.assertEqual(gravity["zero_torque_joints"], [5, 6])
+        self.assertEqual(gravity["disabled_joints"], [])
+        self.assertFalse(gravity["sends_can_frames"])
 
     def test_main_copies_gravity_comp_settings_to_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -793,7 +830,8 @@ class GravityCompCollectionTests(unittest.TestCase):
             calib.write_text("{}")
             with (
                 patch("sys.argv", ["collect_hand_only.py", "--arm-mode", "gravity-comp", "--no-camera",
-                                   "--grav-comp-calib", str(calib), "--drag-session-id", "20261122_1530"]),
+                                   "--grav-comp-calib", str(calib), "--drag-session-id", "20261122_1530",
+                                   "--grav-comp-passive-j6"]),
                 patch("data_collection.collect_hand_only.run_hand_only", return_value=0) as run,
             ):
                 self.assertEqual(main(), 0)
@@ -801,6 +839,8 @@ class GravityCompCollectionTests(unittest.TestCase):
             self.assertEqual(config.arm_mode, ARM_MODE_GRAVITY_COMP)
             self.assertEqual(config.grav_comp_calib, calib)
             self.assertEqual(config.drag_session_id, "20261122_1530")
+            self.assertTrue(config.grav_comp_passive_j6)
+            self.assertFalse(config.grav_comp_disable_j6)
             self.assertEqual(config.hand_operating_mode, 3)
             self.assertEqual((config.piper_installation_pos, config.piper_payload), ("unchanged", "unchanged"))
             self.assertEqual(worker_specs(config)[0][0], "piper")
@@ -836,6 +876,7 @@ class GravityCompCollectionTests(unittest.TestCase):
                 piper_payload="unchanged",
                 grav_comp_calib=calib,
                 drag_session_id="20261122_1530",
+                grav_comp_passive_j6=True,
                 hand_operating_mode=3,
             )
             recorder = RecordingManager()
@@ -864,6 +905,9 @@ class GravityCompCollectionTests(unittest.TestCase):
         self.assertEqual(len(gravity["calibration_sha256"]), 64)
         self.assertTrue(gravity["calibration_changed_during_episode"])
         self.assertEqual(gravity["drag_session_id"], "20261122_1530")
+        self.assertTrue(gravity["passive_j6"])
+        self.assertEqual(gravity["disabled_joints"], [])
+        self.assertEqual(gravity["zero_torque_joints"], [6])
         self.assertEqual(gravity["arm_health"]["not_ok_samples"], 1)
         self.assertEqual(gravity["arm_health"]["first_not_ok_elapsed_s"], 0.005)
         self.assertEqual(gravity["arm_health"]["err_codes"], ["0", "256"])

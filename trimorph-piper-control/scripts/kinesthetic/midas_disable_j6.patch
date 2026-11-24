@@ -1,0 +1,1037 @@
+diff --git a/gravity_comp/control.py b/gravity_comp/control.py
+index 748866e..3068044 100644
+--- a/gravity_comp/control.py
++++ b/gravity_comp/control.py
+@@ -134,7 +134,7 @@ class DragConfig:
+     coulomb_nm: np.ndarray       # measured Coulomb friction LOWER bounds, N*m
+     deadband_rad_s: float        # velocity noise deadband; v0 = 2 * deadband
+     kd_soft: np.ndarray          # software damping in t_ff, N*m*s/rad
+-    kd_mit: float = 0.01         # kd sent in the MIT command during drag
++    kd_mit: float | np.ndarray = 0.01  # scalar or per-joint MIT kd during drag
+     tau_cap_nm: np.ndarray       # per-joint |t_ff| cap, N*m (COMMANDED units)
+     firmware_limits_nm: np.ndarray  # firmware MIT torque limits, N*m (WIRE units)
+     # Per-joint command->wire scale: send_mit puts t_ff * command_scales_nm on
+@@ -160,6 +160,7 @@ class DragConfig:
+         self.assist_nm = _vec6(self.assist_nm, "assist_nm")
+         self.coulomb_nm = _vec6(self.coulomb_nm, "coulomb_nm")
+         self.kd_soft = _vec6(self.kd_soft, "kd_soft")
++        self.kd_mit = _vec6(self.kd_mit, "kd_mit")
+         self.tau_cap_nm = _vec6(self.tau_cap_nm, "tau_cap_nm")
+         self.firmware_limits_nm = _vec6(self.firmware_limits_nm, "firmware_limits_nm")
+         if self.command_scales_nm is None:
+@@ -183,6 +184,8 @@ class DragConfig:
+         """
+         problems: list[str] = []
+         for j in range(6):
++            if not 0.0 <= self.kd_mit[j] <= 5.0:
++                problems.append(f"kd_mit[{j}]={self.kd_mit[j]} must be finite and within [0, 5]")
+             if not self.alpha[j] > 0.0:
+                 problems.append(
+                     f"alpha[{j}]={self.alpha[j]:.4g} violates alpha > 0; "
+@@ -467,7 +470,7 @@ class DragController:
+             p_des=q.copy(),
+             v_des=np.zeros(6),
+             kp=np.zeros(6),
+-            kd=np.full(6, cfg.kd_mit),
++            kd=cfg.kd_mit.copy(),
+             t_ff=t_ff,
+         )
+ 
+diff --git a/gravity_comp/drag_mode.py b/gravity_comp/drag_mode.py
+index feb2ce7..3c61149 100644
+--- a/gravity_comp/drag_mode.py
++++ b/gravity_comp/drag_mode.py
+@@ -105,7 +105,23 @@ def parse_args(argv=None) -> argparse.Namespace:
+                    help="diagnostic only: if the requested gravity cap exceeds the "
+                         "firmware-safe MIT torque cap, clamp tau_cap to the safe cap "
+                         "and run while the operator keeps supporting the arm")
+-    return p.parse_args(argv)
++    wrist = p.add_mutually_exclusive_group()
++    wrist.add_argument("--disable-j6", action="store_true",
++                   help="keep J6 torque off; support the passive wrist even during freeze-hold")
++    wrist.add_argument("--passive-j6", action="store_true",
++                   help="diagnostic: keep all six drives electrically enabled and send "
++                        "zero J6 MIT gains/torque; support the wrist even during freeze-hold")
++    wrist.add_argument("--passive-j5-j6", action="store_true",
++                   help="keep all six drives electrically enabled and send zero J5/J6 MIT "
++                        "gains/torque; support the wrist even during braking and freeze-hold")
++    p.add_argument("--tx-trace", type=Path,
++                   help="save bounded packed CAN transmit frames after supported shutdown")
++    p.add_argument("--j5-kd", type=float,
++                   help="override J5 MIT damping during ramp-in/drag only (default 0.01)")
++    args = p.parse_args(argv)
++    if args.j5_kd is not None and not 0.0 <= args.j5_kd <= 5.0:
++        p.error("--j5-kd must be finite and within [0, 5]")
++    return args
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -113,7 +129,8 @@ def parse_args(argv=None) -> argparse.Namespace:
+ 
+ 
+ def build_drag_config(artifact: CalibrationArtifact, model: ArmGravityModel,
+-                      assist_frac: float, allow_underpowered: bool = False):
++                      assist_frac: float, allow_underpowered: bool = False,
++                      j5_kd: float | None = None):
+     """Derive the DragConfig from the artifact. Returns (config, derived-info).
+ 
+     tau_cap = (max|g(q)| + assist)/alpha + margin: commands are g/alpha, so the
+@@ -166,6 +183,8 @@ def build_drag_config(artifact: CalibrationArtifact, model: ArmGravityModel,
+         command_scales_nm=command_scales,
+         joint_limits=model.joint_limits(),
+     )
++    if j5_kd is not None:
++        config.kd_mit[4] = j5_kd
+     config.validate()  # raises listing every violated rule
+     wire_cap = tau_cap * command_scales
+     info = {
+@@ -173,6 +192,7 @@ def build_drag_config(artifact: CalibrationArtifact, model: ArmGravityModel,
+         "assist_target_nm": assist_target.tolist(),
+         "assist_frac": assist_frac,
+         "kd_soft": kd_soft.tolist(),
++        "kd_mit": config.kd_mit.tolist(),
+         "deadband_rad_s": deadband,
+         "gravity_bound_nm": bound.tolist(),
+         "requested_tau_cap_nm": requested_tau_cap.tolist(),
+@@ -205,8 +225,18 @@ def print_ritual(info) -> None:
+         print("  4. Assist rises to target in 0.2 steps; Enter between steps;")
+         print("     push the arm around after each step to feel for self-drive.")
+     print("  space = freeze   q = freeze+stop   Ctrl-C = freeze")
++    if info.get("disable_j6"):
++        print("  J6 DISABLED: support the free wrist throughout, including freeze-hold.")
++        print("  The mode switch may energize J6 briefly; OFF is verified before ramp-in.")
++    elif info.get("passive_j5_j6"):
++        print("  J5/J6 ELECTRICALLY ENABLED: zero MIT torque, kp, kd and velocity commands.")
++        print("  Support the free wrist throughout, including braking and freeze-hold.")
++    elif info.get("passive_j6"):
++        print("  J6 ELECTRICALLY ENABLED: zero MIT torque, kp, kd and velocity commands.")
++        print("  Support the free wrist throughout, including braking and freeze-hold.")
+     print("-" * 64)
+     print("alpha      : " + " ".join(f"{a:.3f}" for a in info["alpha"]))
++    print("MIT kd     : " + " ".join(f"{kd:.3f}" for kd in info["kd_mit"]))
+     print("assist (N*m): " + " ".join(f"{a:.3f}" for a in info["assist_target_nm"]))
+     print("tau caps   : " + " ".join(f"{c:.2f}" for c in info["tau_cap_nm"]))
+     if info.get("underpowered_diagnostic"):
+@@ -248,15 +278,32 @@ def main(argv=None) -> int:
+         config, info, assist_target = build_drag_config(
+             artifact, model, args.assist_frac,
+             allow_underpowered=args.allow_underpowered,
++            j5_kd=args.j5_kd,
+         )
+     except ValueError as exc:
+         print(f"DragConfig validation FAILED:\n{exc}")
+         print("For a supported diagnostic run only, retry with --allow-underpowered.")
+         return 1
+ 
++    info["disable_j6"] = args.disable_j6
++    info["passive_j6"] = args.passive_j6
++    info["passive_j5_j6"] = args.passive_j5_j6
++    info["zero_torque_joints"] = [5, 6] if args.passive_j5_j6 else ([6] if args.passive_j6 else [])
++    info["active_joints"] = list(range(1, 5 if args.passive_j5_j6 else
++                                        (6 if args.disable_j6 or args.passive_j6 else 7)))
+     session = HardwareSession(artifact.firmware_driver(), channel=args.channel,
+-                              calib=artifact)
++                              calib=artifact, disable_j6=args.disable_j6,
++                              passive_j6=args.passive_j6, passive_j5_j6=args.passive_j5_j6)
+     version = session.connect()
++    tx_trace = None
++    if args.tx_trace is not None:
++        from .can_trace import CanTxTrace
++        args.tx_trace.parent.mkdir(parents=True, exist_ok=True)
++        # Verify the output destination before enabling any motor.
++        with args.tx_trace.open("xb"):
++            pass
++        tx_trace = CanTxTrace()
++        tx_trace.attach(session.api.robot)
+     print(f"connected, firmware {version!r}, driver {session.driver!r}")
+     print("workspace keep-out: disabled for drag mode")
+     if np.any(session.command_scales != 1.0):
+@@ -295,10 +342,12 @@ def main(argv=None) -> int:
+     # any freeze/abort); save_run writes exactly the retained window.
+     log_max = max(1, int(LOG_RETAIN_S * args.rate))
+     log = {k: deque(maxlen=log_max) for k in
+-           ("t", "q", "v_raw", "v_filt", "tau_cmd", "tau_fb", "state")}
++           ("t", "q", "v_raw", "v_filt", "tau_cmd", "tau_fb", "state",
++            "cmd_kp", "cmd_kd", "cmd_p_des", "cmd_v_des")}
+     overruns = 0
+     cycles = 0
+     freeze_sent = False
++    freeze_event = None
+     quit_requested = False
+     phase = "rampin"           # rampin -> handsoff -> assist -> running
+     assist_step = 0
+@@ -314,9 +363,19 @@ def main(argv=None) -> int:
+             "Drag mode: MIT torque with kp=0. The arm is torque-supported "
+             "only - keep supporting it through the ramp-in."
+         )
++        if args.disable_j6:
++            arm_msg += " J6 will remain DISABLED. Support the free wrist even during freeze-hold."
++        elif args.passive_j5_j6:
++            arm_msg += (" J5/J6 are ELECTRICALLY ENABLED with zero MIT gains/torque. "
++                        "Support the free wrist even during braking and freeze-hold.")
++        elif args.passive_j6:
++            arm_msg += (" J6 is ELECTRICALLY ENABLED with zero MIT gains/torque. "
++                        "Support the free wrist even during braking and freeze-hold.")
+         enter_to_arm(
+             arm_msg
+         )
++        session.read_state()  # Refuse missing feedback before enabling any motor.
++        loop_armed = True  # Includes a partial enable failure requiring supported cleanup.
+         session.enable()
+         session.set_mit_mode()
+         loop_armed = True  # MIT torque now flows; any abort must safe-stop
+@@ -335,15 +394,24 @@ def main(argv=None) -> int:
+         stale_ctr = 0
+         while controller.state != DragState.DONE:
+             now = time.monotonic()
++            passive_fault = session.passive_joint_fault()
++            if passive_fault and not freeze_sent:
++                controller.freeze(passive_fault)
++                freeze_sent = True
++                quit_requested = True
++                print(f"\nfreeze requested: {passive_fault}; support the free wrist.")
+ 
+             # --- feedback (with staleness handling) -----------------------
+             sample = None
++            feedback_problem = None
+             try:
+                 s = session.read_state()
+                 if watchdog.update(s.t_feedback):
+                     sample = s
+-            except RuntimeError:
+-                pass
++                else:
++                    feedback_problem = "stale sources: " + ", ".join(watchdog.stale_sources)
++            except RuntimeError as exc:
++                feedback_problem = str(exc)
+             if sample is not None:
+                 stale_ctr = 0
+                 last_sample = sample
+@@ -377,6 +445,26 @@ def main(argv=None) -> int:
+             cmd = controller.update(q_now, v_f, dt)
+             sent = session.send_mit(cmd)
+ 
++            # Automatic stale/runaway freezes used to be silent. Latch the
++            # first event after sending the braking command, so both operator
++            # and collector can distinguish a safety hold from normal drag.
++            if controller.freeze_reason is not None and freeze_event is None:
++                freeze_sent = True
++                freeze_event = {
++                    "reason": controller.freeze_reason,
++                    "elapsed_s": now - t_start,
++                    "feedback_problem": feedback_problem,
++                    "last_good_q_deg": None if last_sample is None else
++                        np.rad2deg(last_sample.q).tolist(),
++                }
++                detail = f" ({feedback_problem})" if feedback_problem else ""
++                wrist = (" J5/J6 remain free; support the wrist." if args.passive_j5_j6 else
++                         (" J6 remains free; support the wrist."
++                          if args.disable_j6 or args.passive_j6 else ""))
++                print(f"\nfreeze requested: {controller.freeze_reason}{detail}. "
++                      "Drag frozen; braking then position hold. Enter cannot resume. "
++                      f"Press q, then follow the support/disable prompt.{wrist}", flush=True)
++
+             log["t"].append(now)
+             log["q"].append(q_now)
+             log["v_raw"].append(v_now)
+@@ -384,6 +472,8 @@ def main(argv=None) -> int:
+             log["tau_cmd"].append(sent)
+             log["tau_fb"].append(tau_fb_now)
+             log["state"].append(controller.state.name)
++            for name in ("kp", "kd", "p_des", "v_des"):
++                log[f"cmd_{name}"].append(session.last_mit_command[name])
+             cycles += 1
+ 
+             # --- operator input -------------------------------------------
+@@ -413,7 +503,7 @@ def main(argv=None) -> int:
+                     freeze_sent = True
+                 quit_requested = True
+                 print("\nquit requested: braking, then stop")
+-            elif key in ("\r", "\n"):
++            elif key in ("\r", "\n") and not freeze_sent and controller.state == DragState.ACTIVE:
+                 if phase == "handsoff":
+                     phase = "assist"
+                     print("hands-off confirmed; Enter raises assist in "
+@@ -507,7 +597,13 @@ def main(argv=None) -> int:
+                 )
+             except Exception:
+                 pass
+-        session.disconnect()
++        try:
++            if tx_trace is not None:
++                tx_trace.detach()
++                tx_trace.save(args.tx_trace)
++                print(f"packed CAN transmit trace: {args.tx_trace}")
++        finally:
++            session.disconnect()
+ 
+     # ------------------------------------------------------------- record
+     overrun_frac = overruns / max(1, cycles)
+@@ -542,10 +638,13 @@ def main(argv=None) -> int:
+             "tau_cmd": np.asarray(log["tau_cmd"]).reshape(-1, 6),
+             "tau_fb": np.asarray(log["tau_fb"]).reshape(-1, 6),
+             "state": np.asarray(log["state"]),
++            **{f"cmd_{name}": np.asarray(log[f"cmd_{name}"]).reshape(-1, 6)
++               for name in ("kp", "kd", "p_des", "v_des")},
+         },
+         {"stage": "drag", "info": info, "freeze_reason": controller.freeze_reason,
++         "freeze_event": freeze_event,
+          "cycles": cycles, "overrun_frac": overrun_frac, "gates": gates,
+-         "args": vars(args)},
++         "args": {**vars(args), "tx_trace": None if args.tx_trace is None else str(args.tx_trace)}},
+     )
+     print(f"session log: {npz}")
+ 
+diff --git a/gravity_comp/hw_session.py b/gravity_comp/hw_session.py
+index 86add4b..024421c 100644
+--- a/gravity_comp/hw_session.py
++++ b/gravity_comp/hw_session.py
+@@ -135,10 +135,22 @@ class HardwareSession:
+         version string.
+     """
+ 
+-    def __init__(self, driver: str, channel: str = "can0", calib=None, guard=None) -> None:
++    def __init__(self, driver: str, channel: str = "can0", calib=None, guard=None,
++                 *, disable_j6: bool = False, passive_j6: bool = False,
++                 passive_j5_j6: bool = False) -> None:
++        if sum(map(bool, (disable_j6, passive_j6, passive_j5_j6))) > 1:
++            raise ValueError("disable_j6, passive_j6 and passive_j5_j6 are mutually exclusive")
+         self.driver = driver
+         self.channel = channel
+         self.calib = calib
++        self.disable_j6 = bool(disable_j6)
++        self.passive_j6 = bool(passive_j6)
++        self.passive_j5_j6 = bool(passive_j5_j6)
++        self.passive_joint_indices = (4, 5) if passive_j5_j6 else ((5,) if passive_j6 else ())
++        self._last_q: np.ndarray | None = None
++        # Effective parameters forwarded to the SDK by the last complete
++        # command. This is requested-command evidence, not motor readback.
++        self.last_mit_command: dict[str, np.ndarray] | None = None
+         # Optional WorkspaceGuard: when set, every slew waypoint and every
+         # guarded state read is checked against the keep-out planes so a pose
+         # or a sagging kp=0 joint cannot reach the table (see gravity_comp.
+@@ -198,10 +210,44 @@ class HardwareSession:
+             self.api = None
+ 
+     def enable(self, timeout_s: float = 5.0) -> None:
++        if self.disable_j6:
++            # Operator confirmation covers the arm AND passive wrist. Never
++            # briefly enable all six; require fresh feedback for every drive.
++            deadline = time.monotonic() + timeout_s
++            while time.monotonic() < deadline:
++                self.api.robot.disable(6)
++                time.sleep(0.05)
++                if self._driver_enabled(6) is False:
++                    break
++            else:
++                raise RuntimeError("Could not confirm J6 disabled; no other joints enabled")
++            while time.monotonic() < deadline:
++                for joint in range(1, 6):
++                    self.api.robot.enable(joint)
++                time.sleep(0.05)
++                if (all(self._driver_enabled(j) is True for j in range(1, 6))
++                        and self._driver_enabled(6) is False):
++                    return
++            raise RuntimeError("Timed out enabling J1-J5 with J6 disabled")
+         if not self.api.enable(timeout_s=timeout_s):
+             raise RuntimeError("Timed out enabling Piper")
+         time.sleep(0.2)
+ 
++    def _driver_enabled(self, joint: int) -> bool | None:
++        state = self.api.robot.get_driver_states(joint)
++        if state is None or abs(time.time() - float(state.timestamp)) > 0.25:
++            return None
++        return bool(state.msg.foc_status.driver_enable_status)
++
++    def passive_joint_fault(self) -> str | None:
++        if self.disable_j6:
++            enabled = self._driver_enabled(6)
++            if enabled is None:
++                return "J6 driver feedback missing/stale"
++            if enabled:
++                return "J6 unexpectedly enabled"
++        return None
++
+     def disable_after_confirm(self, extra: str = "") -> bool:
+         """The ONLY disable path: the arm goes limp, so the operator must
+         already be supporting it when the command lands."""
+@@ -225,8 +271,23 @@ class HardwareSession:
+         # command lands. The operator must physically support the arm across the
+         # switch; automated goto-pose sequences additionally rely on the
+         # catch-radius abort to stop a sag before it runs away.
++        if self.disable_j6:
++            # v183 move_mit otherwise repeats the global mode frame on every
++            # joint write. Keep the selected mode stable for a passive wrist.
++            self.api.robot.set_auto_set_motion_mode_enabled(False)
+         self.api.set_mit_mode()
+         time.sleep(MODE_SWITCH_SETTLE_S)
++        if self.disable_j6:
++            # The mode transition can change drive enables on the robot.
++            # The operator supports the wrist across it; re-confirm OFF before
++            # starting the ramp, and never send a J6 MIT frame afterwards.
++            deadline = time.monotonic() + 2.0
++            while time.monotonic() < deadline:
++                self.api.robot.disable(6)
++                time.sleep(0.05)
++                if self._driver_enabled(6) is False:
++                    return
++            raise RuntimeError("Could not confirm J6 disabled after MIT mode switch")
+ 
+     def set_position_mode(self) -> None:
+         robot = self.api.robot
+@@ -239,8 +300,15 @@ class HardwareSession:
+         js = self.api.get_joint_state()
+         ms = self.api.get_motor_state()
+         if js is None or ms is None:
+-            raise RuntimeError("No joint/motor feedback from Piper")
+-        return StateSample(
++            missing = [name for name, value in (("joint-angle", js), ("motor", ms))
++                       if value is None]
++            detail = ""
++            if js is None and ms is not None:
++                detail = "; motor positions (deg): " + " ".join(
++                    f"{v:.2f}" for v in np.rad2deg(ms.positions)
++                )
++            raise RuntimeError("No " + "/".join(missing) + " feedback from Piper" + detail)
++        sample = StateSample(
+             q=np.asarray(js.joints, dtype=float),
+             v=np.asarray(ms.velocities, dtype=float),
+             tau_fb=np.asarray(ms.torques, dtype=float),
+@@ -250,6 +318,8 @@ class HardwareSession:
+             t_feedback=float(ms.timestamp),
+             t_joint=float(js.timestamp),
+         )
++        self._last_q = sample.q.copy()
++        return sample
+ 
+     # -- MIT commands -----------------------------------------------------
+ 
+@@ -282,15 +352,24 @@ class HardwareSession:
+             v_des = cmd.v_des
+             kp = cmd.kp
+             kd = cmd.kd
+-        t_ff = np.zeros(6) if t_ff is None else np.asarray(t_ff, dtype=float)
+-        p_des = np.zeros(6) if p_des is None else np.asarray(p_des, dtype=float)
+-        v_des = np.zeros(6) if v_des is None else np.asarray(v_des, dtype=float)
+-        kp = np.broadcast_to(np.asarray(kp, dtype=float), (6,))
+-        kd = np.broadcast_to(np.asarray(kd, dtype=float), (6,))
++        t_ff = np.zeros(6) if t_ff is None else np.array(t_ff, dtype=float, copy=True)
++        p_des = np.zeros(6) if p_des is None else np.array(p_des, dtype=float, copy=True)
++        v_des = np.zeros(6) if v_des is None else np.array(v_des, dtype=float, copy=True)
++        kp = np.broadcast_to(np.asarray(kp, dtype=float), (6,)).copy()
++        kd = np.broadcast_to(np.asarray(kd, dtype=float), (6,)).copy()
++        for j in self.passive_joint_indices:
++            # Keep the original six-drive enable/mode/command sequence while
++            # requesting zero wrist torque. Central filtering also covers
++            # emergency braking and position hold; neither may stiffen a passive joint.
++            t_ff[j] = v_des[j] = kp[j] = kd[j] = 0.0
++            if self._last_q is not None:
++                p_des[j] = self._last_q[j]
+ 
+         scaled = t_ff * self.command_scales
+-        sent = np.empty(6)
++        sent = np.zeros(6)
+         for j in range(6):  # pyAgxArm move_mit is per joint, 1-based
++            if self.disable_j6 and j == 5:
++                continue  # No MIT frame, including during braking/freeze-hold.
+             sent[j] = self.api.move_mit_torque(
+                 j + 1,
+                 float(scaled[j]),
+@@ -300,6 +379,12 @@ class HardwareSession:
+                 kd=float(kd[j]),
+                 clamp=True,
+             )
++        self.last_mit_command = {
++            "p_des": p_des, "v_des": v_des, "kp": kp, "kd": kd,
++        }
++        if self.disable_j6:
++            for values in self.last_mit_command.values():
++                values[5] = np.nan  # No J6 frame was sent.
+         return sent
+ 
+     def send_mit_zero_gains(self, t_ff: Sequence[float]) -> np.ndarray:
+@@ -596,6 +681,14 @@ def damp_brake(
+     Returns the held pose.
+     """
+     print("\n*** DAMP BRAKE: kd braking with gravity feed-forward retained ***")
++    if getattr(session, "disable_j6", False):
++        print("*** J6 remains DISABLED: support the free wrist; only J1-J5 brake/hold.")
++    elif getattr(session, "passive_j5_j6", False):
++        print("*** J5/J6 are ELECTRICALLY ENABLED with zero MIT gains/torque: "
++              "support the free wrist; only J1-J4 brake/hold.")
++    elif getattr(session, "passive_j6", False):
++        print("*** J6 is ELECTRICALLY ENABLED with zero MIT gains/torque: "
++              "support the free wrist; only J1-J5 brake/hold.")
+     period = 1.0 / BRAKE_LOOP_HZ
+     t_end = time.monotonic() + duration_s
+     q = None
+diff --git a/gravity_comp/can_trace.py b/gravity_comp/can_trace.py
+new file mode 100644
+index 0000000..596d0c3
+--- /dev/null
++++ b/gravity_comp/can_trace.py
+@@ -0,0 +1,79 @@
++"""Bounded capture of packed frames passed to the SDK's CAN transport.
++
++The tap forwards each send exactly once. It neither sends extra frames nor
++changes SocketCAN loopback. A successful send confirms SDK transport success,
++not that a motor applied the command. File I/O occurs only after the run.
++"""
++from collections import deque
++from pathlib import Path
++import time
++
++import numpy as np
++
++
++class CanTxTrace:
++    def __init__(self, *, head_frames=12000, tail_frames=120000):
++        if head_frames < 0 or tail_frames <= 0:
++            raise ValueError("Trace sizes must be nonnegative head and positive tail")
++        self.head_frames = head_frames
++        self.head = []
++        self.tail = deque(maxlen=tail_frames)
++        self.total = 0
++        self.comm = None
++        self.original_send = None
++        self.tap = None
++
++    def attach(self, robot):
++        if self.comm is not None:
++            raise RuntimeError("Trace already attached")
++        comm = robot.get_context().get_comm()
++        if comm is None:
++            raise RuntimeError("Cannot trace a disconnected SDK transport")
++        original = comm.send
++
++        def tap(msg, *args, **kwargs):
++            # Timestamp and bytes refer to this particular packed command,
++            # before any later call can reuse/mutate a message object.
++            row = (time.monotonic(), int(msg.arbitration_id), bytes(msg.data))
++            ok = False
++            try:
++                result = original(msg, *args, **kwargs)
++                ok = result is not False
++                return result
++            finally:
++                entry = (*row, ok)
++                if len(self.head) < self.head_frames:
++                    self.head.append(entry)
++                else:
++                    self.tail.append(entry)
++                self.total += 1
++
++        self.comm, self.original_send, self.tap = comm, original, tap
++        comm.send = tap
++
++    def detach(self):
++        if self.comm is not None:
++            if self.comm.send is self.tap:
++                self.comm.send = self.original_send
++            self.comm = None
++
++    def save(self, path):
++        rows = self.head + list(self.tail)
++        data = np.zeros((len(rows), 8), dtype=np.uint8)
++        for i, (_, _, payload, _) in enumerate(rows):
++            if len(payload) > 8:
++                raise ValueError("Trace expects classic CAN payloads of at most 8 bytes")
++            data[i, :len(payload)] = list(payload)
++        path = Path(path)
++        with path.open("wb") as stream:
++            np.savez_compressed(
++                stream,
++                t=np.asarray([r[0] for r in rows], dtype=float),
++                can_id=np.asarray([r[1] for r in rows], dtype=np.uint32),
++                dlc=np.asarray([len(r[2]) for r in rows], dtype=np.uint8),
++                data=data,
++                send_ok=np.asarray([r[3] for r in rows], dtype=bool),
++                total_frames=np.asarray(self.total),
++                dropped_frames=np.asarray(self.total - len(rows)),
++            )
++        return path
+diff --git a/gravity_comp/tests/test_passive_wrist.py b/gravity_comp/tests/test_passive_wrist.py
+new file mode 100644
+index 0000000..e12cd55
+--- /dev/null
++++ b/gravity_comp/tests/test_passive_wrist.py
+@@ -0,0 +1,221 @@
++"""Disabled/passive wrist contracts, exercised without CAN or motors."""
++from itertools import combinations
++import time
++from types import SimpleNamespace as NS
++from unittest.mock import Mock, patch
++
++import numpy as np
++import pytest
++
++from gravity_comp.hw_session import HardwareSession, damp_brake
++from gravity_comp.control import DragController, DragState
++from gravity_comp.tests.test_control import make_config, Q_MID, const_gravity
++
++
++def session(*, passive_j6=False, passive_j5_j6=False):
++    s = HardwareSession("v183", disable_j6=not (passive_j6 or passive_j5_j6),
++                        passive_j6=passive_j6, passive_j5_j6=passive_j5_j6)
++    enabled = [False] * 6
++    def state(j):
++        return NS(timestamp=time.time(), msg=NS(foc_status=NS(driver_enable_status=enabled[j-1])))
++    robot = Mock()
++    robot.get_driver_states.side_effect = state
++    robot.disable.side_effect = lambda j: enabled.__setitem__(j-1, False)
++    robot.enable.side_effect = lambda j: enabled.__setitem__(j-1, True)
++    s.api = Mock(robot=robot)
++    s.api.move_mit_torque.side_effect = lambda j, torque, **kw: torque
++    return s, enabled
++
++
++def test_selective_enable_and_passive_feedback_faults():
++    s, enabled = session()
++    with patch("gravity_comp.hw_session.time.sleep"):
++        s.enable()
++    assert enabled == [True] * 5 + [False]
++    s.api.enable.assert_not_called()
++    assert [c.args[0] for c in s.api.robot.enable.call_args_list] == [1, 2, 3, 4, 5]
++    assert s.passive_joint_fault() is None
++    enabled[5] = True
++    assert s.passive_joint_fault() == "J6 unexpectedly enabled"
++    s.api.robot.get_driver_states.return_value = None
++    s.api.robot.get_driver_states.side_effect = None
++    assert "missing/stale" in s.passive_joint_fault()
++
++
++def test_missing_disabled_ack_never_enables_other_joints():
++    s, _ = session()
++    s.api.robot.get_driver_states.side_effect = lambda j: None
++    with pytest.raises(RuntimeError, match="confirm J6 disabled"):
++        s.enable(timeout_s=.001)
++    s.api.robot.enable.assert_not_called()
++
++
++def test_mode_switch_rechecks_j6_and_stops_automatic_mode_frames():
++    s, enabled = session()
++    s.api.set_mit_mode.side_effect = lambda: enabled.__setitem__(5, True)
++    with patch("gravity_comp.hw_session.time.sleep"):
++        s.set_mit_mode()
++    s.api.robot.set_auto_set_motion_mode_enabled.assert_called_once_with(False)
++    assert enabled[5] is False
++    s.api.move_mit_torque.assert_not_called()
++
++
++def test_no_j6_mit_frame_in_ramp_active_brake_hold_or_done():
++    s, _ = session()
++    gravity = Mock(side_effect=const_gravity)
++    ctrl = DragController(make_config(), gravity)
++    q = Q_MID.copy()
++    q[5] = .4
++    v = np.array([0., 0., 0., 0., 0., .5])  # Passive wrist can keep moving.
++    ctrl.start(q)
++    for dt in (.1, 2.):
++        sent = s.send_mit(ctrl.update(q, v, dt))
++        assert sent[5] == 0
++    ctrl.freeze("test")
++    for dt in (.1, .6, .6):
++        s.send_mit(ctrl.update(q, v, dt))
++    assert ctrl.state == DragState.FREEZE_HOLD
++    ctrl.stop()
++    s.send_mit(ctrl.update(q, v, .01))
++    assert {c.args[0] for c in s.api.move_mit_torque.call_args_list} == {1, 2, 3, 4, 5}
++    assert all(c.args[0][5] == .4 for c in gravity.call_args_list)
++
++
++def test_exception_damp_brake_also_excludes_j6():
++    s, _ = session()
++    s.read_state = Mock(return_value=NS(q=Q_MID.copy()))
++    with patch("gravity_comp.hw_session.time.sleep"), patch("gravity_comp.hw_session.HOLD_RAMP_S", .01):
++        damp_brake(s, const_gravity, duration_s=0)
++    assert {c.args[0] for c in s.api.move_mit_torque.call_args_list} == {1, 2, 3, 4, 5}
++
++
++def test_default_session_still_commands_all_six():
++    s, _ = session()
++    s.disable_j6 = False
++    s.send_mit(t_ff=np.ones(6))
++    assert [c.args[0] for c in s.api.move_mit_torque.call_args_list] == [1, 2, 3, 4, 5, 6]
++
++
++@pytest.mark.parametrize("both", [False, True])
++def test_passive_profile_preserves_original_enable_and_mode_sequence(both):
++    s, _ = session(passive_j6=not both, passive_j5_j6=both)
++    s.api.enable.return_value = True
++    with patch("gravity_comp.hw_session.time.sleep"):
++        s.enable()
++        s.set_mit_mode()
++    s.api.enable.assert_called_once_with(timeout_s=5.0)
++    s.api.set_mit_mode.assert_called_once_with()
++    s.api.robot.enable.assert_not_called()
++    s.api.robot.disable.assert_not_called()
++    s.api.robot.set_auto_set_motion_mode_enabled.assert_not_called()
++    assert s.passive_joint_fault() is None
++
++
++def assert_passive_command(s, cmd, measured_q6):
++    """Check the SDK boundary, preserving other joints and all six frames."""
++    s.api.move_mit_torque.reset_mock()
++    s._last_q = Q_MID.copy()
++    s._last_q[4] = -.6
++    s._last_q[5] = measured_q6
++    sent = s.send_mit(cmd)
++    calls = s.api.move_mit_torque.call_args_list
++    assert [c.args[0] for c in calls] == [1, 2, 3, 4, 5, 6]
++    active_count = 4 if s.passive_j5_j6 else 5
++    for j, call in enumerate(calls[:active_count]):
++        assert call.args[1] == pytest.approx(cmd.t_ff[j] * s.command_scales[j])
++        for name in ("p_des", "v_des", "kp", "kd"):
++            assert call.kwargs[name] == pytest.approx(getattr(cmd, name)[j])
++    for j in range(active_count, 6):
++        assert calls[j].args[1] == sent[j] == 0.0
++        assert calls[j].kwargs == dict(p_des=s._last_q[j], v_des=0., kp=0., kd=0., clamp=True)
++        assert s.last_mit_command["p_des"][j] == s._last_q[j]
++        for name in ("kp", "kd", "v_des"):
++            assert s.last_mit_command[name][j] == 0.
++
++
++@pytest.mark.parametrize("both", [False, True])
++def test_passive_wrist_zeroes_every_control_state_without_changing_other_joints(both):
++    s, _ = session(passive_j6=not both, passive_j5_j6=both)
++    s.command_scales = np.arange(1., 7.)
++    ctrl = DragController(make_config(), const_gravity)
++    q = Q_MID.copy()
++    ctrl.start(q)
++    states = set()
++    for dt in (.1, 2.):
++        cmd = ctrl.update(q, np.zeros(6), dt)
++        original = {name: getattr(cmd, name).copy()
++                    for name in ("t_ff", "p_des", "v_des", "kp", "kd")}
++        assert_passive_command(s, cmd, measured_q6=.7)
++        for name, values in original.items():
++            np.testing.assert_array_equal(getattr(cmd, name), values)
++        states.add(ctrl.state)
++    ctrl.freeze("test")
++    for dt in (.1, .6, .6):
++        assert_passive_command(s, ctrl.update(q, np.zeros(6), dt), measured_q6=.8)
++        states.add(ctrl.state)
++    ctrl.stop()
++    assert_passive_command(s, ctrl.update(q, np.zeros(6), .01), measured_q6=.9)
++    states.add(ctrl.state)
++    assert states == {DragState.RAMP_IN, DragState.ACTIVE, DragState.BRAKE,
++                      DragState.FREEZE_HOLD, DragState.DONE}
++
++
++@pytest.mark.parametrize("both", [False, True])
++def test_passive_wrist_remains_zero_in_exception_damp_brake(both):
++    s, _ = session(passive_j6=not both, passive_j5_j6=both)
++    q = Q_MID.copy()
++    q[4] = -.6
++    q[5] = .9
++    s.read_state = Mock(return_value=NS(q=q))
++    with patch("gravity_comp.hw_session.time.sleep"), patch("gravity_comp.hw_session.HOLD_RAMP_S", .01):
++        damp_brake(s, const_gravity, duration_s=0)
++    calls = s.api.move_mit_torque.call_args_list
++    assert len(calls) >= 12
++    assert [c.args[0] for c in calls] == [1, 2, 3, 4, 5, 6] * (len(calls) // 6)
++    for joint in ((5, 6) if both else (6,)):
++        assert all(c.args[1] == 0 and c.kwargs ==
++                   dict(p_des=q[joint-1], v_des=0., kp=0., kd=0., clamp=True)
++                   for c in calls if c.args[0] == joint)
++    assert any(c.kwargs["kp"] > 0 for c in calls if c.args[0] == 1)
++    assert all(c.args[1] != 0 for c in calls if c.args[0] == 1)
++
++
++@pytest.mark.parametrize("joint,both", [(6, False), (5, True), (6, True)])
++def test_passive_wrist_still_trips_runaway_guard(joint, both):
++    s, _ = session(passive_j6=not both, passive_j5_j6=both)
++    ctrl = DragController(make_config(), const_gravity)
++    ctrl.start(Q_MID)
++    ctrl.update(Q_MID, np.zeros(6), 2.)
++    for _ in range(4):
++        v = np.zeros(6)
++        v[joint-1] = 8.
++        s.send_mit(ctrl.update(Q_MID, v, .01))
++    assert ctrl.freeze_reason == f"runaway J{joint}"
++
++
++@pytest.mark.parametrize("both", [False, True])
++def test_passive_position_reference_uses_last_measured_state(both):
++    s, _ = session(passive_j6=not both, passive_j5_j6=both)
++    q = Q_MID.copy()
++    q[4] = -.6
++    q[5] = -.9
++    s.api.get_joint_state.return_value = NS(joints=q, hz=200., timestamp=time.time())
++    s.api.get_motor_state.return_value = NS(velocities=np.zeros(6), torques=np.zeros(6),
++                                          currents=np.zeros(6), hz=200., timestamp=time.time())
++    s.read_state()
++    s.send_mit(t_ff=np.ones(6), p_des=np.ones(6), kp=3., kd=.8)
++    assert s.api.move_mit_torque.call_args_list[5].kwargs["p_des"] == -.9
++    if both:
++        assert s.api.move_mit_torque.call_args_list[4].kwargs["p_des"] == -.6
++
++
++def test_j6_profiles_are_mutually_exclusive_in_session_and_cli():
++    from gravity_comp.drag_mode import parse_args
++    for first, second in combinations(("disable_j6", "passive_j6", "passive_j5_j6"), 2):
++        with pytest.raises(ValueError, match="mutually exclusive"):
++            HardwareSession("v183", **{first: True, second: True})
++        with pytest.raises(SystemExit) as exc:
++            parse_args(["--" + name.replace("_", "-") for name in (first, second)])
++        assert exc.value.code == 2
++    assert parse_args(["--passive-j6"]).passive_j6
++    assert parse_args(["--passive-j5-j6"]).passive_j5_j6
+diff --git a/gravity_comp/tests/test_drag_feedback_reporting.py b/gravity_comp/tests/test_drag_feedback_reporting.py
+new file mode 100644
+index 0000000..7201d1d
+--- /dev/null
++++ b/gravity_comp/tests/test_drag_feedback_reporting.py
+@@ -0,0 +1,84 @@
++"""Exercise automatic freezes through the real I/O loop, without hardware."""
++from types import SimpleNamespace as NS
++from unittest.mock import Mock
++
++import numpy as np
++import pytest
++
++from gravity_comp import drag_mode as dm
++from gravity_comp.hw_session import HardwareSession, StateSample
++from gravity_comp.tests.test_control import make_config, Q_MID, const_gravity
++
++
++@pytest.mark.parametrize("failure,at_s,reason", [
++    ("missing", .2, "stale feedback"),  # During ramp-in.
++    ("missing", 1.2, "stale feedback"),  # Waiting for assist steps.
++    ("runaway", 1.2, "runaway J6"),
++])
++def test_automatic_freeze_is_visible_latched_and_saved(monkeypatch, capsys, failure, at_s, reason):
++    clock = NS(now=0.)
++    monkeypatch.setattr(dm, "time", NS(monotonic=lambda: clock.now,
++                                      sleep=lambda dt: setattr(clock, "now", clock.now + dt)))
++    monkeypatch.setattr(dm.signal, "signal", lambda *args: None)
++    artifact = Mock(robot_id="test")
++    artifact.payload_mass_com.return_value = (0., np.zeros(3))
++    monkeypatch.setattr(dm.CalibrationArtifact, "load", lambda path: artifact)
++    monkeypatch.setattr(dm, "ArmGravityModel", lambda **kw: NS(gravity_torques=const_gravity))
++    cfg = make_config(ramp_in_s=1.)
++    info = dict(underpowered_diagnostic=True, underpowered_joints=[1, 2],
++                tau_cap_nm=[8.] * 6, command_scales_nm=[1.] * 6,
++                firmware_limits_nm=[30.] * 6, cap_fraction_of_limit=[8./30.] * 6)
++    monkeypatch.setattr(dm, "build_drag_config", lambda *a, **kw: (cfg, info, cfg.assist_nm.copy()))
++    monkeypatch.setattr(dm, "print_ritual", lambda *args: None)
++    monkeypatch.setattr(dm, "enter_to_arm", lambda *args: None)
++    monkeypatch.setattr(dm, "print_gate_table", lambda *args: True)
++    monkeypatch.setattr(dm, "refuse_or_force", lambda *args: True)
++    save = Mock(return_value="test.npz")
++    monkeypatch.setattr(dm, "save_run", save)
++    session = Mock(command_scales=np.ones(6))
++    session.passive_joint_fault.return_value = None
++    def send(cmd):
++        session.last_mit_command = {
++            name: getattr(cmd, name).copy() for name in ("kp", "kd", "p_des", "v_des")
++        }
++        return np.asarray(cmd.t_ff)
++    session.send_mit.side_effect = send
++
++    def read():
++        broken = at_s <= clock.now < at_s + .4
++        if broken and failure == "missing":
++            raise RuntimeError("No joint-angle feedback from Piper; motor positions (deg): 0 0 0 0 0 361")
++        v = np.zeros(6)
++        if broken and failure == "runaway":
++            v[5] = 8.
++        return StateSample(q=Q_MID.copy(), v=v, tau_fb=np.zeros(6), current=np.zeros(6),
++                           t_wall=clock.now, feedback_hz=200., t_feedback=clock.now, t_joint=clock.now)
++
++    session.read_state.side_effect = read
++    monkeypatch.setattr(dm, "HardwareSession", lambda *a, **kw: session)
++    keys = Mock()
++    # Fresh feedback and repeated Enter presses after the fault must not
++    # resume assist or print READY. Operator q still shuts down normally.
++    keys.pressed.side_effect = lambda: "q" if clock.now > 3. else ("\n" if clock.now > 2. else None)
++    monkeypatch.setattr(dm, "KeyGate", lambda: keys)
++    assert dm.main(["--calib", "fake.json", "--disable-j6", "--force"]) == 0
++    out = capsys.readouterr().out
++    assert f"freeze requested: {reason}" in out
++    assert "J6 remains free" in out
++    assert "assist at target" not in out
++    assert "assist at 20%" not in out
++    assert "FREEZE_HOLD" in save.call_args.args[1]["state"]
++    event = save.call_args.args[2]["freeze_event"]
++    assert event["reason"] == reason
++    if failure == "missing":
++        assert "361" in event["feedback_problem"]
++    session.disable_after_confirm.assert_called_once()
++
++
++def test_missing_joint_feedback_reports_motor_positions_without_accepting_them():
++    session = HardwareSession("v183")
++    session.api = Mock()
++    session.api.get_joint_state.return_value = None
++    session.api.get_motor_state.return_value = NS(positions=np.deg2rad([0, 0, 0, 0, 0, 361]))
++    with pytest.raises(RuntimeError, match="No joint-angle feedback.*361.00"):
++        session.read_state()
+diff --git a/gravity_comp/tests/test_can_trace.py b/gravity_comp/tests/test_can_trace.py
+new file mode 100644
+index 0000000..e7d6b72
+--- /dev/null
++++ b/gravity_comp/tests/test_can_trace.py
+@@ -0,0 +1,109 @@
++"""A trace must preserve SDK behavior, including send errors, without CAN."""
++from types import SimpleNamespace as NS
++
++import numpy as np
++import pytest
++
++from gravity_comp.can_trace import CanTxTrace
++
++
++def attach(trace, send):
++    comm = NS(send=send)
++    robot = NS(get_context=lambda: NS(get_comm=lambda: comm))
++    trace.attach(robot)
++    return comm
++
++
++def test_trace_retains_start_and_bounded_tail_and_forwards_once(tmp_path):
++    sent = []
++    def send(msg, *args, **kwargs):
++        sent.append((msg.arbitration_id, bytes(msg.data), args, kwargs))
++        return True
++    trace = CanTxTrace(head_frames=2, tail_frames=3)
++    comm = attach(trace, send)
++    for i in range(8):
++        msg = NS(arbitration_id=0x151 + i, data=bytearray([i] * 8))
++        assert comm.send(msg, timeout=.1) is True
++        msg.data[0] = 255
++    trace.detach()
++    assert comm.send is send
++    assert len(sent) == 8
++    assert all(row[3] == {"timeout": .1} for row in sent)
++    out = np.load(trace.save(tmp_path / "trace.npz"))
++    assert out["can_id"].tolist() == [0x151 + i for i in (0, 1, 5, 6, 7)]
++    assert out["data"][:, 0].tolist() == [0, 1, 5, 6, 7]
++    assert out["total_frames"] == 8
++    assert out["dropped_frames"] == 3
++    assert out["send_ok"].all()
++
++
++def test_transport_error_is_preserved_and_recorded(tmp_path):
++    fault = RuntimeError("CAN send failed")
++    def send(msg):
++        raise fault
++    trace = CanTxTrace()
++    comm = attach(trace, send)
++    with pytest.raises(RuntimeError) as caught:
++        comm.send(NS(arbitration_id=0x15A, data=b"abcdefgh"))
++    assert caught.value is fault
++    trace.detach()
++    out = np.load(trace.save(tmp_path / "trace.npz"))
++    assert out["send_ok"].tolist() == [False]
++
++
++def test_empty_trace_has_stable_payload_shape(tmp_path):
++    trace = CanTxTrace()
++    out = np.load(trace.save(tmp_path / "empty.npz"))
++    assert out["data"].shape == (0, 8)
++
++
++@pytest.mark.parametrize("both", [False, True])
++def test_passive_wrist_real_sdk_packs_original_mode_and_zero_gains(tmp_path, both):
++    # Exercise the installed SDK's actual encoder; no connect() and no CAN
++    # transport are used. Mocking move_mit would miss a packing regression.
++    pytest.importorskip("pyAgxArm")
++    from scripts.piper_api.robot_helpers import create_piper_robot
++    from scripts.piper_api.piper_api import PiperAPI
++    from gravity_comp.hw_session import HardwareSession
++    from gravity_comp.control import DragController
++    from gravity_comp.tests.test_control import make_config, Q_MID, const_gravity
++    from uuid import uuid4
++
++    robot = create_piper_robot(firmware="v183", interface="virtual", channel="offline-" + uuid4().hex)
++    transmitted = []
++    # Intercept the transport after the actual message encoder runs.
++    robot.get_context().comm = NS(send=lambda msg: transmitted.append(msg) or True)
++    trace = CanTxTrace()
++    trace.attach(robot)
++    api = PiperAPI(firmware="v183", installation_pos=None, payload=None, robot=robot)
++    session = HardwareSession("v183", passive_j6=not both, passive_j5_j6=both)
++    session.api = api
++    kd = np.full(6, .01)
++    kd[4] = .005
++    ctrl = DragController(make_config(kd_mit=kd), const_gravity)
++    ctrl.start(Q_MID)
++    api.set_mit_mode()
++    session.send_mit(ctrl.update(Q_MID, np.zeros(6), 2.))
++    trace.detach()
++    rows = np.load(trace.save(tmp_path / "packed.npz"))
++    ids = rows["can_id"].tolist()
++    assert ids == [0x151] + [v for j in range(6) for v in (0x151, 0x15A + j)]
++    mode_data = rows["data"][rows["can_id"] == 0x151]
++    assert (mode_data == mode_data[0]).all()
++    assert mode_data[0, :4].tolist() == [1, 4, 50, 0xAD]
++    mit_data = rows["data"][rows["can_id"] >= 0x15A]
++    for data in mit_data:
++        kp_bits = ((int(data[3]) & 15) << 8) | int(data[4])
++        assert kp_bits == 0
++        assert int(data[7]) & 15 == int(np.bitwise_xor.reduce(data[:7])) & 15
++    j5 = mit_data[4]
++    assert (int(j5[5]) << 4) | (int(j5[6]) >> 4) == (2047 if both else 2049)
++    # V183's signed ranges have no exactly-zero code: these are its zero
++    # request encodings, not a claim of exactly zero measured motor torque.
++    for wrist in mit_data[4 if both else 5:]:
++        kd_bits = (int(wrist[5]) << 4) | (int(wrist[6]) >> 4)
++        torque_bits = ((int(wrist[6]) & 15) << 4) | (int(wrist[7]) >> 4)
++        assert kd_bits == 2047
++        assert torque_bits == 127
++    assert len(transmitted) == 13
++    robot.get_context().comm = None
+diff --git a/gravity_comp/tests/test_collection_damping.py b/gravity_comp/tests/test_collection_damping.py
+new file mode 100644
+index 0000000..9a33537
+--- /dev/null
++++ b/gravity_comp/tests/test_collection_damping.py
+@@ -0,0 +1,47 @@
++"""Collection's J5 damping override must not weaken brake or hold damping."""
++from types import SimpleNamespace as NS
++
++import numpy as np
++import pytest
++
++from gravity_comp.control import DragController, DragState
++from gravity_comp.drag_mode import build_drag_config, parse_args
++from gravity_comp.tests.test_control import Q_MID, const_gravity
++from gravity_comp.poses import JOINT_LIMITS
++
++
++def config(j5_kd=None):
++    artifact = NS(alpha=lambda: np.ones(6), coulomb=lambda: np.full(6, .3),
++                  section=lambda name: {}, velocity_noise_sigma=lambda: np.full(6, .001),
++                  torque_limits=lambda: np.full(6, 30.), output_scales=lambda: np.ones(6))
++    model = NS(max_gravity_torque_bound=lambda: np.ones(6), joint_limits=lambda: JOINT_LIMITS)
++    return build_drag_config(artifact, model, .3, j5_kd=j5_kd)
++
++
++def test_j5_override_applies_during_drag_but_preserves_brake_and_hold():
++    baseline, _, _ = config()
++    cfg, info, _ = config(.005)
++    expected = np.array([.01, .01, .01, .01, .005, .01])
++    np.testing.assert_array_equal(baseline.kd_mit, np.full(6, .01))
++    np.testing.assert_array_equal(cfg.kd_mit, expected)
++    np.testing.assert_array_equal(info["kd_mit"], expected)
++    np.testing.assert_array_equal(cfg.kd_soft, baseline.kd_soft)
++    ctrl = DragController(cfg, const_gravity)
++    ctrl.start(Q_MID)
++    for dt, state in ((.1, DragState.RAMP_IN), (4., DragState.ACTIVE)):
++        cmd = ctrl.update(Q_MID, np.zeros(6), dt)
++        assert ctrl.state == state
++        np.testing.assert_array_equal(cmd.kd, expected)
++    ctrl.freeze("test")
++    cmd = ctrl.update(Q_MID, np.zeros(6), .01)
++    np.testing.assert_array_equal(cmd.kd, np.full(6, baseline.brake_kd))
++    cmd = ctrl.update(Q_MID, np.zeros(6), 1.)
++    assert ctrl.state == DragState.FREEZE_HOLD
++    np.testing.assert_array_equal(cmd.kd, np.full(6, baseline.hold_kd))
++
++
++@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "-0.001", "5.001"])
++def test_bad_override_is_rejected_before_connect(value):
++    with pytest.raises(SystemExit) as exc:
++        parse_args(["--j5-kd=" + value])
++    assert exc.value.code == 2

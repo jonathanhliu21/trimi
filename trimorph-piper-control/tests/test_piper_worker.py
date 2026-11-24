@@ -168,7 +168,8 @@ class PiperWorkspaceWarningTests(unittest.TestCase):
 
 
 
-def fake_sdk_robot(joint_stamps, *, enabled=True, err_code=0, eef_stamp_offset=0.0, on_exhausted=None):
+def fake_sdk_robot(joint_stamps, *, enabled=True, err_code=0, arm_status="NORMAL",
+                   eef_stamp_offset=0.0, on_exhausted=None):
     """A pyAgxArm robot double that serves cached feedback and records every call.
 
     get_joint_angles serves one frame per entry of joint_stamps (repeats included,
@@ -199,7 +200,7 @@ def fake_sdk_robot(joint_stamps, *, enabled=True, err_code=0, eef_stamp_offset=0
         timestamp=robot.last_stamp, hz=50.0,
     )
     robot.get_arm_status.side_effect = lambda: SimpleNamespace(
-        msg=SimpleNamespace(ctrl_mode="CAN_CTRL", arm_status="NORMAL", mode_feedback="MIT",
+        msg=SimpleNamespace(ctrl_mode="CAN_CTRL", arm_status=arm_status, mode_feedback="MIT",
                             teach_status="OFF", motion_status="ARRIVED", err_code=err_code),
         timestamp=robot.last_stamp, hz=200.0,
     )
@@ -209,18 +210,19 @@ def fake_sdk_robot(joint_stamps, *, enabled=True, err_code=0, eef_stamp_offset=0
     return robot
 
 
-def gravity_comp_config():
+def gravity_comp_config(disable_j6=False):
     return SimpleNamespace(
         arm_mode=ARM_MODE_GRAVITY_COMP,
         piper_firmware="v183", piper_interface="socketcan", piper_channel="can0",
         # Deliberately set: the listener must ignore them and send nothing.
         piper_installation_pos="right", piper_payload="half", piper_joint_level=True,
         piper_rate_hz=20000.0, teacher_mode_poll_hz=20.0,
+        grav_comp_disable_j6=disable_j6,
     )
 
 
 class GravityCompListenerTests(unittest.TestCase):
-    def run_listener(self, robot, shared, session=None):
+    def run_listener(self, robot, shared, session=None, *, disable_j6=False):
         rows = []
         if session is None:
             session = SimpleNamespace(elapsed_s=lambda _ns: 0.5, append_piper=rows.append)
@@ -230,7 +232,7 @@ class GravityCompListenerTests(unittest.TestCase):
             patch("scripts.piper_api.piper_api.time.sleep"),
             patch("data_collection.collection.piper_worker.print") as printed,
         ):
-            run_piper_worker(gravity_comp_config(), shared,
+            run_piper_worker(gravity_comp_config(disable_j6), shared,
                              SimpleNamespace(current=lambda: session), init_done=init_done)
         self.assertTrue(init_done.is_set())
         return rows, printed
@@ -270,6 +272,9 @@ class GravityCompListenerTests(unittest.TestCase):
         health = shared.latest_arm_health()
         self.assertTrue(health.ok)
         self.assertEqual(health.rate_hz, 200.0)
+        feedback = shared.latest_piper_joints()
+        self.assertEqual(feedback.joints, tuple(health.joints))
+        self.assertEqual(feedback.monotonic_ns, rows[-1]["joint_rx_monotonic_ns"])
 
     def test_disabled_drive_marks_rows_and_warns(self):
         shared = SharedState()
@@ -287,6 +292,32 @@ class GravityCompListenerTests(unittest.TestCase):
         warnings = [call.args[0] for call in printed.call_args_list if "not OK" in str(call.args[0])]
         self.assertEqual(len(warnings), 1)
         self.assertIn("flagged", warnings[0])
+
+    def test_firmware_target_limit_with_zero_error_bits_is_unhealthy(self):
+        shared = SharedState()
+        robot = fake_sdk_robot([time.time()], arm_status="TARGET_POS_EXCEEDS_LIMIT(0x4)",
+                               on_exhausted=shared.shutdown.set)
+        rows, _ = self.run_listener(robot, shared)
+        self.assert_receive_only(robot)
+        self.assertEqual(rows[0]["err_code"], 0)
+        self.assertEqual(rows[0]["arm_ok"], 0)
+        self.assertFalse(shared.latest_arm_health().ok)
+        self.assertIn("TARGET_POS_EXCEEDS_LIMIT", shared.latest_arm_health().problem)
+        self.assertEqual(shared.latest_piper_controller_status().arm_status,
+                         "TARGET_POS_EXCEEDS_LIMIT(0x4)")
+
+    def test_passive_j6_keeps_all_feedback_without_transmitting(self):
+        shared = SharedState()
+        robot = fake_sdk_robot([time.time()], on_exhausted=shared.shutdown.set)
+        robot.get_driver_states.side_effect = lambda joint: SimpleNamespace(
+            msg=SimpleNamespace(foc_status=SimpleNamespace(driver_enable_status=joint != 6)),
+            timestamp=robot.last_stamp, hz=50.)
+        rows, _ = self.run_listener(robot, shared, disable_j6=True)
+        self.assert_receive_only(robot)
+        self.assertEqual(rows[0]["enable_6"], 0)
+        self.assertEqual(rows[0]["arm_ok"], 1)
+        self.assertEqual(float(rows[0]["joint_6"]), .3)
+        self.assertTrue(shared.latest_arm_health().ok)
 
     def test_stale_firmware_end_pose_is_left_blank(self):
         shared = SharedState()
