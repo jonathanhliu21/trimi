@@ -13,6 +13,7 @@ import numpy as np
 from data_collection.collection import config as defaults
 from data_collection.collection.task_start import write_task_start
 from inference.executor import executor
+from inference.executor import dagger
 from scripts.kinesthetic import rollout
 
 
@@ -102,6 +103,13 @@ class ExecutorTaskStartTests(unittest.TestCase):
         self.assertNotEqual(pinned_hash, hashlib.sha256(self.profile_path.read_bytes()).hexdigest())
         self.profile_path.unlink()
         np.testing.assert_array_equal(executor.start_base(args)[0], original["arm"]["joints_deg"])
+
+    def test_dagger_uses_pinned_task_start_for_kinesthetic_sag_check(self):
+        original = self.profile()
+        args = self.parse(original, extra=["--dagger", str(self.root / "dagger"),
+                                           "--takeover", "kinesthetic"])
+        self.profile_path.unlink()
+        np.testing.assert_array_equal(dagger.start_joints_deg(args), original["arm"]["joints_deg"])
 
     def test_profile_snapshot_and_hash_describe_same_bytes_during_file_replacement(self):
         original = self.profile()
@@ -207,6 +215,7 @@ class ExecutorTaskStartTests(unittest.TestCase):
         self.start_log.write_text(json.dumps(record) + "\n")
         after = executor.start_base(repeated)
         np.testing.assert_array_equal(after[0], before[0])
+        np.testing.assert_array_equal(dagger.start_joints_deg(repeated), before[0])
         self.assertEqual(after[1], before[1])
 
     def test_embedded_logged_profile_is_schema_validated(self):

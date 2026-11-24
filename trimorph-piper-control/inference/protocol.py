@@ -169,16 +169,19 @@ def send_action(
     action_chunk: np.ndarray,
     *,
     infer_ms: float,
+    extra: Optional[Dict] = None,
 ) -> None:
+    """Send one action chunk; ``extra`` adds JSON fields (e.g. the policy's provenance) to the header."""
     chunk = np.ascontiguousarray(np.atleast_2d(action_chunk), dtype=np.float32)
     if chunk.ndim != 2 or chunk.shape[1] != ACTION_DIM or not len(chunk) or not np.isfinite(chunk).all():
         raise ValueError("Action chunk must be finite, nonempty [T,19]")
-    header = {
+    header = dict(extra or {})
+    header.update({
         "type": "action",
         "seq": int(seq),
         "shape": list(chunk.shape),
         "infer_ms": float(infer_ms),
-    }
+    })
     send_msg(sock, header, chunk.tobytes())
 
 

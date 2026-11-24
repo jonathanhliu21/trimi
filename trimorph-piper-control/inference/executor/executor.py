@@ -17,6 +17,9 @@ appended to output/executor_starts.jsonl with an id that --start-id repeats;
 returns the arm and hand to that start, and a second press resumes the policy.
 --traj-view draws the dataset's demonstrated trajectories with the live EEF pose.
 No leader-to-follower retargeting is used.
+--dagger DATASET_ROOT (inference/executor/dagger.py) records every rollout and,
+on the takeover pedal, hands the rest of the episode to the operator by
+teleoperation or kinesthetic teaching (HG-DAgger).
 """
 from __future__ import annotations
 
@@ -562,6 +565,7 @@ class OakCamera:
         self.delivered_frame = None
         self.window = "Wrist camera (policy input; q/Esc stops)" if args.show else None
         dai = import_depthai()
+        self.dai = dai  # --dagger converts frame timestamps with it
         require_depthai_device(dai)
         self.pipeline = dai.Pipeline()
         try:
@@ -762,6 +766,11 @@ class RunLog:
         self.commands = []
         self.events = []
         self.chunks = []
+        self.policy = None  # the predictor's checkpoint provenance, from its reply header
+
+    def note_header(self, header):
+        if header.get("policy") is not None:
+            self.policy = header["policy"]
 
     def event(self, cycle, event, detail=""):
         self.events.append({"monotonic_ns": time.monotonic_ns(), "cycle": cycle, "event": event, "detail": detail})
@@ -863,8 +872,15 @@ def refresh_views(robot, camera, view):
         view.update(robot.eef_pose())
 
 
+def is_dagger(pedal):
+    """A dagger.DaggerSession in place of the pedal (a class attribute, so a Mock never matches)."""
+    return bool(getattr(type(pedal), "DAGGER", False))
+
+
 def wait_for_policy_start(robot, camera, pedal, view=None, *, resume=False):
     """Hold for a fresh pedal press, keeping camera and trajectory views live."""
+    if is_dagger(pedal):
+        return pedal.wait_for_start(robot, camera, view, resume=resume)
     pedal.poll()  # Discard presses made while moving to the start.
     verb = "resume" if resume else "start"
     print(f"At start. Press the pedal to {verb} the policy (Ctrl-C to quit).", flush=True)
@@ -875,7 +891,13 @@ def wait_for_policy_start(robot, camera, pedal, view=None, *, resume=False):
 
 
 def pause_at_start(args, robot, camera, pedal, view=None):
-    """Return to the start pose, then hold until the next pedal press."""
+    """Return to the start pose, then hold until the next pedal press.
+
+    With --dagger the pedal is a DaggerSession: a takeover or the end of the
+    rollout, which also returns to the start and waits for the next rollout.
+    """
+    if is_dagger(pedal):
+        return pedal.interrupt(args, robot, camera, view)
     print("Pedal: stopping the policy and returning the arm and hand to the start.", flush=True)
     if view is not None:
         view.set_chunk(None)
@@ -926,6 +948,7 @@ def receive_chunk(sock, seq, state, log=None):
     if chunk.ndim != 2 or chunk.shape[1] != 19 or not len(chunk) or not np.isfinite(chunk).all():
         raise ValueError("Predictor action chunk must be finite, nonempty [T,19]")
     if log is not None:
+        log.note_header(header)
         log.chunk(seq, state, chunk)
         log.event(seq, "chunk_received", f"infer_ms={header.get('infer_ms', 0):.1f} len={len(chunk)}")
     positions = np.vstack((state[:3], chunk[:, :3]))
@@ -1170,6 +1193,7 @@ def run_async(args, robot, camera, sock, action_alpha, pedal=None, view=None, lo
                         continue
                     new_chunk = validate_chunk(reply[1])
                     if log is not None:
+                        log.note_header(reply[2])
                         log.chunk(new_cycle, state, new_chunk)
                     event(new_cycle, "chunk_received",
                           f"infer_ms={reply[2].get('infer_ms', 0):.1f} len={len(new_chunk)} rtt_ms={new_rtt_ms:.1f}")
@@ -1390,11 +1414,16 @@ def run_rtc(args, robot, camera, sock, pedal=None, view=None, log=None):
                       f"overruns={overruns} starved={starved}{' interrupted' if interrupted else ''}")
         if not interrupted:
             return
-        if pending is not None:
-            protocol.recv_action(sock)  # its chunk continues motion the reset abandoned
+        # Its chunk continues motion the reset abandoned: drain it unexecuted. A
+        # DAgger takeover must not wait for the predictor, so it drains afterwards.
+        drain_after = pending is not None and is_dagger(pedal)
+        if pending is not None and not drain_after:
+            protocol.recv_action(sock)
         if log is not None:
             log.event(seq, "pedal_reset")
         pause_at_start(args, robot, camera, pedal, view)
+        if drain_after:
+            protocol.recv_action(sock)
 
 
 def parse_args(argv=None):
@@ -1502,6 +1531,8 @@ def parse_args(argv=None):
                    help="Save each run's Piper feedback (200 Hz), commands, and chunks under here "
                         "(default: %(default)s)")
     p.add_argument("--no-log", action="store_true", help="Do not save the run log")
+    from inference.executor import dagger as dagger_mode
+    dagger_mode.add_arguments(p)
     args = p.parse_args(argv)
     args.task_start_profile = None
     args.task_start_sha256 = None
@@ -1520,6 +1551,7 @@ def parse_args(argv=None):
             validate_task_start_for_executor(args, args.task_start_profile)
         except (OSError, ValueError, KeyError) as exc:
             p.error(str(exc))
+    dagger_mode.check_arguments(p, args)
     if args.record_video and args.fake:
         p.error("--record-video requires the real wrist camera; remove --fake")
     if args.execute_steps < 0:
@@ -1576,13 +1608,20 @@ def parse_args(argv=None):
 
 def main():
     args = parse_args()
-    robot = camera = sock = pedal = view = None
+    robot = camera = sock = pedal = view = session = None
     log = None if args.no_log else RunLog(args.log_root)
     try:
         # Establish predictor connectivity before enabling any actuators.
         sock = socket.create_connection((args.predictor, args.port), timeout=args.timeout)
         protocol.set_low_latency(sock)
-        if not args.no_pedal and not args.fake:
+        prepared = None
+        if args.dagger is not None:
+            from inference.executor import dagger as dagger_mode
+            # Calibrations load before any hardware moves, so a bad one fails early.
+            prepared = dagger_mode.prepare(args)
+            pedal = dagger_mode.create_pedals(args)
+            print(f"Foot pedals on {pedal.trigger.active_device}: {pedal.describe()}.")
+        elif not args.no_pedal and not args.fake:
             from scripts.piper_api.foot_pedal import FootPedalTrigger
             pedal = FootPedalTrigger(args.foot_pedal_device, debounce_s=0.3)
             pedal.start()
@@ -1593,6 +1632,8 @@ def main():
             view.update()
         camera = FakeCamera() if args.fake else OakCamera(args)
         robot = FakeRobot() if args.fake else RobotIO(args)
+        if args.dagger is not None:
+            session = pedal = dagger_mode.create_session(args, prepared, robot, camera, pedal, log)
         if pedal is not None:
             wait_for_policy_start(robot, camera, pedal, view)
         if args.record_video:
@@ -1602,6 +1643,15 @@ def main():
     except KeyboardInterrupt:
         print("Stopped")
     finally:
+        if session is not None:
+            # Saves a rollout still in progress; needs the Piper log, so before it stops.
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                session.close()
+            except Exception as exc:
+                print(f"WARNING: closing the DAgger session failed: {exc!r}", flush=True)
+            finally:
+                signal.signal(signal.SIGINT, previous)
         # Save before closing hardware, with Ctrl-C ignored: a second Ctrl-C or a
         # stuck close must not lose the log.
         if log is not None:

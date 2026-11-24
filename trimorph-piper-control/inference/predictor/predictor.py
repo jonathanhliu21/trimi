@@ -14,6 +14,7 @@ continue that chunk (rtc.py).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import socket
 import sys
@@ -72,6 +73,18 @@ def load_policy(args):
     return policy
 
 
+def policy_provenance(args, policy):
+    """Which checkpoint answers: sent with every reply so DAgger episodes record the policy that ran."""
+    path = Path(args.checkpoint).resolve()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return {"checkpoint": str(path), "sha256": digest.hexdigest(), "size_bytes": path.stat().st_size,
+            "num_inference_steps": int(policy.policy.num_inference_steps), "ema": not args.no_ema,
+            "action_mode": args.action_mode}
+
+
 def make_chunker(policy):
     from rtc import RealTimeChunker
     from shared.env.midas.se3_utils import absolute_to_relative, relative_to_absolute
@@ -99,7 +112,7 @@ def warmup(policy, chunker, n: int) -> None:
     print("Warmup done.")
 
 
-def serve_connection(policy, chunker, conn: socket.socket, peer) -> None:
+def serve_connection(policy, chunker, conn: socket.socket, peer, provenance=None) -> None:
     protocol.set_low_latency(conn)
     policy.reset()
     print(f"Executor connected: {peer}")
@@ -121,7 +134,8 @@ def serve_connection(policy, chunker, conn: socket.socket, peer) -> None:
                 action = chunker.predict(image_rgb, state, rtc["prev_chunk"], rtc["delay"], rtc["max_guidance"])
             infer_ms = (time.perf_counter() - t0) * 1e3
 
-            protocol.send_action(conn, seq, action, infer_ms=infer_ms)
+            protocol.send_action(conn, seq, action, infer_ms=infer_ms,
+                                 extra=None if provenance is None else {"policy": provenance})
 
             count += 1
             lat_sum += infer_ms
@@ -139,6 +153,8 @@ def main():
         sys.exit(1)
 
     policy = load_policy(args)
+    provenance = policy_provenance(args, policy)
+    print(f"Checkpoint sha256 {provenance['sha256'][:12]}...")
     chunker = make_chunker(policy)
     warmup(policy, chunker, args.warmup)
 
@@ -152,7 +168,7 @@ def main():
         while True:
             conn, peer = server.accept()
             with conn:
-                serve_connection(policy, chunker, conn, peer)
+                serve_connection(policy, chunker, conn, peer, provenance)
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:
