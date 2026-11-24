@@ -18,6 +18,30 @@ EVIOCGRAB = 0x40044590
 PEDAL_HINTS = ("pedal", "foot")
 KEYBOARD_HINTS = ("event-kbd", "keyboard")
 MOUSE_HINTS = ("event-mouse", "mouse")
+# Linux input-event key codes (linux/input-event-codes.h) for the keys a foot
+# switch is usually programmed to send. A PCsensor 3-pedal ships as a, b, c.
+KEY_CODES = {
+    **dict(zip("1234567890", range(2, 12))),
+    **dict(zip("qwertyuiop", range(16, 26))),
+    **dict(zip("asdfghjkl", range(30, 39))),
+    **dict(zip("zxcvbnm", range(44, 51))),
+    "enter": 28, "space": 57, "leftctrl": 29, "leftshift": 42, "leftalt": 56,
+    "f1": 59, "f2": 60, "f3": 61, "f4": 62, "f5": 63, "f6": 64,
+    "btn_left": 272, "btn_right": 273, "btn_middle": 274,
+}
+KEY_NAMES = {code: name for name, code in KEY_CODES.items()}
+
+
+def key_code(value) -> int:
+    """A key code from an int, a decimal string, or a name in KEY_CODES (case-insensitive)."""
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().lower()
+    if text.isdigit() and len(text) > 1:
+        return int(text)
+    if text in KEY_CODES:
+        return KEY_CODES[text]
+    raise ValueError(f"Unknown key {value!r}: use a key code number or one of {sorted(KEY_CODES)}")
 
 
 @dataclass(frozen=True)
@@ -177,6 +201,8 @@ class FootPedalTrigger:
         self._start_t = 0.0
         self._last_trigger_t = 0.0
         self._pedal_down_t: Optional[float] = None
+        # Press time of every key currently held, by key code (multi-pedal devices).
+        self._down_since: dict[int, float] = {}
 
     @property
     def active_device(self) -> Optional[str]:
@@ -242,6 +268,7 @@ class FootPedalTrigger:
         self._drain_raw_events()
         self._buffer = b""
         self._pedal_down_t = None
+        self._down_since = {}
 
     def stop(self) -> None:
         if self._fd is None:
@@ -256,6 +283,7 @@ class FootPedalTrigger:
         self._fd = None
         self._buffer = b""
         self._pedal_down_t = None
+        self._down_since = {}
 
     def poll(self) -> List[FootPedalEvent]:
         if self._fd is None:
@@ -289,6 +317,15 @@ class FootPedalTrigger:
             return None
         return time.monotonic() - self._pedal_down_t
 
+    def held_s(self, code: int) -> Optional[float]:
+        """How long the key with this code has been held, or None if it is up.
+
+        Unlike current_hold_s(), each key of a multi-pedal device is tracked on
+        its own. Only updated by poll(), so call poll() first.
+        """
+        down = self._down_since.get(code)
+        return None if down is None else time.monotonic() - down
+
     def _read_events(self):
         self._drain_raw_events()
         events = []
@@ -298,6 +335,12 @@ class FootPedalTrigger:
             self._buffer = self._buffer[event_size:]
             _, _, event_type, code, value = INPUT_EVENT_STRUCT.unpack(chunk)
             events.append((event_type, code, value))
+            if event_type == EV_KEY:
+                now = time.monotonic()
+                if value == KEY_PRESS:
+                    self._down_since.setdefault(code, now)
+                elif value == KEY_RELEASE:
+                    self._down_since.pop(code, None)
             if event_type == EV_KEY and (self.key_code is None or code == self.key_code):
                 now = time.monotonic()
                 if value == KEY_PRESS and self._pedal_down_t is None:
@@ -321,3 +364,37 @@ class FootPedalTrigger:
             if not data:
                 return
             self._buffer += data
+
+
+def monitor(device: Optional[str] = None) -> None:
+    """Print every key press and release of the pedal device with its code; Ctrl-C stops.
+
+    Use it to find the codes a multi-pedal switch sends (for executor --pedal-keys).
+    """
+    pedal = FootPedalTrigger(device)
+    pedal.start()
+    print(f"Listening on {pedal.active_device}. Press each pedal; Ctrl-C stops.", flush=True)
+    try:
+        while True:
+            for event_type, code, value in pedal._read_events():
+                if event_type == EV_KEY and value in (KEY_PRESS, KEY_RELEASE):
+                    action = "press  " if value == KEY_PRESS else "release"
+                    print(f"{action} code {code:4d} ({KEY_NAMES.get(code, '?')})", flush=True)
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pedal.stop()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="List input devices, or print the key codes a foot pedal sends.")
+    parser.add_argument("--list-input-devices", action="store_true", help="List input devices and exit")
+    parser.add_argument("--foot-pedal-device", help="Pedal input device (default: auto-detect)")
+    options = parser.parse_args()
+    if options.list_input_devices:
+        print(format_input_devices(list_input_devices()))
+    else:
+        monitor(options.foot_pedal_device)

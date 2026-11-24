@@ -150,6 +150,28 @@ flip, manual exposure/ISO, and white-balance defaults come from
 when collection used different settings. The hand API uses the YAML baudrate,
 calibration, gains, and limits. It verifies the connected motor models.
 
+## HG-DAgger rollouts (`--dagger`)
+
+`--dagger DATASET_ROOT --takeover teleop|kinesthetic` records every rollout as a
+raw episode in the collection layout and lets the operator take over:
+
+- Three pedals (`--pedal-keys`, default `b c a`; find the codes with
+  `python -m scripts.piper_api.foot_pedal`):
+  - takeover: starts a rollout at the start pose, and takes over during the policy;
+  - success and failure: end the rollout (hold failure 2 s to discard it).
+- After a takeover the operator finishes the episode:
+  - **teleop:** the Quest moves the arm, from the pose the policy last commanded, with the
+    takeover pedal held as the clutch; the worn leader TriMI moves the follower hand.
+  - **kinesthetic:** the arm runs the calibrated gravity compensation from
+    midas-piper-control and the hand goes limp. Put your hands on the arm before you press
+    the pedal.
+- Use `--rtc` or `--async-inference` so the pedal is read every action.
+
+Postprocess with `data_collection/postprocess_dataset.py --pose-source piper`, then
+keep the human-controlled intervals with `scripts/dagger/export_segments.py`.
+See `DAGGER_PLAN.md` at the repository root for the full procedure, the
+training options, and the bench checklist.
+
 ## Coordinate contract
 
 The executor sends the latest hand target at `--hand-command-hz` (default 100 Hz),

@@ -38,3 +38,10 @@ dataset:
   encoder_window: 0
   sync_downsample_stride: 2
   use_cache: False
+  # dataset_path may also list several roots (base demos + DAgger rounds);
+  # each root's validation episodes are drawn separately. source_weights sets
+  # each root's share of the training draws, e.g. [0.7, 0.3] or
+  # {data_base: 0.7, data_dagger_r1: 0.3}; null samples windows uniformly.
+  source_weights: null
+  # Optional display names for the roots (default: their folder names).
+  source_names: null

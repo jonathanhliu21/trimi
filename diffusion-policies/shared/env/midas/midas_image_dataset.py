@@ -3,7 +3,9 @@ import hashlib
 import json
 import os
 import shutil
-from typing import Dict, List, Tuple
+import warnings
+from collections.abc import Mapping
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -52,18 +54,219 @@ def _resolve_midas_root(dataset_path: str) -> str:
     return dataset_path
 
 
+def _dataset_roots(dataset_path) -> List[str]:
+    """One dataset root (str / PathLike) or several (list, tuple, Hydra ListConfig)."""
+    if isinstance(dataset_path, (str, os.PathLike)):
+        return [os.fspath(dataset_path)]
+    if OmegaConf.is_config(dataset_path):
+        dataset_path = OmegaConf.to_container(dataset_path, resolve=True)
+    roots = [os.fspath(path) for path in dataset_path]
+    if not roots:
+        raise ValueError("dataset_path must name at least one dataset root")
+    return roots
+
+
+def _resolve_source_names(roots: List[str], source_names=None) -> List[str]:
+    """Display names of the sources (one per root), used in logs and source_weights dicts."""
+    if source_names is not None:
+        if OmegaConf.is_config(source_names):
+            source_names = OmegaConf.to_container(source_names, resolve=True)
+        names = [str(name) for name in source_names]
+        if len(names) != len(roots):
+            raise ValueError(
+                f"source_names has {len(names)} entries for {len(roots)} dataset roots"
+            )
+        if len(set(names)) != len(names):
+            raise ValueError(f"source_names must be unique, got {names}")
+        return names
+    names = [os.path.basename(os.path.normpath(root)) or root for root in roots]
+    if len(set(names)) != len(names):
+        # Repeated basenames (e.g. round_1/data, round_2/data): number every source.
+        names = [f"{index}_{name}" for index, name in enumerate(names)]
+    return names
+
+
+def _per_source_val_mask(
+    episode_source: np.ndarray, n_sources: int, val_ratio: float, seed: int
+) -> np.ndarray:
+    """Validation episodes drawn separately inside every source.
+
+    Each source's mask is get_val_mask over that source's own episodes with the
+    same seed, so a source with >= 2 episodes always gets validation episodes,
+    and a root keeps the same validation episodes whether it is loaded alone or
+    with other roots. With one source this is exactly get_val_mask over all
+    episodes, as before multi-root support.
+    """
+    val_mask = np.zeros(len(episode_source), dtype=bool)
+    for source in range(n_sources):
+        episodes = np.flatnonzero(episode_source == source)
+        if len(episodes) == 0:
+            continue
+        val_mask[episodes] = get_val_mask(
+            n_episodes=len(episodes), val_ratio=val_ratio, seed=seed
+        )
+    return val_mask
+
+
+def _window_sources(
+    sampler: SequenceSampler, episode_ends: np.ndarray, episode_source: np.ndarray
+) -> np.ndarray:
+    """Source id of every sampler window, from the episode of its first buffer step."""
+    if len(sampler.indices) == 0:
+        return np.zeros(0, dtype=np.int64)
+    episodes = np.searchsorted(
+        np.asarray(episode_ends), sampler.indices[:, 0], side="right"
+    )
+    return np.asarray(episode_source, dtype=np.int64)[episodes]
+
+
+def _source_window_weights(
+    window_source: np.ndarray,
+    n_sources: int,
+    source_weights,
+    source_names: Optional[List[str]] = None,
+) -> Optional[np.ndarray]:
+    """Per-window sampling weights that give each source its requested share of draws.
+
+    weight(window) = w_source / n_windows_in_source, normalized to sum to 1, so a
+    source's share of the draws is w_source / sum(w) regardless of its size.
+    ``source_weights`` is a list aligned with the sources or a {name: weight}
+    mapping (missing names get 0). None keeps uniform sampling over windows.
+    """
+    if source_weights is None:
+        return None
+    if OmegaConf.is_config(source_weights):
+        source_weights = OmegaConf.to_container(source_weights, resolve=True)
+    names = list(source_names) if source_names is not None else [str(s) for s in range(n_sources)]
+    if isinstance(source_weights, Mapping):
+        unknown = sorted(set(map(str, source_weights)) - set(names))
+        if unknown:
+            raise ValueError(f"source_weights names {unknown} are not sources {names}")
+        weights = [float(source_weights.get(name, 0.0)) for name in names]
+    else:
+        weights = [float(weight) for weight in source_weights]
+    weights = np.asarray(weights, dtype=np.float64)
+    if (weights.shape != (n_sources,) or not np.isfinite(weights).all()
+            or (weights < 0).any() or weights.sum() <= 0):
+        raise ValueError(
+            f"source_weights must be {n_sources} finite, nonnegative weights with a "
+            f"positive sum, got {source_weights}"
+        )
+    window_source = np.asarray(window_source, dtype=np.int64)
+    counts = np.bincount(window_source, minlength=n_sources)
+    per_window = np.zeros(len(window_source), dtype=np.float64)
+    for source in range(n_sources):
+        if counts[source] == 0:
+            if weights[source] > 0:
+                warnings.warn(
+                    f"[MidasImageDataset] source {names[source]!r} has no training "
+                    f"windows; its weight {weights[source]:g} gets no sampling mass"
+                )
+            continue
+        per_window[window_source == source] = weights[source] / counts[source]
+    total = per_window.sum()
+    if total <= 0:
+        raise ValueError("source_weights give no training window any sampling mass")
+    return per_window / total
+
+
+def _load_root_replay_buffer(
+    dataset_path: str,
+    shape_meta: dict,
+    first_cut: int,
+    encoder_window: int,
+    sync_downsample_stride: int,
+    use_cache: bool,
+    replay_buffer: Optional[ReplayBuffer] = None,
+) -> ReplayBuffer:
+    """Load one dataset root, appending its episodes to ``replay_buffer`` when given.
+
+    The optional cache is per root (``<root>/midas_<hash>.zarr.zip``, keyed by the
+    loader settings), so adding a root never rebuilds another root's cache and a
+    single root keeps its cache file name.
+    """
+    if not use_cache:
+        return _build_replay_buffer(
+            dataset_path=dataset_path,
+            shape_meta=shape_meta,
+            first_cut=first_cut,
+            encoder_window=encoder_window,
+            sync_downsample_stride=sync_downsample_stride,
+            store=zarr.MemoryStore(),
+            replay_buffer=replay_buffer,
+        )
+
+    cache_key = {
+        "shape_meta": OmegaConf.to_container(shape_meta),
+        "first_cut": int(first_cut),
+        "encoder_window": int(encoder_window),
+        "sync_downsample_stride": sync_downsample_stride,
+    }
+    cache_hash = hashlib.md5(
+        json.dumps(cache_key, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_zarr_path = os.path.join(
+        dataset_path, f"midas_{cache_hash}.zarr.zip"
+    )
+    cache_lock_path = cache_zarr_path + ".lock"
+
+    print("[MidasImageDataset] Acquiring cache lock")
+    with FileLock(cache_lock_path):
+        if not os.path.exists(cache_zarr_path):
+            try:
+                print("[MidasImageDataset] Cache missing, building replay buffer")
+                root_buffer = _build_replay_buffer(
+                    dataset_path=dataset_path,
+                    shape_meta=shape_meta,
+                    first_cut=first_cut,
+                    encoder_window=encoder_window,
+                    sync_downsample_stride=sync_downsample_stride,
+                    store=zarr.MemoryStore(),
+                )
+                print("[MidasImageDataset] Saving cache")
+                with zarr.ZipStore(cache_zarr_path) as zip_store:
+                    root_buffer.save_to_store(store=zip_store)
+            except Exception as exc:
+                if os.path.exists(cache_zarr_path):
+                    if os.path.isdir(cache_zarr_path):
+                        shutil.rmtree(cache_zarr_path)
+                    else:
+                        os.remove(cache_zarr_path)
+                raise exc
+        else:
+            print("[MidasImageDataset] Loading cached replay buffer")
+            with zarr.ZipStore(cache_zarr_path, mode="r") as zip_store:
+                root_buffer = ReplayBuffer.copy_from_store(
+                    src_store=zip_store,
+                    store=zarr.MemoryStore(),
+                )
+    if replay_buffer is None:
+        return root_buffer
+    for episode in range(root_buffer.n_episodes):
+        replay_buffer.add_episode(root_buffer.get_episode(episode, copy=True))
+    return replay_buffer
+
+
 class MidasImageDataset(Dataset):
     """
     Midas image dataset with Merlin-compatible on-disk layout.
 
     Stored replay-buffer action is absolute [eef_6, hand_13]. Returned training
     action is window-relative [eef_rel_6, hand_delta_13].
+
+    ``dataset_path`` may list several roots (for example the base demos and
+    DAgger rounds). Their episodes share one replay buffer in root order;
+    ``episode_source`` / ``window_source`` give each episode's / window's root
+    index, validation episodes are drawn inside every root, and batches carry a
+    ``source`` id when there is more than one root. ``source_weights`` (one per
+    root, or {name: weight}) sets each root's share of the training draws
+    through ``sample_weights``; None keeps uniform sampling over windows.
     """
 
     def __init__(
         self,
         shape_meta: dict,
-        dataset_path: str,
+        dataset_path,
         horizon: int = 1,
         pad_before: int = 0,
         pad_after: int = 0,
@@ -76,71 +279,37 @@ class MidasImageDataset(Dataset):
         first_cut: int = 0,
         encoder_window: int = 0,
         sync_downsample_stride: int = 1,
+        source_weights=None,
+        source_names=None,
     ):
         super().__init__()
 
-        assert os.path.isdir(dataset_path), f"Dataset path does not exist: {dataset_path}"
+        roots = _dataset_roots(dataset_path)
+        for root in roots:
+            assert os.path.isdir(root), f"Dataset path does not exist: {root}"
         sync_downsample_stride = int(sync_downsample_stride)
         if sync_downsample_stride < 1:
             raise ValueError(
                 "sync_downsample_stride must be >= 1, "
                 f"got {sync_downsample_stride}."
             )
+        names = _resolve_source_names(roots, source_names)
 
-        if use_cache:
-            cache_key = {
-                "shape_meta": OmegaConf.to_container(shape_meta),
-                "first_cut": int(first_cut),
-                "encoder_window": int(encoder_window),
-                "sync_downsample_stride": sync_downsample_stride,
-            }
-            cache_hash = hashlib.md5(
-                json.dumps(cache_key, sort_keys=True).encode("utf-8")
-            ).hexdigest()
-            cache_zarr_path = os.path.join(
-                dataset_path, f"midas_{cache_hash}.zarr.zip"
-            )
-            cache_lock_path = cache_zarr_path + ".lock"
-
-            print("[MidasImageDataset] Acquiring cache lock")
-            with FileLock(cache_lock_path):
-                if not os.path.exists(cache_zarr_path):
-                    try:
-                        print("[MidasImageDataset] Cache missing, building replay buffer")
-                        replay_buffer = _build_replay_buffer(
-                            dataset_path=dataset_path,
-                            shape_meta=shape_meta,
-                            first_cut=first_cut,
-                            encoder_window=encoder_window,
-                            sync_downsample_stride=sync_downsample_stride,
-                            store=zarr.MemoryStore(),
-                        )
-                        print("[MidasImageDataset] Saving cache")
-                        with zarr.ZipStore(cache_zarr_path) as zip_store:
-                            replay_buffer.save_to_store(store=zip_store)
-                    except Exception as exc:
-                        if os.path.exists(cache_zarr_path):
-                            if os.path.isdir(cache_zarr_path):
-                                shutil.rmtree(cache_zarr_path)
-                            else:
-                                os.remove(cache_zarr_path)
-                        raise exc
-                else:
-                    print("[MidasImageDataset] Loading cached replay buffer")
-                    with zarr.ZipStore(cache_zarr_path, mode="r") as zip_store:
-                        replay_buffer = ReplayBuffer.copy_from_store(
-                            src_store=zip_store,
-                            store=zarr.MemoryStore(),
-                        )
-        else:
-            replay_buffer = _build_replay_buffer(
-                dataset_path=dataset_path,
+        replay_buffer = None
+        episode_source = []
+        for source, root in enumerate(roots):
+            before = 0 if replay_buffer is None else replay_buffer.n_episodes
+            replay_buffer = _load_root_replay_buffer(
+                dataset_path=root,
                 shape_meta=shape_meta,
                 first_cut=first_cut,
                 encoder_window=encoder_window,
                 sync_downsample_stride=sync_downsample_stride,
-                store=zarr.MemoryStore(),
+                use_cache=use_cache,
+                replay_buffer=replay_buffer,
             )
+            episode_source.extend([source] * (replay_buffer.n_episodes - before))
+        episode_source = np.asarray(episode_source, dtype=np.int64)
 
         rgb_keys = []
         lowdim_keys = []
@@ -158,8 +327,10 @@ class MidasImageDataset(Dataset):
             for key in rgb_keys + lowdim_keys:
                 key_first_k[key] = num_obs_steps
 
-        val_mask = get_val_mask(
-            n_episodes=replay_buffer.n_episodes,
+        # Per-source split; with one root this is get_val_mask over all episodes.
+        val_mask = _per_source_val_mask(
+            episode_source=episode_source,
+            n_sources=len(roots),
             val_ratio=val_ratio,
             seed=seed,
         )
@@ -185,6 +356,7 @@ class MidasImageDataset(Dataset):
         self.lowdim_keys = lowdim_keys
         self.num_obs_steps = num_obs_steps
         self.val_mask = val_mask
+        self.train_mask = train_mask
         self.horizon = horizon
         self.num_latency_steps = num_latency_steps
         self.pad_before = pad_before
@@ -192,11 +364,35 @@ class MidasImageDataset(Dataset):
         self.first_cut = int(first_cut)
         self.encoder_window = int(encoder_window)
         self.sync_downsample_stride = sync_downsample_stride
+        self.dataset_roots = roots
+        self.source_names = names
+        self.n_sources = len(roots)
+        self.episode_source = episode_source
+        self.window_source = _window_sources(
+            sampler, replay_buffer.episode_ends[:], episode_source
+        )
+        # Training draws only; validation stays uniform over its windows.
+        self.sample_weights = _source_window_weights(
+            self.window_source, self.n_sources, source_weights, names
+        )
 
         print(
             "[MidasImageDataset] Replay buffer: "
             f"episodes={self.replay_buffer.n_episodes}, steps={self.replay_buffer.n_steps}"
         )
+        if self.n_sources > 1:
+            for source, name in enumerate(names):
+                in_source = episode_source == source
+                share = ""
+                if self.sample_weights is not None:
+                    mass = self.sample_weights[self.window_source == source].sum()
+                    share = f", draw share={mass:.3f}"
+                print(
+                    f"[MidasImageDataset] source {source} {name!r}: "
+                    f"episodes={int(in_source.sum())} "
+                    f"(val {int((in_source & val_mask).sum())}), "
+                    f"train windows={int((self.window_source == source).sum())}{share}"
+                )
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -208,7 +404,42 @@ class MidasImageDataset(Dataset):
             episode_mask=self.val_mask,
         )
         val_set.val_mask = ~self.val_mask
+        val_set.window_source = _window_sources(
+            val_set.sampler, self.replay_buffer.episode_ends[:], self.episode_source
+        )
+        val_set.sample_weights = None
         return val_set
+
+    def relative_actions(
+        self, max_windows: Optional[int] = None, seed: int = 0
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Window-relative training targets [N, horizon, 19] and their window sources.
+
+        Reads only the action array (no video frames) for the training windows,
+        or a seeded random subset of at most ``max_windows`` of them.
+        """
+        sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer,
+            sequence_length=self.horizon + self.num_latency_steps,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            keys=["action"],
+            episode_mask=self.train_mask,
+        )
+        indices = np.arange(len(sampler))
+        if max_windows is not None and len(indices) > max_windows:
+            rng = np.random.default_rng(seed)
+            indices = np.sort(rng.choice(len(indices), size=int(max_windows), replace=False))
+        actions = []
+        for idx in indices:
+            abs_action = sampler.sample_sequence(idx)["action"].astype(np.float32)
+            if self.num_latency_steps > 0:
+                abs_action = abs_action[self.num_latency_steps :]
+            actions.append(absolute_to_relative(abs_action))
+        if not actions:
+            action_dim = int(self.replay_buffer["action"].shape[-1])
+            return np.zeros((0, self.horizon, action_dim), dtype=np.float32), np.zeros(0, np.int64)
+        return np.stack(actions).astype(np.float32), self.window_source[indices]
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
@@ -267,10 +498,14 @@ class MidasImageDataset(Dataset):
             abs_action = abs_action[self.num_latency_steps :]
         action = absolute_to_relative(abs_action)
 
-        return {
+        result = {
             "obs": dict_apply(obs_dict, torch.from_numpy),
             "action": torch.from_numpy(action),
         }
+        if self.n_sources > 1:
+            # Root index of this window, for per-source validation losses.
+            result["source"] = torch.tensor(int(self.window_source[idx]), dtype=torch.int64)
+        return result
 
 
 def _sorted_files(directory: str, suffix: str) -> List[str]:
@@ -331,7 +566,9 @@ def _build_replay_buffer(
     encoder_window: int,
     sync_downsample_stride: int,
     store,
+    replay_buffer: Optional[ReplayBuffer] = None,
 ) -> ReplayBuffer:
+    """Load one root's episodes into a new buffer, or append them to ``replay_buffer``."""
     obs_shape_meta = shape_meta["obs"]
 
     rgb_keys = [
@@ -403,7 +640,8 @@ def _build_replay_buffer(
             f"action={len(act_files)} sync={len(sync_files)}"
         )
 
-    replay_buffer = ReplayBuffer.create_empty_zarr(storage=store)
+    if replay_buffer is None:
+        replay_buffer = ReplayBuffer.create_empty_zarr(storage=store)
 
     kept_episodes = 0
     dropped_episodes = 0
@@ -491,8 +729,8 @@ def _build_replay_buffer(
         kept_episodes += 1
         total_steps += len(episode_state)
 
-    if replay_buffer.n_episodes == 0:
-        raise RuntimeError("No usable episodes found in MIDAS dataset")
+    if kept_episodes == 0:
+        raise RuntimeError(f"No usable episodes found in MIDAS dataset {dataset_path}")
 
     print(
         "[MidasImageDataset] Built replay buffer: "

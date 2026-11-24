@@ -112,6 +112,11 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+  # Warm start: load only model/EMA weights from this checkpoint (no optimizer
+  # or step counters); ignored when resume finds this run's own checkpoint.
+  init_ckpt: null
+  # Keep the checkpoint's normalizer instead of refitting it on the dataset.
+  keep_ckpt_normalizer: false
 
 logging:
   project: diffusion_policies
@@ -132,14 +137,14 @@ checkpoint:
   save_last_snapshot: False
 
 multi_run:
-  run_dir: ${tasks.dataset.dataset_path}/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  run_dir: ${first_root:${tasks.dataset.dataset_path}}/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
 
 hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: ${tasks.dataset.dataset_path}/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: ${first_root:${tasks.dataset.dataset_path}}/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   sweep:
-    dir: ${tasks.dataset.dataset_path}/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: ${first_root:${tasks.dataset.dataset_path}}/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}

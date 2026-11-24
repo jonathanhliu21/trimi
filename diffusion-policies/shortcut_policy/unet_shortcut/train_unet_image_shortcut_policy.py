@@ -30,9 +30,9 @@ import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import OmegaConf
-from typing import Optional, List
-from torch.utils.data import DataLoader
+from omegaconf import ListConfig, OmegaConf
+from typing import Dict, Optional, List
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from shortcut_policy.unet_shortcut.unet_image_shortcut_policy import (
     UnetImageShortcutPolicy,
@@ -50,6 +50,109 @@ from shared.models.unet.ema_model import EMAModel
 from shared.models.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def first_dataset_root(dataset_path) -> str:
+    """The first root of a dataset_path that may list several roots.
+
+    Used by ``${first_root:...}`` so the output directories of a multi-root run
+    (base demos first, then DAgger rounds) go under the first root, as they do
+    for a single root.
+    """
+    if isinstance(dataset_path, (list, tuple, ListConfig)):
+        return str(dataset_path[0])
+    return str(dataset_path)
+
+
+# Registered at import, before Hydra resolves hydra.run.dir; inference imports
+# this module (through the checkpoint's _target_) before using the config too.
+OmegaConf.register_new_resolver("first_root", first_dataset_root, replace=True)
+
+# Warn when more than this fraction of normalized action targets fall outside [-1, 1].
+NORMALIZER_COVERAGE_WARN_FRACTION = 0.01
+# Bound on the training windows read for that check.
+NORMALIZER_COVERAGE_MAX_WINDOWS = 20000
+
+
+def make_train_dataloader(dataset, dataloader_cfg) -> DataLoader:
+    """Training loader; a dataset with ``sample_weights`` is drawn by weight.
+
+    Weighted datasets (several sources with ``source_weights``) draw
+    len(dataset) windows per epoch with replacement, each with probability
+    sample_weights[i], instead of shuffling; ``shuffle`` is forced off because
+    a sampler excludes it. Without weights the loader is built exactly as before.
+    """
+    weights = getattr(dataset, "sample_weights", None)
+    if weights is None:
+        return DataLoader(dataset, **dataloader_cfg)
+    kwargs = (
+        OmegaConf.to_container(dataloader_cfg, resolve=True)
+        if OmegaConf.is_config(dataloader_cfg)
+        else dict(dataloader_cfg)
+    )
+    kwargs["shuffle"] = False
+    sampler = WeightedRandomSampler(
+        torch.as_tensor(np.asarray(weights), dtype=torch.double),
+        num_samples=len(dataset),
+        replacement=True,
+    )
+    return DataLoader(dataset, sampler=sampler, **kwargs)
+
+
+def load_init_weights(model, ema_model, path) -> None:
+    """Initialize ``model`` (and ``ema_model``) from a workspace checkpoint.
+
+    Loads only the network weights (including each policy's normalizer
+    submodule); the optimizer, epoch and step counters of that run are not
+    restored, so training starts a fresh schedule from these weights. A
+    checkpoint without an EMA copy initializes the EMA model from ``model``.
+    """
+    payload = torch.load(path, map_location="cpu", pickle_module=dill, weights_only=False)
+    state_dicts = payload["state_dicts"]
+    model.load_state_dict(state_dicts["model"])
+    if ema_model is not None:
+        ema_model.load_state_dict(state_dicts.get("ema_model", state_dicts["model"]))
+
+
+def normalized_action_coverage(
+    normalizer, dataset, max_windows: int = NORMALIZER_COVERAGE_MAX_WINDOWS, seed: int = 0
+) -> Optional[Dict[str, float]]:
+    """Fraction of normalized training action targets outside [-1, 1].
+
+    Returns {"all": fraction} plus one entry per source name when the dataset
+    has several sources, or None when the dataset cannot list its targets.
+    Counts individual action coordinates over up to ``max_windows`` windows.
+    """
+    if not hasattr(dataset, "relative_actions"):
+        return None
+    actions, sources = dataset.relative_actions(max_windows=max_windows, seed=seed)
+    if len(actions) == 0:
+        return {}
+    with torch.no_grad():
+        normalized = normalizer["action"].normalize(torch.from_numpy(actions)).cpu().numpy()
+    outside = np.abs(normalized) > 1.0 + 1e-6
+    coverage = {"all": float(outside.mean())}
+    names = getattr(dataset, "source_names", None) or []
+    if len(names) > 1:
+        for source, name in enumerate(names):
+            selected = outside[sources == source]
+            if selected.size:
+                coverage[name] = float(selected.mean())
+    return coverage
+
+
+def split_batch_by_source(batch) -> List[tuple]:
+    """[(source id, count, sub-batch)] for a batch carrying per-window 'source' ids."""
+    sources = batch["source"]
+    subsets = []
+    for source in torch.unique(sources).tolist():
+        mask = sources == source
+        subsets.append((
+            int(source),
+            int(mask.sum().item()),
+            {"obs": dict_apply(batch["obs"], lambda x: x[mask]), "action": batch["action"][mask]},
+        ))
+    return subsets
 
 
 class TrainDiffusionUnetImageWorkspace:
@@ -312,25 +415,64 @@ class TrainDiffusionUnetImageWorkspace:
         cfg = copy.deepcopy(self.cfg)
 
         # Resume training if specified
+        resumed = False
         if cfg.training.resume:
             latest_ckpt_path = self.get_checkpoint_path()
             if latest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {latest_ckpt_path}")
                 self.load_checkpoint(path=latest_ckpt_path)
+                resumed = True
+
+        # Warm start (e.g. a DAgger round from the previous round's policy):
+        # network weights only; a resumed run keeps its own weights instead.
+        init_ckpt = cfg.training.get("init_ckpt", None)
+        keep_ckpt_normalizer = bool(cfg.training.get("keep_ckpt_normalizer", False))
+        if init_ckpt and not resumed:
+            print(f"Initializing model and EMA weights from {init_ckpt}")
+            load_init_weights(self.model, self.ema_model, init_ckpt)
+        if keep_ckpt_normalizer and not (resumed or init_ckpt):
+            raise ValueError(
+                "training.keep_ckpt_normalizer needs training.init_ckpt or a resumed checkpoint"
+            )
 
         # Configure dataset
         dataset = hydra.utils.instantiate(cfg.tasks.dataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
-        normalizer = dataset.get_normalizer()
+        train_dataloader = make_train_dataloader(dataset, cfg.dataloader)
 
         # Configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
 
-        # Set normalizer
-        self.model.set_normalizer(normalizer)
-        if self.ema_model is not None:
-            self.ema_model.set_normalizer(normalizer)
+        # Set normalizer. The deployed predictor un-normalizes with the
+        # checkpoint's normalizer, so a warm start that keeps it trains the
+        # weights in the same normalized space they were initialized in.
+        if keep_ckpt_normalizer:
+            shape_meta = cfg.get("shape_meta") or {}
+            required = {"action", *shape_meta.get("obs", {}).keys()}
+            missing = sorted(required - set(self.model.normalizer.params_dict.keys()))
+            if missing:
+                raise ValueError(
+                    f"training.keep_ckpt_normalizer: the checkpoint's normalizer has no {missing}; "
+                    "the task's observations differ from the checkpoint's, so refit instead"
+                )
+            print("Keeping the checkpoint's normalizer (training.keep_ckpt_normalizer)")
+        else:
+            normalizer = dataset.get_normalizer()
+            self.model.set_normalizer(normalizer)
+            if self.ema_model is not None:
+                self.ema_model.set_normalizer(normalizer)
+        source_names = getattr(dataset, "source_names", None) or []
+        if keep_ckpt_normalizer or len(source_names) > 1:
+            coverage = normalized_action_coverage(self.model.normalizer, dataset)
+            if coverage:
+                print("Normalized action targets outside [-1, 1]: " + ", ".join(
+                    f"{name} {fraction * 100:.2f}%" for name, fraction in coverage.items()))
+                worst = max(coverage.values())
+                if worst > NORMALIZER_COVERAGE_WARN_FRACTION:
+                    advice = (" Refit the normalizer and train from scratch instead."
+                              if keep_ckpt_normalizer else "")
+                    print(f"WARNING: {worst * 100:.1f}% of normalized action targets fall outside "
+                          f"[-1, 1] (> {NORMALIZER_COVERAGE_WARN_FRACTION * 100:g}%).{advice}")
 
         # Debug adjustments must precede scheduler construction.
         if cfg.training.debug:
@@ -523,6 +665,9 @@ class TrainDiffusionUnetImageWorkspace:
                 if (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = []
+                        # Multi-source data: window-count-weighted loss per source.
+                        source_loss_sums = {}
+                        source_counts = {}
                         with tqdm.tqdm(
                             val_dataloader,
                             desc=f"Validation epoch {self.epoch}",
@@ -535,6 +680,11 @@ class TrainDiffusionUnetImageWorkspace:
                                 )
                                 loss = self.model.compute_loss(batch)
                                 val_losses.append(loss)
+                                if "source" in batch:
+                                    for source, count, subset in split_batch_by_source(batch):
+                                        source_loss_sums[source] = source_loss_sums.get(source, 0.0) + (
+                                            self.model.compute_loss(subset).item() * count)
+                                        source_counts[source] = source_counts.get(source, 0) + count
                                 if (
                                     cfg.training.max_val_steps is not None
                                     and batch_idx >= (cfg.training.max_val_steps - 1)
@@ -543,6 +693,10 @@ class TrainDiffusionUnetImageWorkspace:
                         if len(val_losses) > 0:
                             val_loss = torch.stack(val_losses).mean().item()
                             step_log["val_loss"] = val_loss
+                        for source, total in source_loss_sums.items():
+                            name = (source_names[source] if source < len(source_names)
+                                    else str(source))
+                            step_log[f"val_loss/{name}"] = total / source_counts[source]
 
                 # ---------------------------
                 # 3) SAMPLING & SHORTCUT TEST
