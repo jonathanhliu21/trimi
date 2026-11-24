@@ -81,11 +81,16 @@ from data_collection.collection.replay_config import (
 
 
 class ReplayVideoRecorder:
-    """Keep an OAK pipeline warm and record frames during the replay interval."""
+    """Share one OAK pipeline for recording and live replay preview."""
 
-    def __init__(self, output: Path, config: HandRuntimeConfig) -> None:
-        self.output = output.expanduser().resolve()
+    def __init__(self, output: Path | None, config: HandRuntimeConfig, *, show: bool = False) -> None:
+        self.output = output.expanduser().resolve() if output is not None else None
         self.config = config
+        self.show = show
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._preview_cv2 = None
+        self._window_name = "Replay wrist camera (q/Esc stops replay)"
         self._ready = threading.Event()
         self._begin = threading.Event()
         self._stop = threading.Event()
@@ -101,7 +106,8 @@ class ReplayVideoRecorder:
     def prepare(self) -> None:
         """Connect and warm up the camera without recording pre-replay frames."""
 
-        self.output.parent.mkdir(parents=True, exist_ok=True)
+        if self.output is not None:
+            self.output.parent.mkdir(parents=True, exist_ok=True)
         self._thread.start()
         self._ready.wait()
         self.raise_if_failed()
@@ -114,21 +120,46 @@ class ReplayVideoRecorder:
     def finish(self) -> None:
         self._thread.join()
         self.raise_if_failed()
-        print(
-            f"Saved replay OAK video to {self.output} "
-            f"({self._frames_written} frames)"
-        )
+        if self.output is not None:
+            print(
+                f"Saved replay OAK video to {self.output} "
+                f"({self._frames_written} frames)"
+            )
 
     def stop(self) -> None:
         self._stop.set()
         self._begin.set()
         if self._thread.is_alive():
             self._thread.join()
+        if self._preview_cv2 is not None:
+            try:
+                self._preview_cv2.destroyWindow(self._window_name)
+            except self._preview_cv2.error:
+                pass  # The user may already have closed the preview window.
+            self._preview_cv2 = None
+
+    def poll_preview(self) -> None:
+        """Keep OpenCV GUI calls on the replay's main thread."""
+        if not self.show:
+            return
+        with self._frame_lock:
+            frame = self._latest_frame
+        if frame is None:
+            return
+        if self._preview_cv2 is None:
+            self._preview_cv2 = import_cv2()
+            self._preview_cv2.namedWindow(self._window_name, self._preview_cv2.WINDOW_NORMAL)
+            self._preview_cv2.resizeWindow(self._window_name, 1280, 720)
+        self._preview_cv2.imshow(self._window_name, frame)
+        key = self._preview_cv2.waitKey(1) & 0xff
+        if key in (ord('q'), 27) or self._preview_cv2.getWindowProperty(
+                self._window_name, self._preview_cv2.WND_PROP_VISIBLE) < 1:
+            raise KeyboardInterrupt
 
     def raise_if_failed(self) -> None:
         if self._error is not None:
             raise RuntimeError(
-                f"OAK video recording failed: {self._error}"
+                f"OAK replay camera failed: {self._error}"
             ) from self._error
 
     def _run(self) -> None:
@@ -161,15 +192,16 @@ class ReplayVideoRecorder:
                 if size is None:
                     raise RuntimeError("OAK camera produced no frames during warmup")
                 actual_width, actual_height = size
-                fourcc = cv2.VideoWriter_fourcc(*self.config.video_codec)
-                writer = cv2.VideoWriter(
-                    str(self.output),
-                    fourcc,
-                    float(self.config.task_camera_fps),
-                    (actual_width, actual_height),
-                )
-                if not writer.isOpened():
-                    raise RuntimeError(f"Could not open video writer: {self.output}")
+                if self.output is not None:
+                    fourcc = cv2.VideoWriter_fourcc(*self.config.video_codec)
+                    writer = cv2.VideoWriter(
+                        str(self.output),
+                        fourcc,
+                        float(self.config.task_camera_fps),
+                        (actual_width, actual_height),
+                    )
+                    if not writer.isOpened():
+                        raise RuntimeError(f"Could not open video writer: {self.output}")
                 print(
                     f"Replay camera (DepthAI/OAK): {actual_width}x{actual_height} "
                     f"@{self.config.task_camera_fps}fps"
@@ -182,14 +214,22 @@ class ReplayVideoRecorder:
                     and pipeline.isRunning()
                     and time.monotonic() < end_time
                 ):
-                    frame = queue.get().getCvFrame()
+                    packet = queue.tryGet()
+                    if packet is None:
+                        self._stop.wait(0.005)
+                        continue
+                    frame = packet.getCvFrame()
                     if frame is None:
                         continue
                     if time.monotonic() >= end_time:
                         break
                     frame = flip_frame(cv2, frame, self.config.task_camera_flip)
-                    writer.write(frame)
-                    self._frames_written += 1
+                    if self.show:
+                        with self._frame_lock:
+                            self._latest_frame = frame
+                    if writer is not None:
+                        writer.write(frame)
+                        self._frames_written += 1
         except Exception as exc:
             self._error = exc
         finally:
@@ -443,9 +483,11 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help=(
             "Record the OAK camera view during replay and save the video to PATH. "
-            "No camera is opened when omitted."
+            "The camera opens only with --output-video or --show."
         ),
     )
+    parser.add_argument("--show", action="store_true",
+                        help="Show the live OAK wrist camera during replay; q/Esc or closing the window stops replay.")
     parser.add_argument(
         "--no-piper-enable",
         action="store_true",
@@ -902,7 +944,13 @@ def build_replay_hand_config(
 
 
 def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, args) -> None:
+    # Also runs between loop iterations: relax the hand before moving the arm.
+    if hand is not None:
+        hand.disable_torque()
     if args.no_preposition:
+        if hand is not None:
+            hand.set_positions(hand.read_pos(), clip=True)
+            hand.enable_torque()
         return
     print("Moving to first synchronized pose...")
     if api is not None:
@@ -912,8 +960,6 @@ def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, arg
     if args.joint_level and api is not None and first_eef is not None:
         from scripts.piper_api.replay_trajectory import preposition_joints_linearly
 
-        if hand is not None and first_hand is not None:
-            hand.set_positions(first_hand, clip=True)
         preposition_joints_linearly(
             api,
             first_eef,
@@ -922,6 +968,10 @@ def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, arg
         )
         if args.settle_seconds > 0:
             time.sleep(args.settle_seconds)
+        from scripts.piper_api.replay_trajectory import verify_joint_start
+
+        verify_joint_start(api, first_eef)
+        move_hand_to_first_pose(hand, first_hand, args)
         return
     local_ik = (LocalIKReplay(api, args)
                 if api is not None and first_eef is not None and getattr(args, "arm_control", "pose") == "joint"
@@ -930,8 +980,6 @@ def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, arg
     period_s = 1.0 / args.piper_rate_hz if local_ik is not None else 0.05
     end_t = time.monotonic() + args.preposition_seconds
     while time.monotonic() < end_t:
-        if hand is not None and first_hand is not None:
-            hand.set_positions(first_hand, clip=True)
         if api is not None and first_eef is not None:
             if local_ik is not None:
                 local_ik.command(api, first_eef, time.monotonic() - started)
@@ -940,6 +988,24 @@ def move_to_first_pose(hand, api, hand_stream, piper_stream, start_s: float, arg
         time.sleep(period_s)
     if args.settle_seconds > 0:
         time.sleep(args.settle_seconds)
+    move_hand_to_first_pose(hand, first_hand, args)
+
+
+def move_hand_to_first_pose(hand, target, args) -> None:
+    if hand is None:
+        return
+    if target is None:
+        target = hand.read_pos()
+    # Replace any previous replay goal before restoring torque.
+    hand.set_positions(target, clip=True)
+    hand.enable_torque()
+    try:
+        hand.set_positions_blocking(
+            target, clip=True, tolerance_rad=0.05,
+            timeout_s=max(5.0, args.preposition_seconds),
+        )
+    except TimeoutError:
+        print("WARNING: hand did not reach the replay start within the timeout.", flush=True)
 
 
 def main() -> int:
@@ -1077,8 +1143,6 @@ def main() -> int:
                     config.follower_profile_acceleration_rad_s2
                 ),
             )
-            hand.set_positions(hand.read_pos(), clip=True)
-            hand.enable_torque()
             if args.output_current is not None:
                 current_recorder = ReplayCurrentRecorder(tuple(hand.motor_ids))
             if args.use_follower:
@@ -1153,8 +1217,11 @@ def main() -> int:
             if api is not None:
                 api.set_speed_percent(args.replay_speed_percent)
 
-            if args.output_video is not None:
-                video_recorder = ReplayVideoRecorder(loop_output(args.output_video), config)
+            if args.output_video is not None or args.show:
+                video_recorder = ReplayVideoRecorder(
+                    loop_output(args.output_video) if args.output_video is not None else None,
+                    config, show=args.show,
+                )
                 video_recorder.prepare()
 
             if args.use_mocap:
@@ -1197,6 +1264,7 @@ def main() -> int:
                         mocap_recorder.raise_if_failed()
                     if video_recorder is not None:
                         video_recorder.raise_if_failed()
+                        video_recorder.poll_preview()
                     if arm_errors:
                         raise arm_errors[0]
                     deadline = wall_start + tick * hand_period_s
@@ -1239,6 +1307,7 @@ def main() -> int:
                         mocap_recorder.raise_if_failed()
                     if video_recorder is not None:
                         video_recorder.raise_if_failed()
+                        video_recorder.poll_preview()
                 if arm_errors:
                     raise arm_errors[0]
             if video_recorder is not None:

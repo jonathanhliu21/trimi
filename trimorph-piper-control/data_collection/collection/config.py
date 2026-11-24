@@ -88,6 +88,16 @@ KINESTHETIC_HAND_OPERATING_MODE = 3
 # data_trimorph_unscrew_cap_0 (Vicon poses, one start group), median flange
 # (229, -249, 130) mm, mean Euler xyz (163, -1, 84) deg; starts spread ~20 mm / ~6 deg.
 PIPER_START_JOINTS_DEG = {
+    # Captured from passive can0 joint feedback, 2026-11-24 11:38:22 PST.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    # close to first obj
+    # "home_multi": (37.111, 98.764, -36.960, 43.384, -53.799, 83.866),
+    # Captured from passive can0 joint feedback, 2026-11-24 13:38:02 PST.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    "home_multi": (40.973, 106.673, -36.233, 47.489, -60.137, 82.627),
+    # Captured from passive can0 joint feedback, 2026-11-24 12:31:07 PST.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    # "home_multi": (48.450, 100.123, -30.767, 71.215, -64.472, 76.677),
     # home_cube_newhw geometry, checked with robot1_trimi.json on 2026-11-22:
     # |g/alpha| J1=5.002, J2=3.110 N*m (<6.5). Validate again at launch.
     "kinesthetic": (-42.630, 98.166, -69.691, -29.638, 50.366, 55.604),
@@ -129,6 +139,13 @@ PIPER_START_JOINTS_DEG = {
 }
 # Median first processed_encoder_t row (motors 0..12, leader radians) of the same episodes.
 HAND_START_POSITIONS_RAD = {
+    # Captured from read-only present-position registers, 2026-11-24 11:05:01 PST.
+    # Motors 0..12; calibration: xl330_new_hand_transparent.yaml.
+    "home_multi": (0.015097795053919505, -0.23125204192653737, -3.1570487071569704,
+                  -8.481049130201392, 0.013126211333257976, -0.266000042304442,
+                  -0.19708719484235138, -0.1172621556370208, 0.017786403454401523,
+                  -0.24390294527381684, -0.36576704327449505, -0.39792239006260743,
+                  1.5577281536969148),
     # Transparent-hand home_cube_newhw start clipped to its recorded YAML limits.
     "kinesthetic": (-0.000242, 0.268826, -3.327321, -7.528447, 0.0, -0.370311,
                     0.019204, 0.0, -0.01, -0.030680, 0.0, 0.0, 0.198621),

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -12,7 +13,15 @@ import time
 import urllib.error
 import urllib.request
 
-CAMPAIGN = 'palm_multi_dinov3_20261123_01'
+CAMPAIGN = os.environ.get('TRIMI_CAMPAIGN', 'palm_multi_dinov3_20261123_01')
+if not CAMPAIGN or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in CAMPAIGN):
+    raise ValueError('TRIMI_CAMPAIGN must be a simple experiment directory name')
+DATASET_NAME = os.environ.get('TRIMI_DATASET_NAME', 'data_trimorph_palm_pick_place_multi')
+if not DATASET_NAME or Path(DATASET_NAME).name != DATASET_NAME:
+    raise ValueError('TRIMI_DATASET_NAME must be a dataset directory name')
+CHECKPOINT_TOPK = int(os.environ.get('TRIMI_CHECKPOINT_TOPK', '2'))
+if CHECKPOINT_TOPK < 0:
+    raise ValueError('TRIMI_CHECKPOINT_TOPK must be nonnegative')
 BASE = Path('/workspace/experiments') / CAMPAIGN
 MODE = os.environ.get('TRIMI_OBSERVATION_MODE', '')
 RUN = BASE / 'runs' / MODE
@@ -112,8 +121,11 @@ def main():
         if path.stat().st_size != artifact['size'] or digest(path) != artifact['sha256']:
             raise RuntimeError('Artifact checksum mismatch: ' + artifact['key'])
         print('Checksum verified:', artifact['key'], flush=True)
-    if os.statvfs('/workspace').f_bavail * os.statvfs('/workspace').f_frsize < 12 * 1024**3:
-        raise RuntimeError('Less than 12 GiB free on checkpoint volume')
+    free_gib = os.statvfs('/workspace').f_bavail * os.statvfs('/workspace').f_frsize / 1024**3
+    minimum_free_gib = float(os.environ.get('TRIMI_MIN_FREE_GIB', '12'))
+    print(f'Checkpoint volume free space: {free_gib:.2f} GiB', flush=True)
+    if free_gib < minimum_free_gib:
+        raise RuntimeError(f'Less than {minimum_free_gib:g} GiB free on checkpoint volume')
     status('extracting')
     LOCAL.mkdir(parents=True, exist_ok=True)
     for archive, destination in [('source.tar.gz', LOCAL / 'code'),
@@ -136,20 +148,20 @@ def main():
              'python-dotenv'], 'install.log', 1800)
     common = [python, '-u', 'shortcut_policy/unet_shortcut/train_unet_image_shortcut_policy.py',
               '--config-name=train_unet_image_trimi_hand_cond_dinov3_shortcut_policy',
-              'tasks.dataset.dataset_path=' + str(LOCAL / 'datasets/data_trimorph_palm_pick_place_multi'),
+              'tasks.dataset.dataset_path=' + str(LOCAL / 'datasets' / DATASET_NAME),
               'policy.obs_encoder.vision_backbone.weights=/workspace/models/dinov3_vits16_pretrain_lvd1689m-08c60483.pth',
               'policy.obs_encoder.vision_backbone.repo=' + str(LOCAL / 'dinov3'),
               'policy.obs_encoder.vision_backbone.source=local',
               'training.freeze_encoder=false', 'policy.obs_encoder.vision_backbone.trainable=true',
               '+training.verify_backbone_gradients=true', 'logging.project=trimi-training',
-              'training.checkpoint_every=10', 'checkpoint.topk.k=2',
+              'training.checkpoint_every=10', f'checkpoint.topk.k={CHECKPOINT_TOPK}',
               'training.seed=42', 'tasks.dataset.seed=42']
     if MODE == 'camera_hand':
-        common += ['+tasks.shape_meta.obs.hand_pose_abs={shape:[13],type:low_dim}']
+        common += ['++tasks.shape_meta.obs.hand_pose_abs={shape:[13],type:low_dim}']
     metadata = dict(campaign=CAMPAIGN, mode=MODE, pod_id=os.environ['RUNPOD_POD_ID'],
                     observations=['camera_0'] + (['hand_pose_abs'] if MODE == 'camera_hand' else []),
                     epochs=500, batch_size=256, seed=42, checkpoint_directory=str(RUN / 'checkpoints'),
-                    checkpoint_policy='latest plus best 2 by train_loss, every 10 epochs and final',
+                    checkpoint_policy=f'latest plus best {CHECKPOINT_TOPK} by train_loss, every 10 epochs and final',
                     command=common, wandb_project='trimi-training',
                     max_runtime_seconds=float(os.environ.get('MAX_RUNTIME_SECONDS', '86400')))
     (RUN / 'run_metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
@@ -161,6 +173,11 @@ def main():
         raise RuntimeError('DINOv3 gradient and weight-update check did not pass')
     reload_code = "import torch,dill; p=torch.load(" + repr(str(RUN / 'smoke/checkpoints/latest.ckpt')) + ",map_location='cpu',pickle_module=dill,weights_only=False); assert 'model' in p['state_dicts']; print('Checkpoint reload verified')"
     command([python, '-c', reload_code], 'reload.log', 300)
+    if os.environ.get('TRIMI_KEEP_SMOKE_CHECKPOINTS', '1') == '0':
+        # Discard only this run's two-step test weights after the reload succeeds.
+        # Full-training checkpoints, resolved test configs, and logs are retained.
+        shutil.rmtree(RUN / 'smoke' / 'checkpoints')
+        os.sync()
     status('training', backbone_verified=True, checkpoint_reload_verified=True)
     remaining = max(1, int(float(os.environ.get('MAX_RUNTIME_SECONDS', '86400')) - (time.time() - started) - 180))
     command(common + ['hydra.run.dir=' + str(RUN), 'training.num_epochs=500',

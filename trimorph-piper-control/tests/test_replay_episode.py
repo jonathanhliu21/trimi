@@ -520,6 +520,51 @@ class ReplayEpisodeTests(unittest.TestCase):
         ):
             self.assertEqual(parse_args().output_video, Path("replay.mp4"))
 
+    def test_show_cli_is_opt_in_and_does_not_require_video_output(self):
+        with patch('sys.argv', ['replay_episode.py']):
+            self.assertFalse(parse_args().show)
+        with patch('sys.argv', ['replay_episode.py', '--show']):
+            args = parse_args()
+            self.assertTrue(args.show)
+            self.assertIsNone(args.output_video)
+
+    def test_preview_shares_camera_frames_with_optional_recording(self):
+        from data_collection.replay_episode import ReplayVideoRecorder
+
+        for output in (None, Path('/tmp/replay_preview_test.mp4')):
+            with self.subTest(output=output), ExitStack() as stack:
+                cv2, dai, config = MagicMock(), MagicMock(), MagicMock()
+                config.task_camera_fps = 30
+                pipeline = dai.Pipeline.return_value.__enter__.return_value
+                pipeline.isRunning.side_effect = [True, False]
+                queue = pipeline.create.return_value.build.return_value.requestOutput.return_value.createOutputQueue.return_value
+                frame = np.zeros((2, 3, 3), dtype=np.uint8)
+                queue.tryGet.return_value.getCvFrame.return_value = frame
+                stack.enter_context(patch('data_collection.replay_episode.import_cv2', return_value=cv2))
+                stack.enter_context(patch('data_collection.replay_episode.import_depthai', return_value=dai))
+                stack.enter_context(patch('data_collection.replay_episode.require_depthai_device'))
+                stack.enter_context(patch('data_collection.replay_episode.apply_camera_control'))
+                stack.enter_context(patch('data_collection.replay_episode.warmup_color_queue', return_value=(3, 2)))
+                flip = stack.enter_context(patch('data_collection.replay_episode.flip_frame', return_value=frame))
+                stack.enter_context(patch('data_collection.replay_episode.time.monotonic', return_value=0.))
+                recorder = ReplayVideoRecorder(output, config, show=True)
+                recorder.start(0., 1.)
+                recorder._run()
+                recorder.raise_if_failed()
+                self.assertIs(recorder._latest_frame, frame)
+                flip.assert_called_once()
+                if output is None:
+                    cv2.VideoWriter.assert_not_called()
+                else:
+                    cv2.VideoWriter.return_value.write.assert_called_once_with(frame)
+                    cv2.VideoWriter.return_value.release.assert_called_once()
+                cv2.waitKey.return_value = ord('q')
+                with self.assertRaises(KeyboardInterrupt):
+                    recorder.poll_preview()
+                cv2.imshow.assert_called_once_with(recorder._window_name, frame)
+                recorder.stop()
+                cv2.destroyWindow.assert_called_once_with(recorder._window_name)
+
     def test_arm_diagnostics_cli_is_opt_in(self):
         with patch("sys.argv", ["replay_episode.py"]):
             args = parse_args()
@@ -877,6 +922,7 @@ class ReplayEpisodeTests(unittest.TestCase):
         from unittest.mock import Mock
 
         api = Mock()
+        api.get_joint_angles.return_value = [0.5] * 6
         args = SimpleNamespace(
             no_preposition=False,
             joint_level=True,
@@ -891,6 +937,61 @@ class ReplayEpisodeTests(unittest.TestCase):
         np.testing.assert_allclose(ramp.call_args.args[1], [0.5] * 6)
         api.set_speed_percent.assert_called_once_with(30)
         api.move_eef.assert_not_called()
+
+    def test_hand_torque_stays_off_until_cartesian_preposition_finishes(self):
+        events = MagicMock()
+        hand, api = events.hand, events.api
+        args = self.local_ik_args()
+        args.arm_control = "pose"
+        args.settle_seconds = .2
+        hand_stream = (np.array([0.]), np.zeros((1, 13)))
+        arm_stream = (np.array([0.]), np.zeros((1, 6)))
+        clock = SimpleNamespace(now=0.)
+        def sleep(seconds):
+            events.sleep(seconds)
+            clock.now += seconds
+        with (patch('data_collection.replay_episode.time.monotonic', side_effect=lambda: clock.now),
+              patch('data_collection.replay_episode.time.sleep', side_effect=sleep)):
+            # A second call represents returning to start between loop iterations.
+            for _ in range(2):
+                events.reset_mock()
+                move_to_first_pose(hand, api, hand_stream, arm_stream, 0., args)
+                names = [call[0] for call in events.mock_calls]
+                self.assertEqual(names[0], 'hand.disable_torque')
+                self.assertLess(names.index('api.move_eef'), names.index('hand.set_positions'))
+                self.assertLess(max(i for i, name in enumerate(names) if name == 'sleep'),
+                                names.index('hand.enable_torque'))
+                self.assertLess(names.index('hand.set_positions'), names.index('hand.enable_torque'))
+                self.assertLess(names.index('hand.enable_torque'), names.index('hand.set_positions_blocking'))
+
+    @patch('scripts.piper_api.replay_trajectory.verify_joint_start')
+    @patch('scripts.piper_api.replay_trajectory.preposition_joints_linearly')
+    def test_joint_preposition_failure_keeps_hand_torque_off(self, ramp, verify):
+        hand, api = MagicMock(), MagicMock()
+        args = self.local_ik_args()
+        args.joint_level = True
+        args.max_joint_step_rad = 1.
+        hand_stream = (np.array([0.]), np.zeros((1, 13)))
+        arm_stream = (np.array([0.]), np.zeros((1, 6)))
+        for failed_operation in (ramp, verify):
+            with self.subTest(operation=failed_operation):
+                hand.reset_mock()
+                ramp.side_effect = verify.side_effect = None
+                failed_operation.side_effect = RuntimeError('arm failed')
+                with self.assertRaisesRegex(RuntimeError, 'arm failed'):
+                    move_to_first_pose(hand, api, hand_stream, arm_stream, 0., args)
+                hand.disable_torque.assert_called_once()
+                hand.enable_torque.assert_not_called()
+                hand.set_positions.assert_not_called()
+
+    def test_no_preposition_restores_hand_torque_at_measured_pose(self):
+        hand = MagicMock()
+        hand.read_pos.return_value = np.zeros(13)
+        args = self.local_ik_args()
+        args.no_preposition = True
+        move_to_first_pose(hand, None, None, None, 0., args)
+        self.assertEqual([call[0] for call in hand.mock_calls],
+                         ['disable_torque', 'read_pos', 'set_positions', 'enable_torque'])
 
 
 if __name__ == "__main__":

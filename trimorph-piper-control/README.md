@@ -499,6 +499,17 @@ Hand replay always selects Dynamixel pure position-control mode (`3`) for
 faithful pose tracking. This is an in-memory replay override; it does not alter
 the hand YAML or the current-based position mode used during collection.
 
+Hand torque stays off during Piper prepositioning and its settling period,
+including between `--loop` iterations. Replay then writes the first hand target
+before enabling hand torque and waiting for the hand to reach it. If the arm
+prepositioning fails, hand torque remains off. With `--no-preposition`, torque
+is restored at the measured hand pose before playback.
+
+Add `--show` to display the live OAK wrist camera during replay. Press q/Esc
+or close the window to stop replay. Preview works on its own or together with
+`--output-video output/replay.mp4` using the same camera connection. The camera
+view uses the collection settings and flip; preview starts after prepositioning.
+
 Replay just episode 42's hand stream and record graph-compatible current
 telemetry at the replay logger's fixed 10 Hz sampling rate:
 
