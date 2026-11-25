@@ -173,7 +173,7 @@ class DaggerDatasetTests(unittest.TestCase):
             built = make_dataset(roots, shape_meta=meta, use_cache=True)
             # The cache file is per root and named exactly as for a single root.
             key = {"shape_meta": SHAPE_META, "first_cut": 0, "encoder_window": 0,
-                   "sync_downsample_stride": 1}
+                   "sync_downsample_stride": 1, "buffer_format": 2}
             name = f"midas_{hashlib.md5(json.dumps(key, sort_keys=True).encode('utf-8')).hexdigest()}.zarr.zip"
             self.assertTrue((root_a / name).is_file())
             self.assertTrue((root_b / name).is_file())
@@ -183,10 +183,42 @@ class DaggerDatasetTests(unittest.TestCase):
                 np.testing.assert_array_equal(dataset.episode_source, plain.episode_source)
                 np.testing.assert_array_equal(dataset.replay_buffer.episode_ends[:],
                                               plain.replay_buffer.episode_ends[:])
-                for key in ("action", "camera_0"):
+                for key in ("action", "camera_0", "train_row"):
                     np.testing.assert_array_equal(dataset.replay_buffer[key][:], plain.replay_buffer[key][:])
             np.testing.assert_array_equal(single.replay_buffer["action"][:],
                                           plain.replay_buffer["action"][30:])
+
+    def test_train_mask_drops_windows_that_touch_excluded_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "dagger"
+            write_root(root, n_episodes=2, steps=10, slope=SLOPES["root_b"])
+            mask = np.ones(10, dtype=bool)
+            mask[4:6] = False  # a kinesthetic handoff between policy and human control
+            for path in sorted((root / "syncs").glob("*.npz")):
+                with np.load(path) as sync:
+                    arrays = dict(sync)
+                np.savez(path, **arrays, train_mask=mask)
+            dataset = make_dataset([str(self.root_a), str(root)], val_ratio=0.)
+            # horizon 4 over 10 rows: windows start at 0..6; starts 1..5 touch rows 4-5.
+            self.assertEqual(len(dataset), 8 * 7 + 2 * 2)
+            row = dataset.replay_buffer["train_row"][:]
+            self.assertTrue(row[:80].all())
+            np.testing.assert_array_equal(row[80:90], mask)
+            ends = dataset.replay_buffer.episode_ends[:]
+            for start, end, *_ in dataset.sampler.indices:
+                self.assertTrue(row[start:end].all())
+            starts = [int(s - ends[8]) for s, *_ in dataset.sampler.indices if ends[8] <= s < ends[9]]
+            self.assertEqual(starts, [0, 6])
+            actions, sources = dataset.relative_actions()
+            self.assertEqual(len(actions), len(dataset))
+            np.testing.assert_array_equal(sources, dataset.window_source)
+            # Validation windows are filtered the same way.
+            split = make_dataset(str(root), val_ratio=.5)
+            self.assertEqual(len(split.get_validation_dataset()), 2)
+            # The mask follows the sync stride: rows 0,2,4,6,8 keep [T,T,F,T,T].
+            strided = make_dataset(str(root), val_ratio=0., horizon=2, sync_downsample_stride=2)
+            np.testing.assert_array_equal(strided.replay_buffer["train_row"][:5], mask[::2])
+            self.assertEqual(len(strided), 2 * 2)
 
     def test_output_dirs_use_the_first_root(self):
         import shortcut_policy.unet_shortcut.train_unet_image_shortcut_policy  # noqa: F401 (resolvers)

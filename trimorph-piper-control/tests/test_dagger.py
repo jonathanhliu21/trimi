@@ -110,8 +110,11 @@ class DaggerFakeRobot(FakeRobot):
     def apply_action(self, action):
         super().apply_action(action)
         self.applied += 1
-        self.piper_log.rows.append({"monotonic_ns": time.monotonic_ns(),
-                                    **{f"joint_{i}": "0.1" for i in range(1, 7)}, "fw_x": "0.3"})
+        now = time.monotonic_ns()
+        self.piper_log.rows.append({"monotonic_ns": now, "joint_timestamp_s": "1700000000.000000",
+                                    "joint_rx_monotonic_ns": now - 2_000_000,
+                                    **{f"joint_{i}": "0.1" for i in range(1, 7)}, "fw_x": "0.3",
+                                    "fw_timestamp_s": "1700000000.001000"})
 
     def return_to_start(self, args):
         self.returns += 1
@@ -131,8 +134,7 @@ def make_session(root, robot, pedals, takeover=None, *, args=None, log=None):
     args = args or dagger_args(root, "--takeover", "kinesthetic")
     return dagger.DaggerSession(args, robot, FakeCamera(), pedals, takeover or fake_takeover(),
                                 video=FakeVideo(), follower=FakeSampler(), label_hand=None,
-                                log=log if log is not None else RunLog(Path(root) / "runs"),
-                                fk=lambda q: np.r_[np.asarray(q[:3]), 0.0, 0.0, 0.0])
+                                log=log if log is not None else RunLog(Path(root) / "runs"))
 
 
 class PedalTests(unittest.TestCase):
@@ -303,8 +305,14 @@ class SessionTests(unittest.TestCase):
             self.assertTrue((path / name).is_file(), name)
         piper = read_csv(path / "piper.csv")
         self.assertEqual(len(piper), 1)
-        self.assertAlmostEqual(float(piper[0]["x"]), 0.1)  # FK of the measured joints
-        self.assertEqual(piper[0]["fw_x"], "0.3")
+        # Data collection's layout: the firmware pose in x..yaw, the joints' CAN receive times.
+        self.assertEqual(list(piper[0]), list(dagger.PIPER_FIELDS))
+        self.assertEqual(piper[0]["x"], "0.3")
+        self.assertEqual(piper[0]["joint_1"], "0.1")
+        self.assertEqual(int(piper[0]["monotonic_ns"]) - int(piper[0]["joint_rx_monotonic_ns"]), 2_000_000)
+        self.assertEqual((piper[0]["robot_timestamp_s"], piper[0]["eef_timestamp_s"]),
+                         ("1700000000.000000", "1700000000.001000"))
+        self.assertEqual(metadata["piper"]["training_pose_source"], "piper_fk")
         self.assertEqual([row["source"] for row in read_csv(path / "commands.csv")], ["policy"])
         self.assertIn("takeover", [row["event"] for row in read_csv(path / "events.csv")])
         self.assertEqual(len(read_csv(path / "leader_hand.csv")), 1)
@@ -677,6 +685,31 @@ class KinestheticTakeoverTests(unittest.TestCase):
 
 
 # Compact raw-to-training export coverage lives in test_dagger_export.py.
+
+
+class PiperLogTests(unittest.TestCase):
+    def test_one_row_per_joint_frame_on_its_can_receive_clock(self):
+        from inference.executor.executor import PiperFeedbackLogger
+
+        state = {"joints": None}
+        api = SimpleNamespace(get_joint_state=lambda: state["joints"], get_motor_state=lambda: None,
+                              get_eef_state=lambda: None, robot=SimpleNamespace(get_arm_status=lambda: None))
+        log = PiperFeedbackLogger(api)
+        log.stop()  # sample by hand from here on
+        log.rows.clear()
+        wall = time.time()
+        # The second poll sees the first frame again; the fourth stamp goes back in time
+        # (a wall-clock step) and is dropped; the last one is not on the host clock.
+        for stamp in (wall - 0.004, wall - 0.004, wall - 0.001, wall - 0.010, 5.0):
+            state["joints"] = SimpleNamespace(timestamp=stamp, joints=[0.1] * 6)
+            log.sample()
+        self.assertEqual(len(log.rows), 3)
+        for row, age_ms in zip(log.rows, (4, 1)):
+            lag_ms = (row["monotonic_ns"] - row["joint_rx_monotonic_ns"]) / 1e6
+            self.assertGreaterEqual(lag_ms, age_ms - 0.01)
+            self.assertLess(lag_ms, age_ms + 50)
+        self.assertLess(log.rows[0]["joint_rx_monotonic_ns"], log.rows[1]["joint_rx_monotonic_ns"])
+        self.assertEqual(log.rows[2]["joint_rx_monotonic_ns"], "")
 
 
 if __name__ == "__main__":

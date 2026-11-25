@@ -2,7 +2,7 @@
 
 ## Summary
 
-The policy runs on the robot. When it starts to go wrong, the operator steps on the takeover pedal and finishes the episode. Only the human-controlled part becomes training data (HG-DAgger, Kelly et al. 2019). The next policy trains on D0 ∪ H1 ∪ … ∪ Hk.
+The policy runs on the robot. When it starts to go wrong, the operator steps on the takeover pedal and finishes the episode: a human-gated takeover, as in HG-DAgger (Kelly et al. 2019). Each successful rollout with a takeover is exported whole, with every frame labeled `policy`, `human` or `handoff`. The next policy trains from scratch on D0 and the exported rollouts.
 
 **Decisions:**
 - **Both takeovers**, chosen per run with `--takeover`:
@@ -10,7 +10,7 @@ The policy runs on the robot. When it starts to go wrong, the operator steps on 
   - `kinesthetic`: the arm runs the calibrated gravity compensation and the hand goes limp, so the operator moves both directly.
 - **One-way.** After a takeover the operator finishes the episode; control never returns to the policy.
 - **Three pedals:** takeover, success, failure. Holding the failure pedal discards the episode.
-- **Training data:** only human-controlled intervals. Policy rows are recorded for metrics.
+- **Training data (2026-11-24):** the whole rollout, with no preintv label and no source weights; train from scratch. Every frame trains except a kinesthetic takeover's ~1 s handoff (takeover pedal to `active`: the arm held by the releasing hold, the hand limp), which is labeled and kept out of training windows; `--train-handoff` keeps it too. `--trim` remains for correction-only (strict HG-DAgger) exports.
 
 **Status:** implemented and unit-tested without hardware; nothing has run on the robot yet. Before the first round, go through the bench checklist below, especially the kinesthetic entry and exit.
 
@@ -18,8 +18,8 @@ The policy runs on the robot. When it starts to go wrong, the operator steps on 
 
 HG-DAgger changes only the data; `compute_loss` (`unet_image_shortcut_policy.py:141-162`) is untouched. Three properties of the flow/shortcut policy decide how the data is mixed:
 - **Multimodal fit.** A correction that differs from D0 in a similar state adds a mode. It is not averaged with the old one, as MSE behavior cloning would do.
-- **The failing mode stays.** It is not removed, only made less likely as the corrections gain weight. That is why each batch draws a fixed share from the DAgger roots.
-- **Chunking.** A window's target is the next 16 rows (about 1.07 s at 15 Hz). Each human interval is exported as its own episode, so no target reaches into rows the policy controlled.
+- **The failing mode stays.** Corrections add modes; they don't remove the failing one. Policy frames up to the takeover also train, and without source weights the corrections count in proportion to their frames.
+- **Chunking.** A window's target is the next 16 rows (about 1.07 s at 15 Hz). The trainer skips every window that touches a handoff frame, so a window that starts where the policy was failing never gets "stop and let the fingers go" as its target. The last ~1 s of policy frames before a kinesthetic takeover therefore start no window; they still train as targets of earlier windows. Teleop has no handoff: windows run straight from the policy into the correction.
 
 ## Running a round
 
@@ -109,9 +109,16 @@ python3 scripts/dagger/export_dataset.py data_dagger_<task>_r1 --out data_dagger
 
 The exporter selects complete, successful raw rollouts with human intervals, copies
 each selected rollout to staging, calls the shared `postprocess_dataset.py` pipeline
-with Piper poses, then exports either full rollouts or trimmed corrections:
-- **Default (no `--trim`):** one episode per qualifying rollout, with the unchanged full video, full hand/arm arrays and syncs covering EVERY video frame, including policy execution and correction. Human intervals remain in metadata and an `intervention` annotation is added to syncs. The trainer does not use this annotation to filter: it trains on the full retained rollout.
-- **`--trim`:** each human interval becomes a separate compact episode. Only correction frames remain, after the start trim (400 ms teleop, 0 kinesthetic). Videos are re-encoded, arrays sliced, and indices remapped. This mode trains on human corrections only.
+with `--pose-source piper_fk` (FK of the joints on their CAN receive clock, as
+kinesthetic collection), then exports either full rollouts or trimmed corrections:
+- **Default (no `--trim`):** one episode per qualifying rollout, with the unchanged full video, full hand/arm arrays and syncs covering EVERY video frame. The syncs label each frame in `control`:
+  - `policy`: before the takeover pedal was read;
+  - `human`: from the takeover to the end (teleop: including the hand ramp and clutch-released pauses; kinesthetic: from `active`, including the freeze after the end pedal);
+  - `handoff`: kinesthetic only, from the takeover to `active`: the arm is held by the releasing position hold and the hand is limp, so nobody drives the robot.
+
+  Every frame trains except the handoff: `train_mask` (False on handoff frames) makes the trainer skip every window that touches one, and `--train-handoff` keeps them too. `intervention` marks the human frames. Teleop rollouts label the hand with the follower's measured angles until the hand ramp after the takeover ends (the worn leader was idle before it), then with the leader's; the original leader stream stays in `leader.csv`. `segments.json` counts each rollout's frames per label.
+- **`--trim`:** each human interval becomes a separate compact episode. Only correction frames remain, after the start trim (the teleop hand ramp, 0 kinesthetic). Videos are re-encoded, arrays sliced, and indices remapped. This mode trains on human corrections only.
+- Rollouts recorded before the Piper log had CAN receive times fall back to `--pose-source piper` (poll-time FK), with a warning.
 - A correction interval must have at least 32 camera rows by default (`--min-rows`). In full mode, at least one interval must meet that threshold to retain the rollout. In trimmed mode, short intervals are skipped individually.
 - In both modes, camera/sample timing differences above `--max-sync-error-ms` (default 10) produce warnings and retain nearest samples, matching shared postprocessing. Invalid indices, non-increasing timestamps, and video/frame-count mismatches still fail validation.
 - It always requires success AND a human correction; failed, interrupted and policy-only rollouts are excluded before processing.
@@ -122,16 +129,17 @@ with Piper poses, then exports either full rollouts or trimmed corrections:
 
 ### 5. Train (diffusion-policies)
 
+From scratch, every training window drawn uniformly (no source weights):
+
 ```bash
 python shortcut_policy/unet_shortcut/train_unet_image_shortcut_policy.py \
   --config-name=train_unet_image_trimi_hand_cond_dinov2_shortcut_policy \
   'tasks.dataset.dataset_path=[/data/D0,/data/data_dagger_<task>_r1_human]' \
-  'tasks.dataset.source_weights=[0.8,0.2]' \
-  training.init_ckpt=/path/to/previous/checkpoints/latest.ckpt \
-  training.keep_ckpt_normalizer=true \
-  training.num_epochs=100 optimizer.lr=5e-5 training.lr_warmup_steps=100 \
   exp_name=trimi_dagger_r1
 ```
+
+Windows that touch a handoff frame (syncs `train_mask`) are skipped in training,
+validation and the normalizer fit; D0 has no mask, so all its windows train.
 
 **Several roots.**
 - Roots load in order, one replay buffer.
@@ -139,19 +147,7 @@ python shortcut_policy/unet_shortcut/train_unet_image_shortcut_policy.py \
 - Validation also logs `val_loss/<root name>`.
 - Outputs go under the first root.
 
-**Weights.**
-- `source_weights` sets each root's share of the training draws (a `WeightedRandomSampler`); weights can also be given by name.
-- Pick the share from the per-root `train windows` the trainer prints, so that a DAgger window is drawn about 10–20 times as often as a D0 window:
-
-  share ≈ r · n_dagger / (n_D0 + r · n_dagger), with r = 10–20.
-
-  Example: 150 demos of about 20 s are about 45,000 windows; 10 takeovers of about 5 s are about 700. That gives a share of about 0.2.
-- Raise the share as rounds accumulate, up to about 0.5. Plain aggregation (r = 1) drowns the corrections. A much larger share repeats the same few windows thousands of times and forgets the nominal behavior.
-- Keep the batch size of the D0 training (256); the share, not the batch size, sets the mix.
-
-**Warm start.**
-- `init_ckpt` loads only the model and EMA weights.
-- `keep_ckpt_normalizer` keeps the checkpoint's normalizer, which the predictor un-normalizes with. The trainer prints the share of normalized DAgger targets outside [-1, 1]; above 1%, refit the normalizer and train from scratch instead.
+**Not used in this plan, still available:** `tasks.dataset.source_weights` (each root's share of the training draws) and the warm start `training.init_ckpt` / `training.keep_ckpt_normalizer`.
 
 **Round 1 without the new options:** copy the exported episodes into the D0 root after its indices, and retrain from scratch.
 
@@ -173,7 +169,7 @@ python shortcut_policy/unet_shortcut/train_unet_image_shortcut_policy.py \
   - Disengage on a stale Quest (0.15 s), a Quest jump (50 mm) or a persistent tracking error.
 - **Arm commands.** One IK step per tick at 60 Hz through the executor's `JointController`, with the same joint margins, |J5| ≥ 10° and speed caps as the policy.
 - **Hand.** The leader TriMI is read at 100 Hz with torque off. The follower ramps from the policy's last hand target to the leader over 0.4 s, then follows it through the existing `HandCommandWriter`. No force feedback yet; see open items.
-- **Labels.** Arm: the measured flange pose (FK of the measured joints). Hand: the leader's angles, the operator's intent including squeeze, as in D0.
+- **Labels.** Arm: FK of the measured joints on their CAN receive clock. Hand: the follower's measured angles until the hand ramp after the takeover ends, then the leader's angles, the operator's intent including squeeze, as in D0 (set at export).
 
 ### Kinesthetic (`--takeover kinesthetic`)
 
@@ -208,29 +204,29 @@ The executor runs gravity_comp's `DragController` itself, on its own CAN connect
 - Stale feedback freezes the arm, puts it in position hold, and stops the executor. Freshness uses the joint-stream and all six motor timestamps, not unchanged position/velocity values. The error names the source (e.g. `motor5`).
 - Ctrl-C freezes the arm, puts it in position hold, and stops the executor. Ctrl-C is caught during the loop; it never leaves the arm in MIT mode without a hold.
 
-**Labels.** Arm: FK of the measured joints. Hand: the follower's measured angles. These record no squeeze.
+**Labels.** Arm: FK of the measured joints on their CAN receive clock. Hand: the follower's measured angles. These record no squeeze.
 
 ## Recording
 
-Each rollout is `DATASET_ROOT/raw/episode_N/`, in the collection layout. `postprocess_dataset.py --pose-source piper` reads it as is.
+Each rollout is `DATASET_ROOT/raw/episode_N/`, in the collection layout. `postprocess_dataset.py --pose-source piper_fk` reads it as is.
 
 | File | Contents |
 |---|---|
 | `camera.mp4`, `camera_timestamps.csv` | every frame with its DepthAI capture time, as collection records it |
 | `leader_hand.csv` | the hand label stream: leader (teleop) or follower (kinesthetic), `pos_0..pos_12` |
 | `follower.csv` | follower measured angles and commanded target, 50 Hz |
-| `piper.csv` | 200 Hz: `x..yaw` = FK of the measured joints, plus joints, firmware pose, velocities, currents, status |
+| `piper.csv` | as kinesthetic collection records it: one row per joint feedback frame (polled at 250 Hz, deduplicated), with its CAN receive time on the host clock (`joint_rx_monotonic_ns`), joints, the firmware flange pose in `x..yaw`, velocities, currents, status |
 | `commands.csv` | every arm target, tagged `policy` or `teleop` |
 | `events.csv` | executor and DAgger events: start, takeover, engage/disengage, mit_switch, active, freeze, end |
 | `chunks.npz` | the policy's chunks, as the executor run log |
 | `quest.csv` / `gravity_comp.csv` | Quest packets (teleop) / every MIT cycle, source timestamps, stale source/read errors, and commanded kp/kd (kinesthetic) |
-| `metadata.json` | `status`, counts, hand YAML sha256s, and the `dagger` block below |
+| `metadata.json` | `status`, the episode clock (`started/stopped_monotonic_ns`), counts, hand YAML sha256s, and the `dagger` block below |
 
 The `dagger` block records:
 - round, takeover kind, outcome and reason;
 - the policy provenance from the predictor;
 - executor mode and start record;
-- segments (policy, human), with `human_intervals`, the training intervals;
+- segments (policy, human), `takeover_ns` and `human_intervals` (teleop clutch engaged, kinesthetic `active`); the export derives the frame labels from these;
 - the takeover settings, including calibration paths and sha256s.
 
 The Piper log and run log are emptied after each rollout, so a long session doesn't grow in memory.
@@ -251,11 +247,11 @@ The Piper log and run log are emptied after each rollout, so a long session does
 - **Load:** check the loop overrun warning (the camera, Piper log and hand reader run alongside).
 - Check the operator's hands in the wrist camera during takeovers.
 
-**Pipeline:** postprocess and export a pilot round; load it in the trainer with the old normalizer and read the coverage line.
+**Pipeline:** export a pilot round and load it in the trainer. Check each rollout's `control_rows` in `segments.json`, and on a few videos that the label boundaries fall where control actually changed.
 
 ## Known limits and open items
 
-- **Visual gap.** D0's images come from the hand-held camera, DAgger's from the robot's wrist camera. Weight the DAgger share with that in mind.
+- **Visual gap.** D0's images come from the hand-held camera, DAgger's from the robot's wrist camera. Without source weights, the DAgger share of training is its share of the frames.
 - **Hand state.** Training hand deltas are leader minus leader; deployment adds them to the follower's measured angles, so grips come out weaker under contact. This predates DAgger. Both hands are now recorded, which makes it measurable; if `hand_pose_abs` is re-enabled, DAgger episodes should use `follower.csv` as the observation.
 - **Teleop force feedback.** None in v1. It needs `ContactDetector` / `WallContact` / `LeaderWall` (`trimi_teleop.py:263-518`) driven from the takeover loop.
 - **Kinesthetic supported entry.** DAgger now streams full gravity plus a releasing kp hold from the first MIT command. This removes the software's uncommanded wait/zero-gravity ramp, but requires a supported hardware bench test; it does not establish firmware mode-latch behavior or overcome insufficient torque capacity.
@@ -270,9 +266,9 @@ The Piper log and run log are emptied after each rollout, so a long session does
 | | `inference/executor/executor.py` | `--dagger` options; `pause_at_start` / `wait_for_policy_start` hand over to the session; policy provenance in the run log; RTC drains after a takeover |
 | | `inference/predictor/predictor.py`, `inference/protocol.py` | checkpoint provenance in every reply header |
 | | `scripts/piper_api/foot_pedal.py` | per-key hold tracking, key names, a key-code monitor |
-| | `scripts/dagger/export_segments.py` | new: human intervals → training episodes |
-| | `tests/test_dagger.py` | new: 14 tests (real IK for teleop; real `DragController` and the real calibration for kinesthetic) |
-| diffusion-policies | `shared/env/midas/midas_image_dataset.py` | several roots, per-source validation, `source_weights`, `source` in batches |
+| | `scripts/dagger/export_segments.py` | new: rollouts → training episodes with policy/human/handoff frame labels |
+| | `tests/test_dagger.py` | new: 20 tests (real IK for teleop; real `DragController` and the real calibration for kinesthetic) |
+| diffusion-policies | `shared/env/midas/midas_image_dataset.py` | several roots, per-source validation, `source_weights`, `source` in batches, `train_mask` window filtering |
 | | `shortcut_policy/unet_shortcut/train_unet_image_shortcut_policy.py` | weighted sampler, `init_ckpt`, `keep_ckpt_normalizer`, normalizer coverage, per-source validation loss |
 | | `shortcut_policy/config/...` | the new keys; output dirs under the first root |
-| | `tests/test_dagger_dataset.py` | new: 12 tests |
+| | `tests/test_dagger_dataset.py` | new: 13 tests |

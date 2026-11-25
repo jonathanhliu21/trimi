@@ -12,9 +12,9 @@ operator then finishes the episode; control never returns to the policy:
   limp, so the operator moves both by hand.
 
 Each rollout is one raw episode in the collection layout
-(data_collection/DATASET_SPEC.md): postprocess_dataset.py --pose-source piper
-converts it, and scripts/dagger/export_segments.py keeps the human-controlled
-intervals for training (DAGGER_PLAN.md at the repository root).
+(data_collection/DATASET_SPEC.md): postprocess_dataset.py --pose-source piper_fk
+converts it, and scripts/dagger/export_segments.py labels every frame policy,
+human or handoff for training (DAGGER_PLAN.md at the repository root).
 
 Pedals (--pedal-keys TAKEOVER SUCCESS FAILURE, default a b c; find yours with
 python -m scripts.piper_api.foot_pedal):
@@ -53,9 +53,17 @@ EULER_FIELDS = ("x", "y", "z", "roll", "pitch", "yaw")
 HAND_FIELDS = tuple(f"pos_{i}" for i in range(13))
 TARGET_FIELDS = tuple(f"target_{i}" for i in range(13))
 CAMERA_FIELDS = ("frame_idx", "monotonic_ns", "receipt_monotonic_ns", "sequence_num")
-PIPER_FIELDS = ("monotonic_ns", *EULER_FIELDS, *(f"joint_{i}" for i in range(1, 7)),
-                *(f"fw_{name}" for name in EULER_FIELDS), *(f"vel_{i}" for i in range(1, 7)),
-                *(f"current_{i}" for i in range(1, 7)), "arm_status", "motion_status")
+# raw piper.csv column <- executor Piper log column, in data collection's layout
+# (piper_worker.gravity_comp_sample): one row per joint frame, its CAN receive
+# time, and the firmware flange pose in x..yaw.
+PIPER_COLUMNS = (("monotonic_ns", "monotonic_ns"), ("robot_timestamp_s", "joint_timestamp_s"),
+                 ("joint_rx_monotonic_ns", "joint_rx_monotonic_ns"),
+                 *((f"joint_{i}", f"joint_{i}") for i in range(1, 7)),
+                 *((name, f"fw_{name}") for name in EULER_FIELDS), ("eef_timestamp_s", "fw_timestamp_s"),
+                 *((f"vel_{i}", f"vel_{i}") for i in range(1, 7)),
+                 *((f"current_{i}", f"current_{i}") for i in range(1, 7)),
+                 ("arm_status", "arm_status"), ("motion_status", "motion_status"))
+PIPER_FIELDS = tuple(name for name, _ in PIPER_COLUMNS)
 COMMAND_FIELDS = ("monotonic_ns", "source", "cycle", "index", "engaged", *(f"raw_{name}" for name in EULER_FIELDS),
                   *EULER_FIELDS, *(f"cmd_joint_{i}" for i in range(1, 7)),
                   "sigma", "damping", "step_scale", "pos_err_mm", "rot_err_deg")
@@ -377,7 +385,7 @@ class DaggerSession:
     DAGGER = True
 
     def __init__(self, args, robot, camera, pedals, takeover, *, video, follower, label_hand, log,
-                 quest=None, leader_hand=None, fk=None):
+                 quest=None, leader_hand=None):
         self.args = args
         self.robot = robot
         self.camera = camera
@@ -391,7 +399,6 @@ class DaggerSession:
         self.log = log
         self.quest = quest
         self.leader_hand = leader_hand
-        self.fk = fk
         self.view = None
         self.raw = Path(args.dagger).expanduser() / "raw"
         self.pending = []
@@ -609,6 +616,9 @@ class DaggerSession:
             "episode_index": episode.index,
             "started_utc": episode.started_utc,
             "stopped_utc": utc_now(),
+            # Collection's episode clock (episode.py); postprocess --pose-source piper_fk reads it.
+            "started_monotonic_ns": episode.start_ns,
+            "stopped_monotonic_ns": end_ns,
             "duration_s": (end_ns - episode.start_ns) / 1e9,
             "counts": {"camera_frames": len(frames), "leader_hand": len(label_rows),
                        "follower": len(follower_rows), "piper": len(piper_rows),
@@ -618,7 +628,8 @@ class DaggerSession:
                      "follower": hand_metadata(args.hand_config, args.hand_port),
                      "leader": (hand_metadata(args.leader_config, args.leader_port)
                                 if args.takeover == "teleop" else None)},
-            "piper": {"mode": f"executor_dagger_{args.takeover}", "pose": "fk_of_measured_joints",
+            "piper": {"mode": f"executor_dagger_{args.takeover}", "pose": "firmware_flange_pose",
+                      "pose_clock": "joint_rx_monotonic_ns", "training_pose_source": "piper_fk",
                       "firmware": args.piper_firmware},
             "camera": {"width": args.cam_width, "height": args.cam_height, "fps": args.cam_fps,
                        "flip": args.cam_flip, "exposure_us": args.cam_exposure_us, "iso": args.cam_iso,
@@ -642,15 +653,14 @@ class DaggerSession:
         }
         (path / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
-    def piper_row(self, row):
-        """Executor Piper log row -> raw piper.csv row; x..yaw is FK of the measured joints."""
-        joints = [float(row[f"joint_{i}"]) for i in range(1, 7)]
-        pose = np.asarray(self.fk(joints), dtype=float)
-        result = {"monotonic_ns": row["monotonic_ns"], **{name: f"{v:.9f}" for name, v in zip(EULER_FIELDS, pose)}}
-        for name in PIPER_FIELDS[7:]:
-            if name in row:
-                result[name] = row[name]
-        return result
+    @staticmethod
+    def piper_row(row):
+        """Executor Piper log row -> raw piper.csv row in data collection's layout.
+
+        x..yaw is the firmware flange pose. The training pose is FK of the joints
+        on the CAN receive clock: postprocess_dataset.py --pose-source piper_fk.
+        """
+        return {name: row[source] for name, source in PIPER_COLUMNS if source in row}
 
     def close(self):
         """Save a rollout still in progress as interrupted, then stop the session's devices."""
@@ -1402,7 +1412,6 @@ def create_pedals(args):
 
 def create_session(args, prepared, robot, camera, pedals, log):
     from data_collection.collection import config as defaults
-    from data_collection.replay_actions import piper_model
 
     if robot.piper_log is None:
         raise RuntimeError("--dagger needs the Piper feedback log")
@@ -1428,8 +1437,7 @@ def create_session(args, prepared, robot, camera, pedals, log):
             takeover = KinestheticTakeover(args, robot, prepared["kinesthetic"])
             label_hand = follower
         return DaggerSession(args, robot, camera, pedals, takeover, video=video, follower=follower,
-                             label_hand=label_hand, log=log, quest=quest, leader_hand=leader_hand,
-                             fk=piper_model()[0])
+                             label_hand=label_hand, log=log, quest=quest, leader_hand=leader_hand)
     except BaseException:
         for part in (follower, leader, quest):
             if part is not None:

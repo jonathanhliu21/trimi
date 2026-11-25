@@ -105,6 +105,17 @@ def _fmt(value: float) -> str:
     return f"{float(value):.9f}"
 
 
+def joint_rx_monotonic_ns(rx_s: float, *, now_ns: int, wall_s: float) -> int | None:
+    """A joint frame's CAN receive time (the SDK's host wall-clock stamp) on the host monotonic clock.
+
+    now_ns and wall_s are read together just after the frame is polled. None when
+    the stamp is not on the host clock. The executor's Piper log uses this too.
+    """
+    if abs(wall_s - rx_s) > RX_CLOCK_SANITY_S:
+        return None
+    return now_ns - int(round((wall_s - rx_s) * 1e9))
+
+
 def gravity_comp_sample(joints, motors, enable, status, eef, *, now_ns: int, wall_s: float,
                         disable_j6=False):
     """One piper.csv row (without the per-episode index fields) and its health problem.
@@ -113,15 +124,12 @@ def gravity_comp_sample(joints, motors, enable, status, eef, *, now_ns: int, wal
     """
 
     rx_s = float(joints.timestamp)
+    rx_ns = joint_rx_monotonic_ns(rx_s, now_ns=now_ns, wall_s=wall_s)
     row: dict[str, object] = {
         # CAN receive time of the joint frame (the SDK's timestamp, host wall clock)
         # and the same instant on the host monotonic clock used by the other streams.
         "robot_timestamp_s": f"{rx_s:.6f}",
-        "joint_rx_monotonic_ns": (
-            now_ns - int(round((wall_s - rx_s) * 1e9))
-            if abs(wall_s - rx_s) <= RX_CLOCK_SANITY_S
-            else ""
-        ),
+        "joint_rx_monotonic_ns": "" if rx_ns is None else rx_ns,
         "robot_hz": f"{float(joints.hz):.3f}",
     }
     row.update({name: _fmt(value) for name, value in zip(PIPER_JOINT_FIELDS, joints.joints)})

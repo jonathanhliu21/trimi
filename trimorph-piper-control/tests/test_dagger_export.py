@@ -22,14 +22,20 @@ class ExportTests(unittest.TestCase):
     def write_csv(self, path, rows):
         exporter.write_csv(path, rows)
 
-    def fixture(self, root, index=2, outcome='success', intervals=((30, 75), (85, 110)), bad_hand=False):
+    def fixture(self, root, index=2, outcome='success', intervals=((30, 75), (85, 110)), bad_hand=False,
+                takeover='kinesthetic', takeover_frame=None, hand_ramp_s=None, legacy_piper=False):
         raw = root / 'raw' / f'episode_{index:06d}'
         raw.mkdir(parents=True)
         origin = 1_000_000_000
         frame_ns = np.array([origin + round(i * 1e9 / 30) for i in range(120)], dtype=np.int64)
-        meta = dict(status='complete', piper={}, camera={'fps': 30}, dagger=dict(outcome=outcome,
-            takeover='kinesthetic', round=1, policy={'sha256': 'abc'},
-            human_intervals=[[int(frame_ns[a]), int(frame_ns[b])] for a, b in intervals]))
+        dagger = dict(outcome=outcome, takeover=takeover, round=1, policy={'sha256': 'abc'},
+                      human_intervals=[[int(frame_ns[a]), int(frame_ns[b])] for a, b in intervals])
+        if takeover_frame is not None:
+            dagger['takeover_ns'] = int(frame_ns[takeover_frame])
+        if hand_ramp_s is not None:
+            dagger['takeover_settings'] = {'hand_ramp_s': hand_ramp_s}
+        meta = dict(status='complete', started_monotonic_ns=origin, piper={}, camera={'fps': 30}, dagger=dagger,
+                    hand={'label_source': 'leader' if takeover == 'teleop' else 'follower'})
         (raw / 'metadata.json').write_text(json.dumps(meta))
         video = cv2.VideoWriter(str(raw / 'camera.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), 30., (32, 24))
         self.assertTrue(video.isOpened())
@@ -40,8 +46,19 @@ class ExportTests(unittest.TestCase):
         stamps = [origin+i*10_000_000 for i in range(401)]
         self.write_csv(raw / 'leader_hand.csv', [dict(monotonic_ns=t+(10_000_000_000 if bad_hand else 0),
             **{f'pos_{j}': i*.001+j*.01 for j in range(13)}) for i, t in enumerate(stamps)])
-        self.write_csv(raw / 'piper.csv', [dict(monotonic_ns=t, x=i*.0001, y=-.2, z=.3, roll=.1, pitch=.2, yaw=.3)
-                                         for i, t in enumerate(stamps)])
+        if takeover == 'teleop':
+            # The follower's measured hand (0.5 + ...), distinct from the leader's (<= 0.4).
+            self.write_csv(raw / 'follower.csv', [dict(monotonic_ns=origin+5_000_000+k*20_000_000,
+                **{f'pos_{j}': .5+j*.01 for j in range(13)}, **{f'target_{j}': .6 for j in range(13)})
+                for k in range(200)])
+        if legacy_piper:  # executor log before CAN receive times: FK in x..yaw at the poll time
+            self.write_csv(raw / 'piper.csv', [dict(monotonic_ns=t, x=i*.0001, y=-.2, z=.3, roll=.1, pitch=.2, yaw=.3)
+                                             for i, t in enumerate(stamps)])
+        else:  # data collection's layout: joints on their CAN receive clock, firmware pose in x..yaw
+            self.write_csv(raw / 'piper.csv', [dict(monotonic_ns=t+300_000, robot_timestamp_s=f'{100+i*.01:.6f}',
+                joint_rx_monotonic_ns=t, joint_1=i*.001, joint_2=1., joint_3=-1., joint_4=0., joint_5=.5, joint_6=0.,
+                x=.3, y=0., z=.2, roll=3.1, pitch=0., yaw=0., eef_timestamp_s=f'{100.001+i*.01:.6f}')
+                for i, t in enumerate(stamps)])
         return raw, frame_ns
 
     def snapshot(self, root):
@@ -74,7 +91,11 @@ class ExportTests(unittest.TestCase):
                 self.assertTrue(sync['intervention'][30])
                 self.assertTrue(sync['intervention'][100])
                 self.assertEqual(len(sync['encoder_idx']), 120)
+                # Arm poses are on the joints' CAN receive clock, not the poll time.
+                self.assertEqual(int(sync['pose_monotonic_ns'][0]), 1_000_000_000)
             self.assertEqual(len(np.load(paths.hand_path)), 401)
+            processing = json.loads((out/'processed'/'episode_000000'/'metadata.json').read_text())
+            self.assertEqual((processing['pose_source'], processing['pose_clock']), ('piper_fk', 'joint_rx_monotonic_ns'))
             saved = json.loads((out/'raw'/'episode_000000'/'metadata.json').read_text())
             self.assertEqual(saved['dagger']['human_intervals'], original_intervals)
             self.assertEqual(len(skipped), 2)
@@ -82,6 +103,56 @@ class ExportTests(unittest.TestCase):
             compact = Path(d)/'compact'
             trimmed, _ = self.run_export(out, compact, min_rows=5)
             self.assertEqual([r['rows'] for r in trimmed], [46, 26])
+
+    def test_full_export_trains_every_frame_but_the_kinesthetic_handoff(self):
+        for train_handoff in (False, True):
+            with self.subTest(train_handoff=train_handoff), tempfile.TemporaryDirectory() as d:
+                root, out = Path(d)/'dataset', Path(d)/'full'
+                self.fixture(root, takeover_frame=20, intervals=((30, 110),))  # kinesthetic: active 30, freeze 110
+                self.run_export(root, out, trim=False, min_rows=5, train_handoff=train_handoff)
+                expected = np.array(['policy']*20 + ['handoff']*10 + ['human']*90)  # the exit freeze stays human
+                with np.load(base.processed_paths(out, 0).sync_path) as sync:
+                    np.testing.assert_array_equal(sync['control'], expected)
+                    np.testing.assert_array_equal(sync['train_mask'],
+                                                  np.ones(120, bool) if train_handoff else expected != 'handoff')
+                    np.testing.assert_array_equal(sync['intervention'], expected == 'human')
+                summary = json.loads((out/'segments.json').read_text())
+                self.assertEqual(summary['segments'][0]['control_rows'], {'policy': 20, 'human': 90, 'handoff': 10})
+                self.assertEqual(summary['train_handoff'], train_handoff)
+
+    def test_teleop_trains_from_the_takeover_with_a_continuous_hand_label(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, out, again = Path(d)/'dataset', Path(d)/'full', Path(d)/'again'
+            raw, _ = self.fixture(root, takeover='teleop', takeover_frame=20, intervals=((21, 110),), hand_ramp_s=.2)
+            leader_before = (raw/'leader_hand.csv').read_bytes()
+            source_before = self.snapshot(root)
+            self.run_export(root, out, trim=False, min_rows=5)
+            self.assertEqual(self.snapshot(root), source_before)  # relabeled in staging only
+            paths = base.processed_paths(out, 0)
+            with np.load(paths.sync_path) as sync:
+                hand = np.load(paths.hand_path)[sync['encoder_idx'], 0]
+                control = sync['control']
+                self.assertTrue(sync['train_mask'].all())
+            # No handoff in teleop: the operator drives from the takeover (frame 20) on.
+            np.testing.assert_array_equal(control, ['policy']*20 + ['human']*100)
+            # The follower's hand until the 0.2 s hand ramp ends (frame 26), then the leader's.
+            np.testing.assert_allclose(hand[:26], .5)
+            self.assertTrue(np.all(hand[27:] <= .4))
+            self.assertEqual((out/'raw'/'episode_000000'/'leader.csv').read_bytes(), leader_before)
+            # Exporting the export again keeps its hand labels.
+            self.run_export(out, again, trim=False, min_rows=5)
+            np.testing.assert_array_equal(np.load(base.processed_paths(again, 0).hand_path), np.load(paths.hand_path))
+
+    def test_recordings_without_can_receive_times_keep_poll_time_poses(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d)/'dataset', Path(d)/'full'
+            self.fixture(root, legacy_piper=True)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exporter.export(root, out, min_rows=5)
+            self.assertIn('predates joint_rx_monotonic_ns', output.getvalue())
+            processing = json.loads((out/'processed'/'episode_000000'/'metadata.json').read_text())
+            self.assertEqual(processing['pose_source'], 'piper')
 
     def test_default_in_place_prunes_but_keeps_full_retained_rollout(self):
         with tempfile.TemporaryDirectory() as d:
@@ -99,6 +170,10 @@ class ExportTests(unittest.TestCase):
     def test_cli_trim_is_opt_in(self):
         self.assertFalse(exporter.parse_args(['root', '--out', 'out']).trim)
         self.assertTrue(exporter.parse_args(['root', '--out', 'out', '--trim']).trim)
+        self.assertTrue(exporter.parse_args(['root', '--out', 'out', '--train-handoff']).train_handoff)
+        for args in (['--trim-start-ms', '100'], ['--trim', '--train-handoff']):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                exporter.parse_args(['root', '--out', 'out', *args])
 
     def test_raw_selection_compaction_and_roundtrip_alignment(self):
         with tempfile.TemporaryDirectory() as d:
@@ -136,7 +211,7 @@ class ExportTests(unittest.TestCase):
                     self.assertEqual(os.stat(raw_video).st_ino, os.stat(paths.video_path).st_ino)
             # Shared postprocessor can regenerate equivalent training data from compact raw.
             config = post.PostprocessConfig(dataset_root=out, raw_dir=out/'raw', overwrite_processed_files=True,
-                process_only_raw_statuses={'complete'}, max_sync_error_s=.01, trim_camera_frames=0, pose_source='piper')
+                process_only_raw_statuses={'complete'}, max_sync_error_s=.01, trim_camera_frames=0, pose_source='piper_fk')
             expected = [(np.load(base.processed_paths(out, i).hand_path), np.load(base.processed_paths(out, i).eef_path)) for i in range(2)]
             with contextlib.redirect_stdout(io.StringIO()):
                 for episode in base.discover_raw_episodes(config):
