@@ -1,6 +1,7 @@
 """Pedal reset torque ordering without robot hardware."""
 from contextlib import ExitStack, redirect_stdout
 import io
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -8,6 +9,7 @@ import numpy as np
 
 from data_collection.collection.config import HAND_START_POSITIONS_RAD
 from inference.executor.executor import HandCommandWriter, RobotIO, parse_args
+from inference.executor.dagger import HandSampler
 
 
 class PedalHandResetTests(unittest.TestCase):
@@ -85,11 +87,65 @@ class PedalHandResetTests(unittest.TestCase):
         np.testing.assert_array_equal(robot.hand.set_positions.call_args.args[0], np.zeros(13))
         robot.hand.set_positions_blocking.assert_not_called()
 
-    def test_initial_start_keeps_existing_torque_behavior(self):
+    def test_initial_start_keeps_hand_limp_until_arm_reaches_start(self):
         args, robot = self.setup_robot()
+        events = []
+        robot.hand.disable_torque.side_effect = lambda: events.append('off')
+        robot.hand.set_positions.side_effect = lambda *a, **k: events.append('target')
+        robot.hand.enable_torque.side_effect = lambda: events.append('on')
+        robot.hand.set_positions_blocking.side_effect = lambda *a, **k: events.append('settle')
         with ExitStack() as stack:
-            self.environment(stack, lambda *a: None)
-            robot.move_to_start(args, confirm=False)
-        robot.hand.disable_torque.assert_not_called()
-        robot.hand.enable_torque.assert_not_called()
-        robot.hand.set_positions_blocking.assert_called_once()
+            self.environment(stack, lambda *a: events.append('arm_arrived'))
+            stack.enter_context(patch('builtins.input', side_effect=lambda _: events.append('enter')))
+            robot.move_to_start(args, release_hand=True)
+        self.assertEqual(events, ['enter', 'off', 'arm_arrived', 'target', 'on', 'settle'])
+
+    def test_dagger_sampler_cannot_read_during_reset_serial_transactions(self):
+        for extra in ((), ('--no-hand-start',)):
+            with self.subTest(extra=extra):
+                args, robot = self.setup_robot(extra)
+                readers = []
+                checked = []
+
+                def transaction(name):
+                    def check(*args, **kwargs):
+                        # Start a real sampler read inside each reset transaction.
+                        # It must wait for the shared lock before touching the bus.
+                        entered = threading.Event()
+                        attempted = threading.Event()
+                        sampler = HandSampler.__new__(HandSampler)
+                        sampler.lock = robot.hand_writer.lock
+                        sampler.target = None
+                        sampler.rows = None
+                        sampler.name = 'follower'
+                        sampler.read = lambda: (entered.set(), np.zeros(13))[1]
+
+                        def sample():
+                            attempted.set()
+                            sampler.sample()
+
+                        reader = threading.Thread(target=sample, daemon=True)
+                        readers.append((reader, entered))
+                        reader.start()
+                        self.assertTrue(attempted.wait(1.0))
+                        self.assertFalse(entered.wait(0.03), f'sampler overlapped {name}')
+                        checked.append(name)
+                        if name == 'read_pos':
+                            return np.zeros(13)
+                    return check
+
+                for name in ('disable_torque', 'set_positions', 'enable_torque',
+                             'set_positions_blocking', 'read_pos'):
+                    getattr(robot.hand, name).side_effect = transaction(name)
+                try:
+                    with ExitStack() as stack:
+                        self.environment(stack, lambda *a: None)
+                        robot.return_to_start(args)
+                finally:
+                    for reader, entered in readers:
+                        reader.join(1.0)
+                        self.assertFalse(reader.is_alive())
+                        self.assertTrue(entered.is_set())
+                expected = ['disable_torque', 'read_pos', 'set_positions', 'enable_torque'] if extra else [
+                    'disable_torque', 'set_positions', 'enable_torque', 'set_positions_blocking']
+                self.assertEqual(checked, expected)

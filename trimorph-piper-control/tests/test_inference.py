@@ -277,12 +277,14 @@ class InferenceTests(unittest.TestCase):
              patch('data_collection.collection.hand_common.load_hand_config', return_value=SimpleConfig()), \
              patch('data_collection.collection.hand_common.verify_connected_hand'), \
              patch('scripts.piper_api.piper_api.PiperAPI', return_value=piper) as factory, \
-             patch.object(RobotIO, 'move_to_start', side_effect=lambda _: events.append('start')):
+             patch.object(RobotIO, 'move_to_start', side_effect=lambda *a, **k: events.append('start')) as start:
             robot = RobotIO(args)
             self.assertEqual(hand_class.call_args.kwargs['config'].operating_mode, 3)
             self.assertEqual(factory.call_args.kwargs['channel'], args.piper_channel)
             hand.configure.assert_called_once_with(enable_torque=False)
-            self.assertEqual(events, ['hold', 'enable', 'start'])
+            self.assertEqual(events, ['hold', 'start'])
+            start.assert_called_once_with(args, release_hand=True)
+            hand.enable_torque.assert_not_called()
             piper.set_speed_percent.assert_called_once_with(args.piper_speed)
             robot.close()
         hand.shutdown.assert_called_once()

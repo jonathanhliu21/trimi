@@ -58,6 +58,7 @@ class PiperMotorState:
     torques: list[float]
     timestamp: float
     hz: float
+    timestamps: list[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +297,7 @@ class PiperAPI:
             torques=[float(state.msg.torque) for state in motor_states],
             timestamp=max(timestamps),
             hz=min(hzs),
+            timestamps=timestamps,
         )
 
     def get_joint_velocities(self) -> list[float] | None:

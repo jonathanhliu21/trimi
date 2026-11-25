@@ -248,6 +248,19 @@ class ExecutorTaskStartTests(unittest.TestCase):
         self.assertEqual(launched.count("--hand-config"), 1)
         self.assertEqual(launched[launched.index("--hand-config") + 1], str(self.hand_config))
 
+    def test_dagger_wrapper_requires_start_and_preserves_executor_options(self):
+        with self.assertRaisesRegex(ValueError, "no fixed task start"):
+            rollout.main(["--predictor", "localhost", "--dagger", "corrections"])
+        with patch.object(rollout, "running_drag", return_value=False), patch.object(rollout.os, "execv") as execute:
+            rollout.main(["--predictor", "localhost", "--dagger", "corrections", "--gravity-comp-repo", "/tmp/gc",
+                          "--start-home", "home_multi", "--rtc", "--rtc-max-guidance", "5"])
+        launched = execute.call_args.args[1]
+        args = executor.parse_args(launched[3:])
+        self.assertEqual(args.start_home, "home_multi")
+        self.assertEqual(args.takeover, "kinesthetic")
+        self.assertTrue(args.rtc)
+        self.assertEqual(args.gravity_comp_repo, Path("/tmp/gc"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,15 @@ from data_collection.replay_episode import move_to_first_pose, replay_piper_comm
 
 
 class EefCommandTests(unittest.TestCase):
+    def test_motor_feedback_preserves_each_source_timestamp(self):
+        robot = Mock()
+        robot.get_motor_states.side_effect = [
+            SimpleNamespace(timestamp=float(i), hz=200., msg=SimpleNamespace(
+                position=0., velocity=0., current=0., torque=0.)) for i in range(1, 7)]
+        state = PiperAPI(robot=robot).get_motor_state()
+        self.assertEqual(state.timestamps, [1., 2., 3., 4., 5., 6.])
+        self.assertEqual(state.timestamp, 6.)
+
     def assert_same_pose(self, actual, expected):
         np.testing.assert_array_equal(actual[:3], expected[:3])
         self.assertLessEqual(abs(actual[3]), math.pi)

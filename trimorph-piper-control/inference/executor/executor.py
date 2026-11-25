@@ -317,7 +317,10 @@ class RobotIO:
                 profile_acceleration_rad_s2=args.hand_acceleration,
             )
             self.hand.set_positions(vector(self.hand.read_pos(), 13, "hand state"), clip=True)
-            self.hand.enable_torque()
+            # Keep fingers limp through the initial arm move. With no arm start
+            # move requested, hold the measured hand pose immediately instead.
+            if args.no_start_move:
+                self.hand.enable_torque()
             self.piper = PiperAPI(
                 firmware=args.piper_firmware, interface=args.piper_interface,
                 channel=args.piper_channel, installation_pos=args.piper_installation_pos,
@@ -328,7 +331,7 @@ class RobotIO:
             if not args.no_log:
                 self.piper_log = PiperFeedbackLogger(self.piper)
             if not args.no_start_move:
-                self.move_to_start(args)
+                self.move_to_start(args, release_hand=True)
             self.piper.set_speed_percent(args.piper_speed)
             self.hand_writer = HandCommandWriter(self.hand, args.hand_command_hz)
         except BaseException:
@@ -364,7 +367,8 @@ class RobotIO:
         else:
             print(message, flush=True)
         if release_hand:
-            self.hand.disable_torque()
+            with writer.lock if writer is not None else nullcontext():
+                self.hand.disable_torque()
             print("Hand torque off while the arm returns to start.", flush=True)
         self.piper.set_position_mode()
         time.sleep(POSITION_MODE_SETTLE_S)
@@ -375,8 +379,9 @@ class RobotIO:
             self.move_hand_to_start(hand_name, enable_torque=release_hand)
         elif release_hand:
             # --no-hand-start: restore torque holding the relaxed, measured pose.
-            self.hand.set_positions(vector(self.hand.read_pos(), 13, "hand state"), clip=True)
-            self.hand.enable_torque()
+            with writer.lock if writer is not None else nullcontext():
+                self.hand.set_positions(vector(self.hand.read_pos(), 13, "hand state"), clip=True)
+                self.hand.enable_torque()
         self.log_start(args, name, joints, target, offset_m, angle_deg, None if args.no_hand_start else hand_name)
 
     def log_start(self, args, name, base_deg, target_deg, offset_m, angle_deg, hand_name):
@@ -403,6 +408,13 @@ class RobotIO:
               f"(or --start-joints-deg {' '.join(f'{v:.2f}' for v in target_deg)}).", flush=True)
 
     def move_hand_to_start(self, name, tolerance_rad=0.05, timeout_s=5.0, enable_torque=False):
+        # DAgger's sampler keeps reading between episodes. Serialize the entire
+        # goal/torque/settle transaction with it and the background command writer.
+        writer = getattr(self, "hand_writer", None)
+        with writer.lock if writer is not None else nullcontext():
+            self._move_hand_to_start(name, tolerance_rad, timeout_s, enable_torque)
+
+    def _move_hand_to_start(self, name, tolerance_rad, timeout_s, enable_torque):
         # The motion profile set at startup limits the speed of this single target write.
         if isinstance(name, dict):
             target = task_hand_positions(name)
@@ -1534,10 +1546,11 @@ def parse_args(argv=None):
     from inference.executor import dagger as dagger_mode
     dagger_mode.add_arguments(p)
     args = p.parse_args(argv)
+    raw_args = sys.argv[1:] if argv is None else argv
+    dagger_mode.apply_defaults(args, raw_args)
     args.task_start_profile = None
     args.task_start_sha256 = None
     args.saved_start_record = None
-    raw_args = sys.argv[1:] if argv is None else argv
     if args.start_profile is not None:
         if args.start_joints_deg or args.start_id is not None or any(
                 value == "--start-home" or value.startswith("--start-home=") for value in raw_args):

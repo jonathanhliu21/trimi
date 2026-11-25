@@ -23,6 +23,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ class PostprocessConfig(base.PostprocessConfig):
     max_start_rotation_deg: float = 45.0
     mocap_smooth_s: float = 0.02
     apply_calibration_latency: bool = False
+    link_video: bool = False  # internal staging: avoid another full video copy
 
 
 def resolve_pose_source(config):
@@ -508,7 +510,14 @@ def process_episode(config, episode):
     for path in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)
     if not config.no_camera:
-        shutil.copy2(episode.camera_path, out.video_path)
+        if out.video_path.exists() and episode.camera_path.samefile(out.video_path):
+            pass  # compact exports share one video inode between raw and processed
+        elif config.link_video:
+            if out.video_path.exists():
+                out.video_path.unlink()
+            os.link(episode.camera_path, out.video_path)
+        else:
+            shutil.copy2(episode.camera_path, out.video_path)
     with replay_csv.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(converted[0]))
         writer.writeheader()

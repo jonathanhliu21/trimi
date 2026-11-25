@@ -29,13 +29,31 @@ HG-DAgger changes only the data; `compute_loss` (`unet_image_shortcut_policy.py:
 python -m scripts.piper_api.foot_pedal          # press each pedal: prints its key code
 ```
 
-The executor's default `--pedal-keys b c a` is takeover, success, failure: the middle, right and left pedal of a PCsensor 3-pedal as shipped. If yours sends other keys, pass them, for example `--pedal-keys 48 46 30`.
+The executor's default `--pedal-keys a b c` is takeover, success, failure. If yours sends other keys, override them with `--pedal-keys`.
 
 ### 1. Predictor (GPU machine)
 
 Unchanged command. The predictor now also sends the checkpoint's path, sha256 and inference steps in every reply header. Each episode stores them, so rounds can't get mixed up.
 
 ### 2. Executor (robot machine), from `trimorph-piper-control/`
+
+DAgger-specific defaults allow this command with explicit executor settings:
+
+```bash
+bash inference/executor/run_kinesthetic.sh --predictor GPU_HOST \
+  --rtc --rtc-max-guidance 5 --start-home home_multi \
+  --hand-config config/xl330_new_hand_transparent.yaml \
+  --hand-port /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO3G5-if00-port0 \
+  --dagger data_dagger_task_r1
+```
+
+`--dagger` selects kinesthetic takeover, pedals `a b c`, and the existing
+underpowered/forced friction allowances. RTC, guidance, start and hand settings
+are independent and explicitly supplied above. `--show` is independent. All settings can be overridden;
+strict checking uses `--no-allow-underpowered --no-gravity-force`. Round numbers
+can live in the folder name; `--dagger-round` is optional.
+Keep `--gravity-comp-repo` for an explicit override, or use automatic discovery:
+`TRIMORPH_GRAVITY_COMP_REPO`, sibling checkout, then the known home paths.
 
 ```bash
 # Teleop takeover: operator wears the leader TriMI with the Quest controller on it.
@@ -82,15 +100,25 @@ python inference/executor/executor.py --predictor GPU_HOST --rtc --rtc-max-guida
 ### 4. Postprocess and export
 
 ```bash
-python3 data_collection/postprocess_dataset.py data_dagger_<task>_r1 --pose-source piper
-python3 scripts/dagger/export_segments.py data_dagger_<task>_r1        # -> data_dagger_<task>_r1_human
+python3 scripts/dagger/export_dataset.py data_dagger_<task>_r1 --out data_dagger_<task>_r1_human
+# Correction-only alternative:
+# python3 scripts/dagger/export_dataset.py data_dagger_<task>_r1 --out data_dagger_<task>_r1_trimmed --trim
+# DESTRUCTIVE alternative, with collection/training stopped:
+# python3 scripts/dagger/export_dataset.py data_dagger_<task>_r1 --overwrite-raw
 ```
 
-The exporter turns each human interval into one training episode:
-- It keeps the sync rows inside the interval, after a trim at its start: 400 ms for teleop (operator reaction and hand ramp); 0 for kinesthetic, whose intervals already start after the gravity ramp-in.
-- It skips intervals under 32 camera rows.
-- It keeps only rollouts that ended as a success; change that with `--outcomes success failure`.
+The exporter selects complete, successful raw rollouts with human intervals, copies
+each selected rollout to staging, calls the shared `postprocess_dataset.py` pipeline
+with Piper poses, then exports either full rollouts or trimmed corrections:
+- **Default (no `--trim`):** one episode per qualifying rollout, with the unchanged full video, full hand/arm arrays and syncs covering EVERY video frame, including policy execution and correction. Human intervals remain in metadata and an `intervention` annotation is added to syncs. The trainer does not use this annotation to filter: it trains on the full retained rollout.
+- **`--trim`:** each human interval becomes a separate compact episode. Only correction frames remain, after the start trim (400 ms teleop, 0 kinesthetic). Videos are re-encoded, arrays sliced, and indices remapped. This mode trains on human corrections only.
+- A correction interval must have at least 32 camera rows by default (`--min-rows`). In full mode, at least one interval must meet that threshold to retain the rollout. In trimmed mode, short intervals are skipped individually.
+- In both modes, exported sample clocks must match camera timestamps within `--max-sync-error-ms` (default 10); misalignment fails instead of silently accepting nearest samples.
+- It always requires success AND a human correction; failed, interrupted and policy-only rollouts are excluded before processing.
 - `segments.json` lists what was kept and why the rest was skipped.
+- `--out` is required unless `--overwrite-raw` is given; a nonempty destination is refused and no source files are changed. Output includes raw episodes, processed arrays, videos and syncs. Raw and processed videos are hard-linked to avoid two physical copies.
+- `--overwrite-raw` replaces raw/processed episodes in the original root and deletes rejected recordings and stale training caches after all exports validate. It preserves full retained rollouts unless combined with `--trim`. Other root files are preserved. Rename failures are rolled back; this is not power-loss atomic across directories. Empty exports or validation failures leave the original dataset intact. Temporary space for final outputs plus one full selected rollout is needed.
+- `export_segments.py` remains an alternative entrypoint. The old `--video`, `--outcomes` and `--force` options are removed; `--out` never deletes existing output.
 
 ### 5. Train (diffusion-policies)
 
@@ -162,12 +190,13 @@ The executor runs gravity_comp's `DragController` itself, on its own CAN connect
   | home_unscrew1 | 5.8 |
   | quest_0 | 2.6 |
 
-**Entry, as in drag_mode:**
+**Supported DAgger entry (different from standalone drag_mode's gravity ramp):**
 1. The operator's hands are already on the arm. Hands first, then the pedal.
 2. The hand goes limp; `--kinesthetic-hand hold` keeps its last target instead, for an arm-only correction.
-3. The arm switches to MIT mode. The firmware holds no torque for the 0.3 s mode latch.
-4. Gravity ramps in over `--kinesthetic-ramp-in-s` (default 1 s, the minimum `DragConfig` allows).
-5. Friction assist defaults to 0 (`--kinesthetic-assist-frac`) until drag_mode has validated one.
+3. Before switching modes, every joint/motor feedback clock must advance. A missing or stalled source rejects takeover while the arm is still in position control.
+4. The arm switches to MIT mode and immediately receives full calibrated gravity feed-forward plus a position hold at the measured takeover joints. Commands stream continuously; there is no application-level 0.3 s sleep before the first command. Firmware acceptance across the transition still needs a supported bench check.
+5. The position stiffness releases over `--kinesthetic-ramp-in-s` (default 1 s) while gravity support remains full. Friction assistance stays off during this handoff. Begin demonstrating only after the console says `Kinesthetic takeover active`; that is when the human training interval opens.
+6. Friction assist defaults to 0 (`--kinesthetic-assist-frac`) until drag_mode has validated one.
 
 **Exit:**
 1. The end pedal freezes the arm: brake with gravity retained, then a position hold with a kp ramp.
@@ -176,7 +205,7 @@ The executor runs gravity_comp's `DragController` itself, on its own CAN connect
 
 **Faults.**
 - A runaway trip by the controller ends the episode as a failure.
-- Stale feedback freezes the arm, puts it in position hold, and stops the executor.
+- Stale feedback freezes the arm, puts it in position hold, and stops the executor. Freshness uses the joint-stream and all six motor timestamps, not unchanged position/velocity values. The error names the source (e.g. `motor5`).
 - Ctrl-C freezes the arm, puts it in position hold, and stops the executor. Ctrl-C is caught during the loop; it never leaves the arm in MIT mode without a hold.
 
 **Labels.** Arm: FK of the measured joints. Hand: the follower's measured angles. These record no squeeze.
@@ -194,7 +223,7 @@ Each rollout is `DATASET_ROOT/raw/episode_N/`, in the collection layout. `postpr
 | `commands.csv` | every arm target, tagged `policy` or `teleop` |
 | `events.csv` | executor and DAgger events: start, takeover, engage/disengage, mit_switch, active, freeze, end |
 | `chunks.npz` | the policy's chunks, as the executor run log |
-| `quest.csv` / `gravity_comp.csv` | Quest packets (teleop) / every MIT cycle (kinesthetic) |
+| `quest.csv` / `gravity_comp.csv` | Quest packets (teleop) / every MIT cycle, source timestamps, stale source/read errors, and commanded kp/kd (kinesthetic) |
 | `metadata.json` | `status`, counts, hand YAML sha256s, and the `dagger` block below |
 
 The `dagger` block records:
@@ -216,7 +245,7 @@ The Piper log and run log are emptied after each rollout, so a long session does
 - Check the leader→follower ramp and the hand label stream (`leader_hand.csv`).
 
 **Kinesthetic** (at a held start, e.g. home_cube_newhw, with the arm supported):
-- **Entry:** take over while the policy is still. Measure the sag across the 0.3 s mode latch and the 1 s ramp-in (`gravity_comp.csv`, `piper.csv`).
+- **Entry:** take over while the policy is still and the arm is physically supported. Verify full gravity from the first command and smoothly decreasing position stiffness during `HANDOFF` (`gravity_comp.csv`, `piper.csv`). Software tests cannot establish when the firmware accepts the first MIT command. Do not progress to moving takeovers if it drops, jolts or buzzes.
 - **Exit:** end the episode and check that the switch from the MIT hold back to position mode doesn't move the arm. This is the step most in need of a hardware check: the firmware might keep an old position target.
 - **Mid-motion takeover:** repeat during policy motion; check that the runaway watchdog doesn't trip on the arm's momentum.
 - **Load:** check the loop overrun warning (the camera, Piper log and hand reader run alongside).
@@ -229,7 +258,7 @@ The Piper log and run log are emptied after each rollout, so a long session does
 - **Visual gap.** D0's images come from the hand-held camera, DAgger's from the robot's wrist camera. Weight the DAgger share with that in mind.
 - **Hand state.** Training hand deltas are leader minus leader; deployment adds them to the follower's measured angles, so grips come out weaker under contact. This predates DAgger. Both hands are now recorded, which makes it measurable; if `hand_pose_abs` is re-enabled, DAgger episodes should use `follower.csv` as the observation.
 - **Teleop force feedback.** None in v1. It needs `ContactDetector` / `WallContact` / `LeaderWall` (`trimi_teleop.py:263-518`) driven from the takeover loop.
-- **Kinesthetic warm entry.** Full gravity from the first MIT command plus a kp handover would remove most of the entry sag. It needs a `DragController` change upstream (midas-piper-control) and a bench test.
+- **Kinesthetic supported entry.** DAgger now streams full gravity plus a releasing kp hold from the first MIT command. This removes the software's uncommanded wait/zero-gravity ramp, but requires a supported hardware bench test; it does not establish firmware mode-latch behavior or overcome insufficient torque capacity.
 - **Kinesthetic torque.** Firmware 1.8-8 or newer (16 N·m) would hold the arm at every start; the calibration would then have to be redone.
 - **Ending by keyboard.** Not needed with three pedals.
 

@@ -22,6 +22,8 @@ from inference.executor.executor import FakeCamera, FakeRobot, RunLog, parse_arg
 from scripts.piper_api.foot_pedal import EV_KEY, INPUT_EVENT_STRUCT, KEY_PRESS, KEY_RELEASE, FootPedalTrigger
 
 GRAVITY_COMP_REPO = Path.home() / "workspace" / "midas-piper-control"
+if not (GRAVITY_COMP_REPO / "gravity_comp" / "control.py").is_file():
+    GRAVITY_COMP_REPO = Path.home() / "midas_hand" / "midas-piper-control"
 
 
 def read_csv(path):
@@ -188,10 +190,9 @@ class ArgumentTests(unittest.TestCase):
     def test_dagger_options_are_checked(self):
         with tempfile.TemporaryDirectory() as root:
             args = parse_args(["--predictor", "h", "--dagger", root, "--takeover", "kinesthetic"])
-            self.assertEqual(args.pedal_keys, ["b", "c", "a"])
+            self.assertEqual(args.pedal_keys, ["a", "b", "c"])
             self.assertEqual(args.kinesthetic_assist_frac, 0.0)
-            for bad in (["--dagger", root],
-                        ["--dagger", root, "--takeover", "teleop"],
+            for bad in (["--dagger", root, "--takeover", "teleop"],
                         ["--dagger", root, "--takeover", "kinesthetic", "--no-log"],
                         ["--dagger", root, "--takeover", "kinesthetic", "--fake"],
                         ["--dagger", root, "--takeover", "kinesthetic", "--arm-control", "pose"],
@@ -206,6 +207,47 @@ class ArgumentTests(unittest.TestCase):
                                  "--leader-config", "leader.yaml"])
             self.assertFalse(teleop.teleop_position_only)
             self.assertIsNone(parse_args(["--predictor", "h"]).dagger)
+
+    def test_minimal_dagger_defaults_and_explicit_overrides(self):
+        args = parse_args(["--predictor", "h", "--dagger", "round1"])
+        self.assertEqual(args.takeover, "kinesthetic")
+        plain = parse_args(["--predictor", "h"])
+        dagger_keys = {"dagger", "takeover", "allow_underpowered", "gravity_force"}
+        for key, value in vars(plain).items():
+            if key not in dagger_keys:
+                self.assertEqual(getattr(args, key), value, key)
+        self.assertFalse(args.rtc)
+        self.assertTrue(args.allow_underpowered)
+        self.assertTrue(args.gravity_force)
+        self.assertFalse(args.show)
+        self.assertIsNone(args.dagger_round)
+        args = parse_args(["--predictor", "h", "--dagger=round1", "--async-inference",
+                           "--start-home=home_cube_newhw", "--hand-config=custom.yaml", "--hand-port=/dev/custom",
+                           "--rtc-max-guidance=2", "--pedal-keys", "c", "b", "a",
+                           "--no-allow-underpowered", "--no-gravity-force", "--gravity-comp-repo=/tmp/gc"])
+        self.assertFalse(args.rtc)
+        self.assertTrue(args.async_inference)
+        self.assertEqual(args.start_home, "home_cube_newhw")
+        self.assertEqual(args.hand_config, Path("custom.yaml"))
+        self.assertEqual(args.hand_port, "/dev/custom")
+        self.assertEqual(args.rtc_max_guidance, 2)
+        self.assertEqual(args.pedal_keys, ["c", "b", "a"])
+        self.assertFalse(args.allow_underpowered)
+        self.assertFalse(args.gravity_force)
+        self.assertEqual(args.gravity_comp_repo, Path("/tmp/gc"))
+        plain = parse_args(["--predictor", "h"])
+        self.assertFalse(plain.rtc)
+        self.assertFalse(plain.allow_underpowered)
+        self.assertFalse(plain.gravity_force)
+
+    def test_gravity_repo_discovery_precedence(self):
+        with patch.dict(os.environ, {"TRIMORPH_GRAVITY_COMP_REPO": "/tmp/environment-gc"}):
+            self.assertEqual(dagger.gravity_comp_candidates("/tmp/explicit-gc"), [Path("/tmp/explicit-gc")])
+            self.assertEqual(dagger.gravity_comp_candidates(), [Path("/tmp/environment-gc")])
+        with patch.dict(os.environ, {}, clear=True):
+            candidates = dagger.gravity_comp_candidates()
+            self.assertEqual(candidates[0].name, "midas-piper-control")
+            self.assertIn(Path.home() / "midas_hand" / "midas-piper-control", candidates)
 
     def test_action_reply_header_carries_policy_provenance(self):
         left, right = socket.socketpair()
@@ -427,6 +469,7 @@ class FakeArmApi:
         self.stamp = 0.0
         self.calls = []
         self.torques = []
+        self.command_times = []
         self.on_read = on_read
         self.reads = 0
 
@@ -439,11 +482,16 @@ class FakeArmApi:
 
     def get_motor_state(self):
         return SimpleNamespace(velocities=[0.0] * 6, torques=[0.0] * 6, currents=[0.0] * 6,
-                               timestamp=self.stamp, hz=300.0)
+                               timestamp=self.stamp, timestamps=[self.stamp] * 6, hz=300.0)
 
     def move_mit_torque(self, joint, torque, **kwargs):
         self.torques.append((joint, torque, kwargs))
+        self.command_times.append(dagger.time.monotonic())
         return torque
+
+    def set_mit_mode(self):
+        self.calls.append("set_mit_mode")
+        self.mode_time = dagger.time.monotonic()
 
     def get_joint_angles(self):
         return [0.1] * 6
@@ -508,7 +556,7 @@ class KinestheticTakeoverTests(unittest.TestCase):
             finally:
                 self.handler_after = signal.getsignal(signal.SIGINT)
 
-    def test_gravity_ramps_in_then_the_end_pedal_freezes_and_returns_to_position_control(self):
+    def test_supported_handoff_then_end_pedal_freezes_and_returns_to_position_control(self):
         api = FakeArmApi()
         before = signal.getsignal(signal.SIGINT)
         outcome, session, robot = self.run_takeover(api, end_at_s=2.0)
@@ -517,19 +565,80 @@ class KinestheticTakeoverTests(unittest.TestCase):
         robot.hand_writer.pause.assert_called_once()
         robot.hand.disable_torque.assert_called_once()
         self.assertEqual(api.calls[0], "set_mit_mode")
+        self.assertEqual(api.command_times[0], api.mode_time)  # no application sleep before support
         self.assertEqual(api.calls[-4:], ["enable", "set_position_mode", "move_joint", "move_joint"])
         states = [row["state"] for row in session.tables["gravity_comp.csv"]]
         self.assertEqual([s for i, s in enumerate(states) if i == 0 or s != states[i - 1]],
-                         ["RAMP_IN", "ACTIVE", "BRAKE", "FREEZE_HOLD"])
+                         ["HANDOFF", "ACTIVE", "BRAKE", "FREEZE_HOLD"])
         first_ff, full_ff = api.torques[0][1], api.torques[6 * 300][1]
-        self.assertLess(first_ff, 0.05)  # gravity ramps in from zero
+        self.assertAlmostEqual(first_ff, 0.5)  # full gravity from the first MIT command
         self.assertAlmostEqual(full_ff, 0.5, places=6)
+        self.assertEqual(api.torques[0][2]["kp"], self.plan.config.hold_kp)
+        self.assertEqual(api.torques[0][2]["p_des"], 0.1)
+        handoff_rows = [r for r in session.tables["gravity_comp.csv"] if r["state"] == "HANDOFF"]
+        self.assertGreater(handoff_rows[0]["kp_1"], handoff_rows[-1]["kp_1"])
         (start_label, active_s), (end_label, frozen_s) = session.intervals
         self.assertEqual((start_label, end_label), ("start", "end"))
         self.assertAlmostEqual(active_s, 1.0, delta=0.02)  # human data starts after the ramp-in
         self.assertAlmostEqual(frozen_s, 2.0, delta=0.02)
-        self.assertEqual(session.events[:4], ["hand_limp", "mit_switch", "ramp_in", "active"])
+        self.assertEqual(session.events[:4], ["hand_limp", "mit_switch", "supported_handoff", "active"])
         self.assertIsNone(robot.commanded_pose)
+
+    def test_stream_watchdog_names_joint_and_individual_motor_stalls(self):
+        for source in ("joint", "motor1", "motor5", "motor6"):
+            with self.subTest(source=source):
+                watch = dagger.FeedbackWatchdog()
+                clocks = {"joint": 1.0, **{f"motor{i}": 1.0 for i in range(1, 7)}}
+                self.assertTrue(watch.update(clocks, 0.0))
+                clocks = {name: 1.0 if name == source else 2.0 for name in clocks}
+                self.assertFalse(watch.update(clocks, 0.06))
+                self.assertEqual(watch.stale_sources, [source])
+                clocks[source] = 2.0
+                self.assertTrue(watch.update(clocks, 0.061))
+
+    def test_stuck_motor_clock_is_rejected_before_mode_switch(self):
+        api = FakeArmApi()
+        original = api.get_motor_state
+
+        def stuck():
+            state = original()
+            state.timestamps[4] = 0.001
+            return state
+
+        api.get_motor_state = stuck
+        with self.assertRaisesRegex(RuntimeError, "before MIT.*motor5"):
+            self.run_takeover(api, end_at_s=2.0)
+        self.assertNotIn("set_mit_mode", api.calls)
+        self.assertEqual(api.torques, [])
+
+    def test_single_motor_clock_freeze_brakes_with_full_gravity_and_names_source(self):
+        api = FakeArmApi()
+        original = api.get_motor_state
+
+        def stuck_after_entry():
+            state = original()
+            state.timestamps[4] = min(api.stamp, 0.03)
+            return state
+
+        api.get_motor_state = stuck_after_entry
+        with self.assertRaisesRegex(RuntimeError, "stale Piper feedback: stale sources: motor5"):
+            self.run_takeover(api, end_at_s=2.0)
+        self.assertEqual(api.calls[-4:], ["enable", "set_position_mode", "move_joint", "move_joint"])
+        self.assertTrue(all(abs(torque - 0.5) < 1e-6 for _, torque, _ in api.torques))
+
+    def test_stationary_joint_with_advancing_clocks_does_not_abort(self):
+        api = FakeArmApi()
+        original = api.get_joint_state
+
+        def moving():
+            state = original()
+            state.joints[0] += 0.00001 * api.reads
+            return state
+
+        api.get_joint_state = moving
+        outcome, session, _ = self.run_takeover(api, end_at_s=2.0)
+        self.assertEqual(outcome, "success")
+        self.assertTrue(all(not row["stale_sources"] for row in session.tables["gravity_comp.csv"]))
 
     def test_ctrl_c_freezes_holds_and_switches_to_position_mode_before_stopping(self):
         def interrupt(reads):
@@ -559,7 +668,7 @@ class KinestheticTakeoverTests(unittest.TestCase):
                 self.assertIn("J1", dagger.start_sag_warning(plan, starts["home_4c"]))
                 self.assertIsNone(dagger.start_sag_warning(plan, starts["home_cube_newhw"]))
                 with self.assertRaisesRegex(ValueError, "allow-underpowered"):
-                    dagger.prepare_kinesthetic(dagger_args(root, "--takeover", "kinesthetic", "--gravity-force",
+                    dagger.prepare_kinesthetic(dagger_args(root, "--takeover", "kinesthetic", "--gravity-force", "--no-allow-underpowered",
                                                            "--gravity-comp-repo", str(GRAVITY_COMP_REPO)))
                 with self.assertRaisesRegex(ValueError, "piper-firmware"):
                     dagger.prepare_kinesthetic(dagger_args(root, "--takeover", "kinesthetic", "--gravity-force",
@@ -567,60 +676,7 @@ class KinestheticTakeoverTests(unittest.TestCase):
                                                            "--gravity-comp-repo", str(GRAVITY_COMP_REPO)))
 
 
-class ExportTests(unittest.TestCase):
-    def make_rollout(self, root, index, frames_ns, intervals, takeover="teleop", outcome="success"):
-        raw = root / "raw" / f"episode_{index:06d}"
-        raw.mkdir(parents=True)
-        with (raw / "camera_timestamps.csv").open("w", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(["frame_idx", "monotonic_ns"])
-            writer.writerows([i, t] for i, t in enumerate(frames_ns))
-        (raw / "metadata.json").write_text(json.dumps({"status": "complete", "dagger": {
-            "takeover": takeover, "outcome": outcome, "round": 1, "policy": {"sha256": "abc"},
-            "human_intervals": intervals}}))
-        stem = f"{index:06d}"
-        for name in ("camera/mp4_files", "processed_encoder_t", "absolute_action_t", "syncs"):
-            (root / name).mkdir(parents=True, exist_ok=True)
-        (root / "camera" / "mp4_files" / f"{stem}.mp4").write_bytes(b"video")
-        np.save(root / "processed_encoder_t" / f"{stem}.npy", np.zeros((50, 13), np.float32))
-        np.save(root / "absolute_action_t" / f"{stem}.npy", np.zeros((50, 6), np.float32))
-        rows = np.arange(1, len(frames_ns) - 1)
-        np.savez_compressed(root / "syncs" / f"{stem}.npz", frame_idx=rows, encoder_idx=rows, pose_idx=rows,
-                            start_pose=np.zeros(6), pose_frame=np.array("piper_base"))
-
-    def test_human_intervals_become_trimmed_training_episodes(self):
-        from scripts.dagger.export_segments import export
-
-        with tempfile.TemporaryDirectory() as directory:
-            root, out = Path(directory) / "dagger", Path(directory) / "dagger_human"
-            ms = 1_000_000
-            frames = [i * 33 * ms for i in range(60)]  # 30 fps
-            self.make_rollout(root, 0, frames, [[10 * 33 * ms, 50 * 33 * ms], [52 * 33 * ms, 55 * 33 * ms]])
-            self.make_rollout(root, 1, frames, [[0, 59 * 33 * ms]], outcome="failure")
-            self.make_rollout(root, 2, frames, [[0, 40 * 33 * ms]], takeover="kinesthetic")
-            segments, skipped = export(root, out, min_rows=10)
-            self.assertEqual([(s["rollout"], s["interval"]) for s in segments], [(0, 0), (2, 0)])
-            first = np.load(out / "syncs" / "000000.npz")
-            # Teleop: 400 ms (about 12 frames) trimmed after the engagement at frame 10.
-            self.assertEqual(int(first["frame_idx"][0]), 23)
-            self.assertEqual(int(first["frame_idx"][-1]), 50)
-            self.assertEqual(str(first["source"]), "dagger_human")
-            self.assertEqual(json.loads(str(first["provenance"]))["policy_sha256"], "abc")
-            second = np.load(out / "syncs" / "000001.npz")
-            self.assertEqual(int(second["frame_idx"][0]), 1)  # kinesthetic: no trim
-            self.assertEqual((out / "camera" / "mp4_files" / "000001.mp4").read_bytes(), b"video")
-            self.assertEqual(np.load(out / "processed_encoder_t" / "000001.npy").shape, (50, 13))
-            reasons = [reason for _, reason in skipped]
-            self.assertTrue(any("outcome failure" in r for r in reasons))
-            self.assertTrue(any("rows < 10" in r for r in reasons))
-            with self.assertRaises(FileExistsError):
-                export(root, out)
-            segments, _ = export(root, out, min_rows=10, outcomes=("success", "failure"), force=True,
-                                 video="symlink")
-            self.assertEqual(len(segments), 3)
-            self.assertTrue((out / "camera" / "mp4_files" / "000000.mp4").is_symlink())
-            summary = json.loads((out / "segments.json").read_text())
-            self.assertEqual(len(summary["segments"]), 3)
+# Compact raw-to-training export coverage lives in test_dagger_export.py.
 
 
 if __name__ == "__main__":

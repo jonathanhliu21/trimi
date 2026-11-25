@@ -68,6 +68,12 @@ Press Enter to move to the start pose, then press the foot pedal to start the
 policy. Camera preview stays live while waiting. With `--no-pedal`, execution
 starts as soon as setup finishes.
 
+The hand stays torque-off during initial setup and the arm's start move. Once
+the arm reaches its target, the executor writes the hand-start target before
+enabling hand torque. With `--no-hand-start`, it instead restores torque at the
+hand's measured pose after the arm arrives. `--no-start-move` holds the measured
+hand pose immediately because no arm start move is performed.
+
 This enables and commands the actual hand and arm. Before the first observation
 the arm ramps in joint space (10 deg/s, after an Enter prompt) to a named start
 from `PIPER_START_JOINTS_DEG` in `data_collection/collection/config.py`:
@@ -152,10 +158,39 @@ calibration, gains, and limits. It verifies the connected motor models.
 
 ## HG-DAgger rollouts (`--dagger`)
 
+For the current kinesthetic bench setup:
+
+```bash
+bash inference/executor/run_kinesthetic.sh --predictor GPU_HOST \
+  --rtc --rtc-max-guidance 5 --start-home home_multi \
+  --hand-config config/xl330_new_hand_transparent.yaml \
+  --hand-port /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO3G5-if00-port0 \
+  --dagger DATASET_ROOT
+```
+
+`--dagger` defaults to kinesthetic takeover, pedals `a b c` (start/takeover,
+success, failure), and the current calibration's `allow-underpowered`/`gravity-force`
+allowances. It does not change RTC, guidance, start pose, hand configuration,
+hand port or `--show`; specify those independently as above.
+Explicit options override defaults; `--no-allow-underpowered` and
+`--no-gravity-force` restore strict calibration checks. Bench defaults live in
+`data_collection/collection/config.py`. `--dagger-round` remains optional for
+older commands; naming the dataset folder by round is sufficient.
+
+`--gravity-comp-repo PATH` is still supported. Without it, discovery checks
+`TRIMORPH_GRAVITY_COMP_REPO`, a sibling `midas-piper-control` checkout, then
+`~/midas_hand/midas-piper-control` and `~/workspace/midas-piper-control`. An
+explicit path or environment setting is authoritative (an invalid setting fails
+instead of silently selecting another checkout). For a custom location, set:
+
+```bash
+export TRIMORPH_GRAVITY_COMP_REPO=/path/to/midas-piper-control
+```
+
 `--dagger DATASET_ROOT --takeover teleop|kinesthetic` records every rollout as a
 raw episode in the collection layout and lets the operator take over:
 
-- Three pedals (`--pedal-keys`, default `b c a`; find the codes with
+- Three pedals (`--pedal-keys`, default `a b c`; find the codes with
   `python -m scripts.piper_api.foot_pedal`):
   - takeover: starts a rollout at the start pose, and takes over during the policy;
   - success and failure: end the rollout (hold failure 2 s to discard it).
@@ -167,8 +202,17 @@ raw episode in the collection layout and lets the operator take over:
     the pedal.
 - Use `--rtc` or `--async-inference` so the pedal is read every action.
 
-Postprocess with `data_collection/postprocess_dataset.py --pose-source piper`, then
-keep the human-controlled intervals with `scripts/dagger/export_segments.py`.
+Export directly from raw recordings with
+`python scripts/dagger/export_dataset.py DATASET_ROOT --out OUTPUT_ROOT`.
+It selects successful rollouts with human corrections, invokes shared Piper
+postprocessing and validates sync alignment. By default, videos and syncs include
+the full retained rollout, including autonomous policy execution. Add `--trim`
+to export only human corrections with compact videos/arrays and remapped syncs.
+The source is preserved and nonempty outputs are refused. Alternatively,
+`--overwrite-raw` destructively replaces the original dataset with selected
+rollouts and deletes rejected episodes after validation; add `--trim` to keep
+corrections only. Stop collection
+and training before using that option. One of these two modes is required.
 See `DAGGER_PLAN.md` at the repository root for the full procedure, the
 training options, and the bench checklist.
 

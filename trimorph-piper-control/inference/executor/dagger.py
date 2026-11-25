@@ -16,8 +16,7 @@ Each rollout is one raw episode in the collection layout
 converts it, and scripts/dagger/export_segments.py keeps the human-controlled
 intervals for training (DAGGER_PLAN.md at the repository root).
 
-Pedals (--pedal-keys TAKEOVER SUCCESS FAILURE, default b c a: the middle,
-right and left pedal of a PCsensor 3-pedal; find yours with
+Pedals (--pedal-keys TAKEOVER SUCCESS FAILURE, default a b c; find yours with
 python -m scripts.piper_api.foot_pedal):
   takeover  at the start pose: start a rollout. During the policy: take over.
             During a teleop takeover: held = the arm follows the Quest.
@@ -26,17 +25,19 @@ python -m scripts.piper_api.foot_pedal):
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import json
 import math
+import os
 import shutil
 import signal
 import sys
 import threading
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +46,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 ROLES = ("takeover", "success", "failure")
-DEFAULT_PEDAL_KEYS = ("b", "c", "a")
+DEFAULT_PEDAL_KEYS = ("a", "b", "c")
 TAKEOVER_MODES = ("teleop", "kinesthetic")
 OUTCOMES = ("success", "failure")  # saved with status "complete"; "discard" deletes the episode
 EULER_FIELDS = ("x", "y", "z", "roll", "pitch", "yaw")
@@ -61,7 +62,10 @@ COMMAND_FIELDS = ("monotonic_ns", "source", "cycle", "index", "engaged", *(f"raw
 EVENT_FIELDS = ("monotonic_ns", "source", "cycle", "event", "detail")
 QUEST_FIELDS = ("monotonic_ns", "seq", "px", "py", "pz", "qx", "qy", "qz", "qw")
 GRAVITY_FIELDS = ("monotonic_ns", "state", *(f"q_{i}" for i in range(1, 7)), *(f"v_{i}" for i in range(1, 7)),
-                  *(f"tau_cmd_{i}" for i in range(1, 7)), *(f"tau_fb_{i}" for i in range(1, 7)))
+                  *(f"tau_cmd_{i}" for i in range(1, 7)), *(f"tau_fb_{i}" for i in range(1, 7)),
+                  "joint_timestamp_s", "motor_timestamp_s", *(f"motor_timestamp_{i}_s" for i in range(1, 7)),
+                  "stale_sources", "feedback_error", *(f"kp_{i}" for i in range(1, 7)),
+                  *(f"kd_{i}" for i in range(1, 7)))
 # A leader sample older than this is not followed; the follower keeps its last target.
 LEADER_TIMEOUT_S = 0.25
 # gravity_comp: consecutive stale feedback reads before a freeze, and the
@@ -871,7 +875,7 @@ class TeleopTakeover:
 
 def import_gravity_comp(repo=None):
     """midas-piper-control's gravity_comp package (calib, control, drag_mode, hw_session, model)."""
-    candidates = [Path(repo).expanduser()] if repo else list(DEFAULT_GRAVITY_COMP_REPOS)
+    candidates = gravity_comp_candidates(repo)
     root = next((path for path in candidates if (path / "gravity_comp" / "__init__.py").is_file()), None)
     if root is None:
         raise FileNotFoundError("midas-piper-control with gravity_comp/ not found in "
@@ -887,6 +891,17 @@ def import_gravity_comp(repo=None):
 
     return SimpleNamespace(root=root, calib=calib, control=control, drag_mode=drag_mode,
                            hw_session=hw_session, model=model)
+
+
+def gravity_comp_candidates(repo=None):
+    """Explicit path > environment > sibling checkout > known local checkouts."""
+    if repo is not None:
+        return [Path(repo).expanduser()]
+    configured = os.environ.get("TRIMORPH_GRAVITY_COMP_REPO")
+    if configured:
+        return [Path(configured).expanduser()]
+    sibling = Path(__file__).resolve().parents[3] / "midas-piper-control"
+    return [sibling, *DEFAULT_GRAVITY_COMP_REPOS]
 
 
 @dataclass
@@ -945,12 +960,37 @@ def start_sag_warning(plan, joints_deg):
               "(quest_0, home_4a, home_cube_newhw, home_unscrew1)")
 
 
+class FeedbackWatchdog:
+    """Check actual source clocks, including each motor, rather than unchanged q/v."""
+
+    def __init__(self, max_age_s=0.05):
+        self.max_age_s = max_age_s
+        self.seen = {}
+        self.stale_sources = []
+
+    def update(self, timestamps, now):
+        self.stale_sources = []
+        for name, stamp in timestamps.items():
+            if not math.isfinite(stamp) or stamp <= 0:
+                self.stale_sources.append(name)
+                continue
+            previous = self.seen.get(name)
+            if previous is not None and stamp < previous[0]:
+                self.stale_sources.append(name)
+            elif previous is None or stamp > previous[0]:
+                self.seen[name] = (stamp, now)
+            elif now - previous[1] > self.max_age_s:
+                self.stale_sources.append(name)
+        return not self.stale_sources
+
+
 class KinestheticTakeover:
     """The arm under gravity compensation in MIT torque mode, the hand limp; the operator moves both.
 
-    Entry follows drag_mode: MIT mode, then gravity ramps in over
-    --kinesthetic-ramp-in-s while the operator supports the arm (the firmware
-    holds no torque across the mode switch). The end pedal freezes the arm
+    Entry streams full gravity support immediately after selecting MIT mode,
+    then releases a latched position hold over --kinesthetic-ramp-in-s.
+    Physical support is still required across the firmware mode transition.
+    The end pedal freezes the arm
     (brake, then a position hold with gravity retained), and it returns to
     position control at the measured joints in the order gravity_comp's
     goto_pose uses. Any error or Ctrl-C freezes first and never leaves the arm
@@ -968,12 +1008,51 @@ class KinestheticTakeover:
         hw._resolve_scales()
         self.hw = hw
 
+    def read_feedback(self):
+        js, ms = self.robot.piper.get_joint_state(), self.robot.piper.get_motor_state()
+        if js is None or ms is None:
+            raise RuntimeError("Missing Piper joint or motor feedback")
+        stamps = getattr(ms, "timestamps", None)
+        if stamps is None or len(stamps) != 6:
+            raise RuntimeError("Piper feedback lacks six per-motor timestamps; update PiperAPI")
+        clocks = {"joint": float(js.timestamp),
+                  **{f"motor{i}": float(stamp) for i, stamp in enumerate(stamps, 1)}}
+        sample = self.plan.gc.hw_session.StateSample(
+            q=np.asarray(js.joints, dtype=float), v=np.asarray(ms.velocities, dtype=float),
+            tau_fb=np.asarray(ms.torques, dtype=float), current=np.asarray(ms.currents, dtype=float),
+            t_wall=time.monotonic(), feedback_hz=float(min(js.hz, ms.hz)),
+            t_feedback=float(ms.timestamp), t_joint=float(js.timestamp))
+        for values in (sample.q, sample.v, sample.tau_fb, sample.current):
+            if values.shape != (6,) or not np.isfinite(values).all():
+                raise RuntimeError("Invalid Piper feedback: expected six finite values")
+        self.hw._last_q = sample.q.copy()
+        return sample, clocks
+
+    def preflight_feedback(self, watchdog):
+        """Require every source clock to advance while still in position control."""
+        sample, initial = self.read_feedback()
+        watchdog.update(initial, time.monotonic())
+        advanced = set()
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            time.sleep(1.0 / self.args.kinesthetic_rate_hz)
+            sample, clocks = self.read_feedback()
+            fresh = watchdog.update(clocks, time.monotonic())
+            advanced.update(name for name in clocks if clocks[name] > initial[name])
+            if fresh and len(advanced) == len(initial):
+                return sample
+        missing = sorted(set(initial) - advanced)
+        raise RuntimeError("Takeover rejected before MIT: feedback not advancing: "
+                           + ", ".join(missing or watchdog.stale_sources))
+
     def describe(self):
         config = self.plan.config
         return {"gravity_calibration": str(self.plan.calibration),
                 "gravity_calibration_sha256": self.plan.calibration_sha256,
                 "gravity_comp_repo": str(self.plan.gc.root), "driver": self.plan.driver,
                 "assist_frac": self.args.kinesthetic_assist_frac, "ramp_in_s": config.ramp_in_s,
+                "entry": "full_gravity_with_releasing_position_hold",
+                "feedback_watchdog": "joint_and_per_motor_timestamps",
                 "rate_hz": self.args.kinesthetic_rate_hz, "hand": self.args.kinesthetic_hand,
                 "tau_cap_nm": np.asarray(config.tau_cap_nm).tolist(),
                 "underpowered_joints": self.plan.info.get("underpowered_joints", [])}
@@ -996,19 +1075,31 @@ class KinestheticTakeover:
         args, robot, hw = self.args, self.robot, self.hw
         control = self.plan.gc.control
         state_enum = control.DragState
-        controller = control.DragController(self.plan.config, self.plan.model.gravity_torques)
+        # Friction assistance stays off until the supported handoff is complete.
+        handoff_config = replace(self.plan.config, assist_nm=np.zeros(6))
+        controller = control.DragController(handoff_config, self.plan.model.gravity_torques)
         velocity_filter = control.VelocityFilter()
-        watchdog = self.plan.gc.hw_session.StaleWatchdog()
+        watchdog = FeedbackWatchdog()
         end = EndPedals(session.pedals, args.discard_hold_s)
         rows = []
         session.add_table("gravity_comp.csv", GRAVITY_FIELDS, rows)
+        # Check clocks and build the supported first command BEFORE changing torque modes.
+        initial = self.preflight_feedback(watchdog)
+        q0 = initial.q.copy()
+        controller.start(q0)
+        # Enter the controller's full-gravity phase before sending any commands.
+        # The handoff below releases position stiffness, not gravity torque. Keeping
+        # the controller ACTIVE also preserves full gravity if braking interrupts it.
+        first = controller.update(q0, np.zeros(6), self.plan.config.ramp_in_s)
+        first = replace(first, p_des=q0.copy(), kp=np.full(6, self.plan.config.hold_kp),
+                        kd=np.full(6, self.plan.config.hold_kd))
         if args.kinesthetic_hand == "limp":
             robot.hand_writer.pause()
             with robot.hand_writer.lock:
                 robot.hand.disable_torque()
             session.event("hand_limp")
-        print(f"Kinesthetic takeover: SUPPORT THE ARM. Gravity compensation ramps in over "
-              f"{self.plan.config.ramp_in_s:g} s; then move the arm and fingers.", flush=True)
+        print(f"Kinesthetic takeover: SUPPORT THE ARM. Full gravity support with a position hold; "
+              f"the hold releases over {self.plan.config.ramp_in_s:g} s. Wait for 'active' before teaching.", flush=True)
         sigint = {"count": 0}
 
         def on_sigint(signum, frame):
@@ -1020,31 +1111,50 @@ class KinestheticTakeover:
         frozen = False
         try:
             session.event("mit_switch")
-            hw.set_mit_mode()
+            # Do not use HardwareSession.set_mit_mode(): it sleeps 0.3 s with
+            # no torque commands. Stream the supported command without that gap.
             armed = True
-            q0 = hw.read_state().q
-            controller.start(q0)
-            session.event("ramp_in")
+            robot.piper.set_mit_mode()
+            sent = hw.send_mit(first)
+            rows.append({"monotonic_ns": time.monotonic_ns(), "state": "HANDOFF",
+                         "joint_timestamp_s": initial.t_joint, "motor_timestamp_s": initial.t_feedback,
+                         **{f"motor_timestamp_{i}_s": watchdog.seen[f"motor{i}"][0] for i in range(1, 7)},
+                         "stale_sources": "", "feedback_error": "",
+                         **{f"kp_{i}": x for i, x in enumerate(first.kp, 1)},
+                         **{f"kd_{i}": x for i, x in enumerate(first.kd, 1)},
+                         **{f"q_{i}": f"{x:.6f}" for i, x in enumerate(q0, 1)},
+                         **{f"v_{i}": f"{x:.6f}" for i, x in enumerate(initial.v, 1)},
+                         **{f"tau_cmd_{i}": f"{x:.4f}" for i, x in enumerate(sent, 1)},
+                         **{f"tau_fb_{i}": f"{x:.4f}" for i, x in enumerate(initial.tau_fb, 1)}})
+            session.event("supported_handoff")
             period = 1.0 / args.kinesthetic_rate_hz
             next_tick = time.monotonic()
+            handoff_start = next_tick
             next_view = next_tick
-            last_t = last_sample = hold_since = None
+            last_t = hold_since = None
+            last_sample = initial
+            clocks = {}
             stale = cycles = overruns = 0
             while True:
                 now = time.monotonic()
                 sample = None
+                reading = None
+                clocks = {}
+                feedback_error = ""
                 try:
-                    reading = hw.read_state()
-                    if watchdog.update(reading):
+                    reading, clocks = self.read_feedback()
+                    if watchdog.update(clocks, now):
                         sample = reading
-                except RuntimeError:
-                    pass
+                    else:
+                        feedback_error = "stale sources: " + ", ".join(watchdog.stale_sources)
+                except RuntimeError as exc:
+                    feedback_error = str(exc)
                 if sample is not None:
                     stale, last_sample = 0, sample
                 else:
                     stale += 1
                     if stale >= STALE_FREEZE_CYCLES and abort is None:
-                        abort = "stale Piper feedback"
+                        abort = "stale Piper feedback: " + feedback_error
                         controller.freeze(abort)
                 if last_sample is None:
                     q, v, tau_fb = q0, np.zeros(6), np.zeros(6)
@@ -1053,19 +1163,34 @@ class KinestheticTakeover:
                 dt = period if last_t is None else max(1e-4, now - last_t)
                 last_t = now
                 velocity = velocity_filter.update(v, dt)
+                handoff = max(0.0, 1.0 - (now - handoff_start) / self.plan.config.ramp_in_s)
+                if handoff == 0:
+                    controller.config = self.plan.config
                 command = controller.update(q, velocity, dt)
+                if state_enum.ACTIVE is controller.state and handoff > 0:
+                    command = replace(command, p_des=q0.copy(),
+                                      kp=np.full(6, self.plan.config.hold_kp * handoff),
+                                      kd=np.maximum(command.kd, self.plan.config.hold_kd * handoff))
                 sent = hw.send_mit(command)
                 state = controller.state
                 cycles += 1
-                rows.append({"monotonic_ns": time.monotonic_ns(), "state": state.name,
+                rows.append({"monotonic_ns": time.monotonic_ns(),
+                             "state": "HANDOFF" if state is state_enum.ACTIVE and handoff > 0 else state.name,
+                             "joint_timestamp_s": clocks.get("joint", ""),
+                             "motor_timestamp_s": reading.t_feedback if reading is not None else "",
+                             **{f"motor_timestamp_{i}_s": clocks.get(f"motor{i}", "") for i in range(1, 7)},
+                             "stale_sources": ",".join(watchdog.stale_sources), "feedback_error": feedback_error,
+                             **{f"kp_{i}": x for i, x in enumerate(command.kp, 1)},
+                             **{f"kd_{i}": x for i, x in enumerate(command.kd, 1)},
                              **{f"q_{i}": f"{x:.6f}" for i, x in enumerate(q, start=1)},
                              **{f"v_{i}": f"{x:.6f}" for i, x in enumerate(velocity, start=1)},
                              **{f"tau_cmd_{i}": f"{x:.4f}" for i, x in enumerate(sent, start=1)},
                              **{f"tau_fb_{i}": f"{x:.4f}" for i, x in enumerate(tau_fb, start=1)}})
                 if state is state_enum.ACTIVE and session.episode is not None \
-                        and session.episode.open_interval is None and not frozen:
+                        and session.episode.open_interval is None and not frozen and handoff == 0:
                     session.human_interval_start()
                     session.event("active")
+                    print("Kinesthetic takeover active: position hold released; begin teaching.", flush=True)
                 if sigint["count"] and abort is None:
                     abort = "Ctrl-C"
                     controller.freeze(abort)
@@ -1137,7 +1262,7 @@ def add_arguments(parser):
                        help="Record each rollout to DATASET_ROOT/raw/episode_N; the takeover pedal hands the "
                             "rest of the episode to the operator (inference/executor/dagger.py)")
     group.add_argument("--takeover", choices=TAKEOVER_MODES,
-                       help="With --dagger: teleop (Quest + worn leader TriMI) or kinesthetic (gravity comp)")
+                       help="With --dagger: defaults to kinesthetic (gravity comp); teleop needs leader/Quest options")
     group.add_argument("--dagger-round", type=int, default=None, help="DAgger round number saved with each episode")
     group.add_argument("--pedal-keys", nargs=3, default=list(DEFAULT_PEDAL_KEYS),
                        metavar=("TAKEOVER", "SUCCESS", "FAILURE"),
@@ -1175,24 +1300,38 @@ def add_arguments(parser):
     kinesthetic = parser.add_argument_group("kinesthetic takeover (--takeover kinesthetic)")
     kinesthetic.add_argument("--gravity-comp-repo", type=Path, default=None,
                              help="midas-piper-control checkout with gravity_comp/ "
-                                  "(default: ~/midas_hand/midas-piper-control or ~/workspace/midas-piper-control)")
+                                  "(otherwise TRIMORPH_GRAVITY_COMP_REPO, sibling checkout, then known home paths)")
     kinesthetic.add_argument("--gravity-calib", type=Path,
                              default=Path(__file__).resolve().parents[2] / "scripts" / "grav_comp" / "calib"
                              / "robot1_trimi.json", help="Gravity calibration artifact (default: %(default)s)")
     kinesthetic.add_argument("--kinesthetic-rate-hz", type=float, default=200.0)
     kinesthetic.add_argument("--kinesthetic-ramp-in-s", type=float, default=1.0,
-                             help="Gravity ramp-in after the takeover while the operator supports the arm "
-                                  "(at least 1, drag_mode uses 4)")
+                             help="Supported handoff: release position stiffness over this duration while "
+                                  "keeping full gravity compensation (at least 1 s)")
     kinesthetic.add_argument("--kinesthetic-assist-frac", type=float, default=0.0,
                              help="Friction assist as a fraction of the measured Coulomb friction (<= 0.6; "
                                   "default %(default)s: none until drag_mode has validated one)")
     kinesthetic.add_argument("--kinesthetic-hand", choices=("limp", "hold"), default="limp",
                              help="limp: hand torque off so the operator moves the fingers (default); "
                                   "hold: keep the policy's last hand target")
-    kinesthetic.add_argument("--allow-underpowered", action="store_true",
-                             help="Run when the firmware torque cap cannot hold the arm everywhere (drag_mode's flag)")
-    kinesthetic.add_argument("--gravity-force", action="store_true",
-                             help="Accept a friction section saved with failed gates (drag_mode --force)")
+    kinesthetic.add_argument("--allow-underpowered", action=argparse.BooleanOptionalAction, default=None,
+                             help="Allow capped gravity support (default on for kinesthetic DAgger; "
+                                  "--no-allow-underpowered restores strict checking)")
+    kinesthetic.add_argument("--gravity-force", action=argparse.BooleanOptionalAction, default=None,
+                             help="Accept failed friction gates (default on for kinesthetic DAgger; "
+                                  "--no-gravity-force restores strict checking)")
+
+
+def apply_defaults(args, argv):
+    """Apply only DAgger-specific defaults; leave executor settings unchanged."""
+    from data_collection.collection import config as defaults
+    if args.dagger is not None:
+        args.takeover = args.takeover or "kinesthetic"
+    kinesthetic = args.dagger is not None and args.takeover == "kinesthetic"
+    if args.allow_underpowered is None:
+        args.allow_underpowered = kinesthetic and defaults.DAGGER_ALLOW_UNDERPOWERED
+    if args.gravity_force is None:
+        args.gravity_force = kinesthetic and defaults.DAGGER_GRAVITY_FORCE
 
 
 def check_arguments(parser, args):

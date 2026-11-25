@@ -75,6 +75,9 @@ DEFAULT_GRAV_COMP_CALIB = (
 KINESTHETIC_HAND_CONFIG = Path("config/xl330_new_hand_transparent.yaml")
 KINESTHETIC_HAND_PORT = "/dev/ttyUSB0"
 KINESTHETIC_HAND_OPERATING_MODE = 3
+# Defaults applied only to --dagger kinesthetic rollouts; CLI overrides win.
+DAGGER_ALLOW_UNDERPOWERED = True
+DAGGER_GRAVITY_FORCE = True
 # Named Piper start configurations (J1..J6 degrees), each the IK solution of a
 # dataset's median start flange pose. quest_0: data_trimorph_hand_mocap_quest_0,
 # flange about (144, -202, 270) mm. data_trimorph_hand_mocap_quest_4 starts form
