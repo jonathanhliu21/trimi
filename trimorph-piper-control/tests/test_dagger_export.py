@@ -200,17 +200,32 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(len(list((root/'camera'/'mp4_files').glob('*.mp4'))), 2)
             self.assertFalse(list(root.parent.glob('.*export*')))
 
-    def test_misalignment_or_invalid_video_never_changes_originals(self):
-        for bad in ('hand', 'video'):
-            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as d:
-                root = Path(d)/'dataset'
-                raw, _ = self.fixture(root, bad_hand=bad=='hand')
-                if bad == 'video':
-                    (raw/'camera.mp4').write_bytes(b'broken video')
+    def test_timing_misalignment_warns_and_exports_both_modes(self):
+        for trim in (False, True):
+            with self.subTest(trim=trim), tempfile.TemporaryDirectory() as d:
+                root, out = Path(d)/'dataset', Path(d)/'out'
+                raw, _ = self.fixture(root)
+                rows = base.read_csv_rows(raw/'leader_hand.csv')
+                # A recording gap during the correction forces nearest samples >10 ms away.
+                rows = [r for r in rows if not 1_900_000_000 < int(r['monotonic_ns']) < 2_100_000_000]
+                self.write_csv(raw/'leader_hand.csv', rows)
                 before = self.snapshot(root)
-                with self.assertRaises(ValueError):
-                    self.run_export(root, overwrite_raw=True, min_rows=5)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    segments, _ = exporter.export(root, out, trim=trim, min_rows=5)
+                self.assertIn('keeping best-effort sync', output.getvalue())
+                self.assertTrue(any(s['max_sync_error_ms']['encoder_idx'] > 10 for s in segments))
                 self.assertEqual(before, self.snapshot(root))
+
+    def test_invalid_video_never_changes_originals(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)/'dataset'
+            raw, _ = self.fixture(root)
+            (raw/'camera.mp4').write_bytes(b'broken video')
+            before = self.snapshot(root)
+            with self.assertRaises(ValueError):
+                self.run_export(root, overwrite_raw=True, min_rows=5)
+            self.assertEqual(before, self.snapshot(root))
 
     def test_publication_failure_rolls_back_originals(self):
         with tempfile.TemporaryDirectory() as d:

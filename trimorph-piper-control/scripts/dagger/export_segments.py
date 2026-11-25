@@ -136,7 +136,9 @@ def validate_alignment(sync, camera_ns, hand_ns, pose_ns, tolerance_s):
         delta = np.abs(stamps[sync[key]] - camera_ns)
         errors[key] = float(delta.max() / 1e6)
         if np.any(delta > round(tolerance_s * 1e9)):
-            raise ValueError(f"Alignment exceeds {tolerance_s * 1000:g} ms: {key}, worst {errors[key]:.3f} ms")
+            bad = int(np.count_nonzero(delta > round(tolerance_s * 1e9)))
+            print(f"Warning: alignment exceeds {tolerance_s * 1000:g} ms: {key}, "
+                  f"{bad}/{n} frames, worst {errors[key]:.3f} ms; keeping best-effort sync.")
     return errors
 
 
@@ -380,7 +382,7 @@ def parse_args(argv=None):
     parser.add_argument("--trim", action="store_true", help="Export only human correction video/syncs; default keeps the full qualifying rollout")
     parser.add_argument("--trim-start-ms", type=float, default=None)
     parser.add_argument("--min-rows", type=int, default=32)
-    parser.add_argument("--max-sync-error-ms", type=float, default=10.0, help="Reject misaligned corrections (default 10 ms)")
+    parser.add_argument("--max-sync-error-ms", type=float, default=10.0, help="Warn on camera/sample timing differences above this threshold; keep nearest samples (default 10 ms)")
     args = parser.parse_args(argv)
     if args.min_rows < 1 or not math.isfinite(args.max_sync_error_ms) or args.max_sync_error_ms <= 0:
         parser.error("--min-rows and --max-sync-error-ms must be positive")

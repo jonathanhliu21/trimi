@@ -208,6 +208,9 @@ It selects successful rollouts with human corrections, invokes shared Piper
 postprocessing and validates sync alignment. By default, videos and syncs include
 the full retained rollout, including autonomous policy execution. Add `--trim`
 to export only human corrections with compact videos/arrays and remapped syncs.
+Timing differences above `--max-sync-error-ms` (default 10) warn and retain
+nearest samples, matching shared postprocessing. Invalid indices, non-increasing
+timestamps, and video/frame-count mismatches still stop the export.
 The source is preserved and nonempty outputs are refused. Alternatively,
 `--overwrite-raw` destructively replaces the original dataset with selected
 rollouts and deletes rejected episodes after validation; add `--trim` to keep
