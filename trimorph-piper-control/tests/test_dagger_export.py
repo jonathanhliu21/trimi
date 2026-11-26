@@ -70,6 +70,15 @@ class ExportTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return exporter.export(*args, **kwargs)
 
+    def process_fixture(self, root):
+        base.ensure_processed_dirs(root)
+        config = post.PostprocessConfig(dataset_root=root, raw_dir=root/'raw',
+            overwrite_processed_files=False, process_only_raw_statuses={'complete'},
+            max_sync_error_s=.01, trim_camera_frames=0, pose_source='piper_fk')
+        with contextlib.redirect_stdout(io.StringIO()):
+            for episode in base.discover_raw_episodes(config):
+                post.process_episode(config, episode)
+
     def test_default_keeps_entire_video_and_syncs_once_per_rollout(self):
         with tempfile.TemporaryDirectory() as d:
             root, out = Path(d)/'dataset', Path(d)/'full'
@@ -175,6 +184,26 @@ class ExportTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 exporter.parse_args(['root', '--out', 'out', *args])
 
+    def test_append_cli_and_destination_modes_are_exclusive(self):
+        args = exporter.parse_args(['root', '--append-to', 'existing', '--trim'])
+        self.assertEqual(args.append_to, Path('existing'))
+        self.assertIsNone(args.out)
+        self.assertTrue(args.trim)
+        for extra in (['--out', 'out'], ['--overwrite-raw']):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                exporter.parse_args(['root', '--append-to', 'existing', *extra])
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d)/'source', Path(d)/'out'
+            self.fixture(root)
+            for kwargs in ({'out': out, 'append_to': out}, {'append_to': out, 'overwrite_raw': True}):
+                with self.assertRaisesRegex(ValueError, 'exactly one'):
+                    self.run_export(root, **kwargs)
+            with self.assertRaisesRegex(FileNotFoundError, 'existing postprocessed dataset'):
+                self.run_export(root, append_to=out)
+            out.mkdir()
+            with self.assertRaisesRegex(ValueError, 'postprocessed dataset'):
+                self.run_export(root, append_to=out)
+
     def test_raw_selection_compaction_and_roundtrip_alignment(self):
         with tempfile.TemporaryDirectory() as d:
             root, out = Path(d)/'rawdata', Path(d)/'human'
@@ -233,9 +262,119 @@ class ExportTests(unittest.TestCase):
             out.mkdir()
             (out/'keep.txt').write_text('untouched')
             before = self.snapshot(root.parent)
-            with self.assertRaises(FileExistsError):
+            with self.assertRaisesRegex(FileExistsError, 'Destination must be empty'):
                 self.run_export(root, out)
             self.assertEqual(before, self.snapshot(root.parent))
+            self.assertEqual((out/'keep.txt').read_text(), 'untouched')
+
+    def test_append_after_postprocessed_episodes_with_matching_provenance(self):
+        for trim in (False, True):
+            with self.subTest(trim=trim), tempfile.TemporaryDirectory() as d:
+                root, out = Path(d)/'source', Path(d)/'existing'
+                self.fixture(root)
+                self.fixture(root, 3, outcome='failure')
+                self.fixture(root, 4, intervals=())
+                self.fixture(out, 7)
+                self.process_fixture(out)
+                before = self.snapshot(out)
+                source_before = self.snapshot(root)
+                records, skipped = self.run_export(root, append_to=out, trim=trim, min_rows=5)
+                self.assertEqual([r['episode'] for r in records], [8, 9] if trim else [8])
+                self.assertEqual(len(skipped), 2)
+                for path, digest in before.items():
+                    self.assertEqual(self.snapshot(out)[path], digest)
+                self.assertEqual(self.snapshot(root), source_before)
+                for record in records:
+                    index = record['episode']
+                    metadata = json.loads((out/'raw'/f'episode_{index:06d}'/'metadata.json').read_text())
+                    self.assertEqual(metadata['episode_index'], index)
+                    self.assertEqual(metadata['export_provenance']['episode'], index)
+                    paths = base.processed_paths(out, index)
+                    with np.load(paths.sync_path, allow_pickle=False) as sync:
+                        self.assertEqual(json.loads(str(sync['provenance']))['episode'], index)
+                    self.assertTrue(paths.video_path.exists())
+                    self.assertTrue(paths.hand_path.exists())
+                    self.assertTrue(paths.eef_path.exists())
+
+    def test_append_rejects_raw_only_and_incomplete_datasets_before_processing(self):
+        for kind in ('raw_only', 'empty_output_dirs', 'missing_sync', 'unprocessed_raw'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                root, out = Path(d)/'source', Path(d)/'existing'
+                self.fixture(root)
+                self.fixture(out, 7)
+                if kind == 'empty_output_dirs':
+                    base.ensure_processed_dirs(out)
+                elif kind in ('missing_sync', 'unprocessed_raw'):
+                    self.process_fixture(out)
+                    if kind == 'missing_sync':
+                        base.processed_paths(out, 7).sync_path.unlink()
+                    else:
+                        self.fixture(out, 8)
+                before = self.snapshot(Path(d))
+                with patch.object(post, 'process_episode') as process:
+                    with self.assertRaisesRegex(ValueError, 'postprocessed dataset'):
+                        self.run_export(root, append_to=out, min_rows=5)
+                    process.assert_not_called()
+                self.assertEqual(before, self.snapshot(Path(d)))
+
+    def test_append_preserves_summary_and_invalidates_training_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d)/'source', Path(d)/'out'
+            self.fixture(root)
+            self.run_export(root, out, min_rows=5)
+            first = json.loads((out/'segments.json').read_text())
+            before = self.snapshot(out)
+            (out/'midas_test.zarr.zip').write_bytes(b'stale training cache')
+            records, _ = self.run_export(root, append_to=out, trim=False, min_rows=5)
+            self.assertEqual(records[0]['episode'], 2)
+            for path, digest in before.items():
+                if path != 'segments.json':
+                    self.assertEqual(self.snapshot(out)[path], digest)
+            summary = json.loads((out/'segments.json').read_text())
+            self.assertEqual(summary['segments'][:2], first['segments'])
+            self.assertEqual(summary['append_exports'][0]['segments'], records)
+            self.assertFalse((out/'midas_test.zarr.zip').exists())
+
+    def test_append_publication_failure_rolls_back_existing_dataset(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d)/'source', Path(d)/'out'
+            self.fixture(root)
+            self.run_export(root, out, min_rows=5)
+            (out/'midas_test.zarr.zip').write_bytes(b'cache')
+            before = self.snapshot(out)
+            replace = os.replace
+            failed = False
+
+            def fail_once(src, dst):
+                nonlocal failed
+                if not failed and Path(dst) == out/'segments.json':
+                    failed = True
+                    raise OSError('injected append failure')
+                return replace(src, dst)
+
+            with patch.object(exporter.os, 'replace', side_effect=fail_once), self.assertRaisesRegex(OSError, 'injected'):
+                self.run_export(root, append_to=out, min_rows=5)
+            self.assertEqual(self.snapshot(out), before)
+
+    def test_destination_changes_during_append_are_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d)/'source', Path(d)/'out'
+            self.fixture(root)
+            self.fixture(out, 8)
+            self.process_fixture(out)
+            before = self.snapshot(out)
+            process = post.process_episode
+
+            def collection_appended(config, episode):
+                value = process(config, episode)
+                (out/'raw'/'episode_000008'/'new-data.csv').write_text('collection is active')
+                return value
+
+            with patch.object(post, 'process_episode', side_effect=collection_appended), self.assertRaisesRegex(RuntimeError, 'Destination changed'):
+                self.run_export(root, append_to=out, min_rows=5)
+            after = self.snapshot(out)
+            after.pop('raw/episode_000008/new-data.csv')
+            self.assertEqual(after, before)
 
     def test_empty_destination_and_source_changes_during_export(self):
         with tempfile.TemporaryDirectory() as d:

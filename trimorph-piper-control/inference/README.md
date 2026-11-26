@@ -246,6 +246,15 @@ raw episode in the collection layout and lets the operator take over:
 
 Export directly from raw recordings with
 `python scripts/dagger/export_dataset.py DATASET_ROOT --out OUTPUT_ROOT`.
+`--out` requires a new or empty directory. To append to an existing postprocessed
+dataset, use `--append-to OUTPUT_ROOT` instead; new episodes start after its
+highest episode index, preserving existing episodes. Raw-only destinations
+and datasets missing matching video, hand, action or sync files are rejected;
+postprocess those datasets first.
+It stages and validates new episodes before publication, merges export records
+in `segments.json`, and removes stale `midas_*.zarr.zip*` training caches so they
+can be rebuilt with the appended data. Stop collection/training during export.
+Running the same export again appends another copy; it does not deduplicate.
 It selects successful rollouts with human corrections, invokes shared Piper
 postprocessing (`--pose-source piper_fk`: FK of the joints on their CAN receive
 clock, as kinesthetic collection) and validates sync alignment. By default, videos

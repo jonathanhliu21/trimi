@@ -4,7 +4,8 @@
   python scripts/dagger/export_dataset.py ROOT --out ROOT_human
   python scripts/dagger/export_dataset.py ROOT --out ROOT_human --trim
 
---out preserves the source and refuses nonempty destinations. --overwrite-raw
+--out preserves the source and requires a new/empty destination. --append-to
+appends after an existing postprocessed dataset's highest episode index. --overwrite-raw
 DELETES rejected episodes and replaces raw/processed data after validation.
 By default videos and syncs cover the FULL retained rollout, and every frame is
 labeled policy, human or handoff (syncs `control`). Every frame trains except a
@@ -391,11 +392,101 @@ def publish_in_place(root, result):
             backup.rmdir()
 
 
-def export(root, out=None, *, overwrite_raw=False, trim=False, trim_ms=None, min_rows=32, max_sync_error_s=0.01,
+def destination_state(root):
+    """Snapshot managed outputs, rejecting symlinks before staging an append."""
+    state = []
+    for name in (*MANAGED, *(p.name for p in root.glob("midas_*.zarr.zip*"))):
+        path = root / name
+        if path.parent.is_symlink():
+            raise ValueError(f"Managed dataset paths must not be symlinks: {path.parent}")
+        paths = [path, *path.rglob("*")] if path.is_dir() else [path]
+        for entry in paths:
+            if entry.is_symlink():
+                raise ValueError(f"Managed dataset paths must not be symlinks: {entry}")
+            if entry.exists():
+                stat = entry.stat()
+                state.append((str(entry.relative_to(root)), stat.st_size, stat.st_mtime_ns))
+    return sorted(state)
+
+
+def next_episode_index(root):
+    """Include raw-only recordings and partial processed outputs in numbering."""
+    indices = []
+    for name in ("raw", "processed", *OUTPUT_DIRS):
+        directory = root / name
+        if directory.exists() and not directory.is_dir():
+            raise ValueError(f"Expected dataset directory: {directory}")
+        for path in directory.glob("*"):
+            stem = path.name.removeprefix("episode_") if name in ("raw", "processed") else path.stem
+            if stem.isdigit():
+                indices.append(int(stem))
+    return max(indices, default=-1) + 1
+
+
+def validate_append_destination(root):
+    """Require matching postprocessed episode sets, including every raw episode."""
+    episode_sets = []
+    for name, suffix in zip(OUTPUT_DIRS, (".mp4", ".npy", ".npy", ".npz")):
+        directory = root / name
+        indices = {int(path.stem) for path in directory.glob(f"*{suffix}")
+                   if path.is_file() and path.stem.isdigit()}
+        episode_sets.append(indices)
+    processed = episode_sets[0]
+    raw = {int(path.name.removeprefix("episode_")) for path in (root / "raw").glob("episode_*")
+           if path.name.removeprefix("episode_").isdigit()}
+    if not processed or any(indices != processed for indices in episode_sets) or not raw <= processed:
+        raise ValueError(
+            f"Append destination must be a postprocessed dataset with matching video, hand, "
+            f"action and sync files for every episode: {root}. Postprocess it first; nothing changed.")
+
+
+def publish_append(root, result):
+    """Install validated new episodes, rolling back a failed publication.
+
+    Existing episode files are never replaced. Cache removal and summary updates
+    are rolled back too. As with in-place export, this is not power-loss atomic.
+    """
+    moved, saved, created = [], [], []
+    backup = result.parent / "append-backup"
+    backup.mkdir()
+    try:
+        for name in ("raw", "processed", *OUTPUT_DIRS):
+            directory = root / name
+            missing = []
+            while not directory.exists():
+                missing.append(directory)
+                directory = directory.parent
+            for directory in reversed(missing):
+                directory.mkdir()
+                created.append(directory)
+            for source in sorted((result / name).glob("*")):
+                target = root / name / source.name
+                if target.exists() or target.is_symlink():
+                    raise FileExistsError(f"Refusing to replace existing episode: {target}")
+                os.replace(source, target)
+                moved.append((target, source))
+        for target in [root / "segments.json", *root.glob("midas_*.zarr.zip*")]:
+            if target.exists():
+                saved_path = backup / target.name
+                os.replace(target, saved_path)
+                saved.append((saved_path, target))
+        os.replace(result / "segments.json", root / "segments.json")
+        moved.append((root / "segments.json", result / "segments.json"))
+    except BaseException:
+        for target, source in reversed(moved):
+            os.replace(target, source)
+        for saved_path, target in reversed(saved):
+            os.replace(saved_path, target)
+        for directory in reversed(created):
+            directory.rmdir()
+        raise
+
+
+def export(root, out=None, *, append_to=None, overwrite_raw=False, trim=False, trim_ms=None, min_rows=32, max_sync_error_s=0.01,
            train_handoff=False):
     root = Path(root).expanduser().resolve()
-    if (out is None and not overwrite_raw) or (out is not None and overwrite_raw):
-        raise ValueError("Specify exactly one of --out or --overwrite-raw")
+    if sum((out is not None, append_to is not None, bool(overwrite_raw))) != 1:
+        raise ValueError("Specify exactly one of --out, --append-to or --overwrite-raw")
     if min_rows < 1 or not math.isfinite(max_sync_error_s) or max_sync_error_s <= 0:
         raise ValueError("min_rows and max_sync_error_s must be positive")
     if trim_ms is not None and (not math.isfinite(trim_ms) or trim_ms < 0):
@@ -408,12 +499,26 @@ def export(root, out=None, *, overwrite_raw=False, trim=False, trim_ms=None, min
         for path in (root / name, (root / name).parent):
             if path.is_symlink():
                 raise ValueError(f"Managed dataset paths must not be symlinks: {path}")
-    out = root if overwrite_raw else Path(out).expanduser().resolve()
+    append = append_to is not None
+    out = root if overwrite_raw else Path(append_to if append else out).expanduser().resolve()
     if not overwrite_raw:
         if out == root or out in root.parents or root in out.parents:
-            raise ValueError("--out must be separate from the source, not an ancestor or descendant")
-        if out.exists() and (not out.is_dir() or any(out.iterdir())):
+            raise ValueError("Destination must be separate from the source, not an ancestor or descendant")
+        if out.exists() and not out.is_dir():
+            raise NotADirectoryError(f"Destination must be a directory: {out}")
+        if not append and out.exists() and any(out.iterdir()):
             raise FileExistsError(f"Destination must be empty; no files will be deleted: {out}")
+        if append and not out.is_dir():
+            raise FileNotFoundError(f"--append-to requires an existing postprocessed dataset: {out}")
+    previous_state = destination_state(out) if append else None
+    if append:
+        validate_append_destination(out)
+    first_index = next_episode_index(out) if append else 0
+    previous_summary = None
+    if append and (out / "segments.json").exists():
+        previous_summary = json.loads((out / "segments.json").read_text())
+        if not isinstance(previous_summary, dict) or not isinstance(previous_summary.get("segments"), list):
+            raise ValueError(f"Invalid export summary: {out / 'segments.json'}")
     selected, skipped = select_episodes(root)
     if not selected:
         raise ValueError("No complete successful rollouts with human corrections; nothing changed")
@@ -442,10 +547,10 @@ def export(root, out=None, *, overwrite_raw=False, trim=False, trim_ms=None, min
             for number, interval in intervals:
                 if trim:
                     record, reason = compact_interval(work, episode, metadata, number, interval, result,
-                        len(segments), trim_start, min_rows, max_sync_error_s, pose_source)
+                        first_index + len(segments), trim_start, min_rows, max_sync_error_s, pose_source)
                 else:
                     record, reason = full_rollout(work, episode, metadata, result,
-                        len(segments), min_rows, max_sync_error_s, train_handoff)
+                        first_index + len(segments), min_rows, max_sync_error_s, train_handoff)
                 if record is None:
                     skipped.append((index, reason))
                 else:
@@ -457,11 +562,22 @@ def export(root, out=None, *, overwrite_raw=False, trim=False, trim_ms=None, min
             control_labels=None if trim else list(CONTROL_LABELS), train_handoff=None if trim else train_handoff,
             min_rows=min_rows, max_sync_error_s=max_sync_error_s, segments=segments,
             skipped=[dict(rollout=i, reason=r) for i, r in skipped])
+        if append:
+            # Keep each batch's settings/source rather than attributing old episodes
+            # to the current export. Per-episode provenance uses destination indices.
+            batch = summary
+            summary = copy.deepcopy(previous_summary) if previous_summary is not None else {}
+            summary["segments"] = [*summary.get("segments", []), *segments]
+            summary.setdefault("append_exports", []).append(batch)
         (result / "segments.json").write_text(json.dumps(summary, indent=2)+"\n")
         if source_state(root) != original_state:
             raise RuntimeError("Source raw data changed during export; stop collection first. Nothing replaced.")
         if overwrite_raw:
             publish_in_place(root, result)
+        elif append:
+            if destination_state(out) != previous_state:
+                raise RuntimeError("Destination changed during export; stop collection/training first. Nothing appended.")
+            publish_append(out, result)
         else:
             # POSIX rename also replaces an empty destination directory atomically.
             # If someone populated it meanwhile, rename refuses instead of deleting files.
@@ -474,6 +590,7 @@ def parse_args(argv=None):
     parser.add_argument("dataset_root", type=Path, help="Raw DAgger dataset")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--out", type=Path, help="New/empty output directory; preserve every source file")
+    mode.add_argument("--append-to", type=Path, help="Existing postprocessed dataset; append after its highest episode index")
     mode.add_argument("--overwrite-raw", action="store_true", help="DESTRUCTIVE: replace raw/processed data with selected exports; delete rejected episodes")
     parser.add_argument("--trim", action="store_true", help="Export only human correction video/syncs; default keeps the full qualifying rollout")
     parser.add_argument("--trim-start-ms", type=float, default=None,
@@ -498,10 +615,12 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    segments, skipped = export(args.dataset_root, args.out, overwrite_raw=args.overwrite_raw, trim=args.trim,
+    segments, skipped = export(args.dataset_root, args.out, append_to=args.append_to, overwrite_raw=args.overwrite_raw, trim=args.trim,
         trim_ms=args.trim_start_ms, min_rows=args.min_rows, max_sync_error_s=args.max_sync_error_ms/1000,
         train_handoff=args.train_handoff)
-    print(f"Exported {len(segments)} {'corrections' if args.trim else 'full rollouts'} to {args.dataset_root if args.overwrite_raw else args.out}")
+    destination = args.dataset_root if args.overwrite_raw else args.append_to if args.append_to is not None else args.out
+    print(f"Exported {len(segments)} {'corrections' if args.trim else 'full rollouts'} to {destination}")
+    print(f"  output episode indices: {segments[0]['episode']:06d}..{segments[-1]['episode']:06d}")
     for index, reason in skipped:
         print(f"  skipped rollout {index}: {reason}")
     return 0

@@ -60,7 +60,7 @@ ARM_ACTION_EMA_ALPHA = 0.25 # action[:6]: XYZ + rotation vector
 HAND_ACTION_EMA_ALPHA = 0.8  # action[6:]: 13 hand motor positions
 # Scale hand displacement from each chunk's observation before EMA.
 # Arm targets always retain scale 1.0.
-HAND_ACTION_SCALE = 1.0
+HAND_ACTION_SCALE = 1.1
 # Per-motor overrides for hand displacement scaling (before EMA).
 # None inherits HAND_ACTION_SCALE; a number replaces it, rather than multiplying it.
 HAND_JOINT_ACTION_SCALES: dict[int, float | None] = {
