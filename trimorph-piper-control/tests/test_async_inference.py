@@ -97,6 +97,7 @@ class AsyncPlaybackTests(unittest.TestCase):
         with patch('inference.executor.executor.time', clock), \
              patch('inference.executor.executor.AsyncPredictor', return_value=predictor), \
              patch('inference.executor.executor.ARM_ACTION_EMA_ALPHA', alpha), \
+             patch('inference.executor.executor.HAND_ACTION_EMA_ALPHA', 1.0), \
              contextlib.redirect_stdout(output):
             run(args, robot, FakeCamera(), Mock(), pedal=pedal, log=log)
         self.assertTrue(predictor.closed)
@@ -118,7 +119,8 @@ class AsyncPlaybackTests(unittest.TestCase):
         self.assertEqual(result.log.commands[4]['index'], 1)
         expected = .01 * (1 - .6 ** 4)
         self.assertAlmostEqual(result.applied[4][1][0], .4 * .02 + .6 * expected)
-        self.assertAlmostEqual(result.applied[4][1][6], .2 * HAND_ACTION_SCALE)
+        reference = result.requests[1][2][6]
+        self.assertAlmostEqual(result.applied[4][1][6], reference + (.2 - reference) * HAND_ACTION_SCALE)
 
     def test_age_index_rounding_and_validation(self):
         for age, expected in ((0, 0), (.045, 1), (.095, 2), (.190, 3)):
@@ -335,12 +337,16 @@ class AsyncPlaybackTests(unittest.TestCase):
              patch.object(protocol, 'recv_action', side_effect=receive), \
              patch('inference.executor.executor.AsyncPredictor') as worker, \
              patch('inference.executor.executor.time.sleep'), \
+             patch('inference.executor.executor.ARM_ACTION_EMA_ALPHA', 1.0), \
+             patch('inference.executor.executor.HAND_ACTION_EMA_ALPHA', 1.0), \
              contextlib.redirect_stdout(io.StringIO()):
             run(args, robot, FakeCamera(), Mock())
         self.assertEqual(events, ['request', 'reply', 'apply', 'apply', 'apply',
                                   'request', 'reply', 'apply', 'apply'])
         expected = np.concatenate(chunks).astype(np.float64)
-        expected[:, 6:] *= HAND_ACTION_SCALE
+        expected[:3, 6:] *= HAND_ACTION_SCALE
+        reference = applied[2][6:]
+        expected[3:, 6:] = reference + HAND_ACTION_SCALE * (expected[3:, 6:] - reference)
         np.testing.assert_allclose(applied, expected)
         worker.assert_not_called()
         self.assertTrue(all('rtc' not in call.kwargs for call in send.call_args_list))
@@ -405,7 +411,8 @@ class AsyncSocketTests(unittest.TestCase):
                                inference_latency_ms=150, camera_timeout=1)
         log = RunLog('/unused')
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
+            with patch('inference.executor.executor.HAND_ACTION_EMA_ALPHA', 1.0), \
+                 contextlib.redirect_stdout(io.StringIO()):
                 run(args, robot, FakeCamera(), client, log=log)
         finally:
             client.close()
@@ -420,7 +427,8 @@ class AsyncSocketTests(unittest.TestCase):
         self.assertTrue(new_indices)
         self.assertGreater(new_indices[0], 0)
         self.assertEqual(new_indices, list(range(new_indices[0], 10)))
-        self.assertAlmostEqual(sent[-1][6], .2 * HAND_ACTION_SCALE)
+        reference = log.chunks[1][2][6]
+        self.assertAlmostEqual(sent[-1][6], reference + (.2 - reference) * HAND_ACTION_SCALE)
 
     def test_worker_exchange_copies_observation_and_rejects_second_request(self):
         client, server = socket.socketpair()

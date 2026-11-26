@@ -57,9 +57,27 @@ MAX_EEF_JUMP_M = 0.15
 # Independent per-action EMA for the arm pose and hand motor positions.
 # filtered = alpha * target + (1 - alpha) * previous; 1.0 disables smoothing.
 ARM_ACTION_EMA_ALPHA = 0.25 # action[:6]: XYZ + rotation vector
-HAND_ACTION_EMA_ALPHA = 1.0  # action[6:]: 13 hand motor positions
-# Multiply hand targets before EMA; arm targets always retain scale 1.0.
-HAND_ACTION_SCALE = 1.005
+HAND_ACTION_EMA_ALPHA = 0.8  # action[6:]: 13 hand motor positions
+# Scale hand displacement from each chunk's observation before EMA.
+# Arm targets always retain scale 1.0.
+HAND_ACTION_SCALE = 1.0
+# Per-motor overrides for hand displacement scaling (before EMA).
+# None inherits HAND_ACTION_SCALE; a number replaces it, rather than multiplying it.
+HAND_JOINT_ACTION_SCALES: dict[int, float | None] = {
+    0: None,  # Thumb
+    1: None,
+    2: None,
+    3: None,
+    4: None,  # Index
+    5: None,
+    6: None,
+    7: None,#1.3,  # Middle
+    8: None,
+    9: None,
+    10: None,  # Ring
+    11: None,
+    12: None#1.3,
+}
 # --rtc: the expected inference delay is the most actions executed while waiting
 # for any of this many recent replies (the paper's conservative max).
 RTC_DELAY_HISTORY = 10
@@ -79,9 +97,28 @@ PIPER_LOG_FIELDS = ("monotonic_ns", "joint_timestamp_s", *(f"joint_{i}" for i in
 JOINT_CONTROL_FIELDS = ("sigma", "damping", "step_scale", "pos_err_mm", "rot_err_deg")
 COMMAND_LOG_FIELDS = ("monotonic_ns", "cycle", "index", *(f"raw_{name}" for name in EULER_FIELDS),
                       *EULER_FIELDS, *(f"cmd_joint_{i}" for i in range(1, 7)), *JOINT_CONTROL_FIELDS)
+HAND_COMMAND_LOG_FIELDS = ("monotonic_ns", "cycle", "index", "clipped_motor_ids",
+                           *(f"{stage}_{i}_rad" for stage in ("policy", "reference", "scaled", "filtered", "clipped")
+                             for i in MOTOR_IDS))
+HAND_WRITE_LOG_FIELDS = ("started_monotonic_ns", "finished_monotonic_ns",
+                        *(f"target_{i}_rad" for i in MOTOR_IDS))
+HAND_TELEMETRY_LOG_FIELDS = ("started_monotonic_ns", "finished_monotonic_ns", "error",
+                            *(f"{quantity}_{i}_{unit}" for quantity, unit in
+                              (("position", "rad"), ("velocity", "rad_s"), ("current", "ma")) for i in MOTOR_IDS))
+OBSERVATION_LOG_FIELDS = ("monotonic_ns", "cycle", "read_started_monotonic_ns", "read_finished_monotonic_ns",
+                          "frame_received_monotonic_ns", "frame_age_ms", "anchor_source",
+                          *(f"measured_{name}" for name in EULER_FIELDS),
+                          *(f"anchor_{name}" for name in EULER_FIELDS), *(f"hand_{i}_rad" for i in MOTOR_IDS))
 EVENT_LOG_FIELDS = ("monotonic_ns", "cycle", "event", "detail")
 DEFAULT_TRAJ_DATASET = CONTROL_ROOT / "data_trimorph_hand_mocap_quest_4"
 DEFAULT_HAND_PORT = "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO9P0-if00-port0"
+
+
+def write_log_csv(path, fields, rows):
+    with Path(path).open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def vector(value, size, name):
@@ -240,6 +277,9 @@ class HandCommandWriter:
         self.period = 1.0 / hz
         self.lock = threading.RLock()
         self.target = None
+        self.run_log = None
+        self.telemetry_period = 0.0  # Opt in: extra reads share this writer's serial lock.
+        self.next_telemetry = 0.0
         self.error = None
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, name="hand-command", daemon=True)
@@ -265,7 +305,28 @@ class HandCommandWriter:
             while not self.stop.is_set():
                 with self.lock:
                     if self.target is not None:
+                        started = time.monotonic_ns()
                         self.hand.set_positions(self.target, clip=True)
+                        finished = time.monotonic_ns()
+                        if self.run_log is not None:
+                            clipped = self.hand.clip_positions(self.target.copy())
+                            self.run_log.hand_writes.append({
+                                "started_monotonic_ns": started, "finished_monotonic_ns": finished,
+                                **{f"target_{i}_rad": float(v) for i, v in zip(MOTOR_IDS, clipped)}})
+                            if self.telemetry_period and time.perf_counter() >= self.next_telemetry:
+                                sample = {"started_monotonic_ns": time.monotonic_ns(), "error": ""}
+                                try:
+                                    readings = self.hand.read_pos_vel_cur()
+                                    for (quantity, unit), values in zip(
+                                            (("position", "rad"), ("velocity", "rad_s"), ("current", "ma")), readings):
+                                        sample.update({f"{quantity}_{i}_{unit}": float(v)
+                                                       for i, v in zip(MOTOR_IDS, vector(values, 13, quantity))})
+                                except Exception as exc:
+                                    # Diagnostic reads must not stop control or invent zero measurements.
+                                    sample["error"] = repr(exc)
+                                sample["finished_monotonic_ns"] = time.monotonic_ns()
+                                self.run_log.hand_telemetry.append(sample)
+                                self.next_telemetry = time.perf_counter() + self.telemetry_period
                 # Skip missed ticks instead of sending catch-up bursts.
                 deadline += self.period
                 now = time.perf_counter()
@@ -451,6 +512,7 @@ class RobotIO:
 
     def read_state(self, anchor=None):
         """Observation state: arm pose (see anchored_pose) + measured hand positions."""
+        started = time.monotonic_ns()
         pose = self.piper.get_eef_pose()
         if pose is None:
             raise RuntimeError("Piper EEF feedback unavailable")
@@ -459,6 +521,9 @@ class RobotIO:
             if writer is not None:
                 writer.check_error()
             hand = vector(self.hand.read_pos(), 13, "hand state")
+        self.last_state_read = {"read_started_monotonic_ns": started,
+                                "read_finished_monotonic_ns": time.monotonic_ns(),
+                                **{f"measured_{name}": float(v) for name, v in zip(EULER_FIELDS, pose)}}
         return np.concatenate((pose_to_policy(self.anchored_pose(pose, anchor)), hand)).astype(np.float32)
 
     def anchored_pose(self, measured, anchor=None):
@@ -497,7 +562,7 @@ class RobotIO:
             source = "command" if anchor is None else "action"
             self.state_note = f"{source}; measured off {off_mm:.1f} mm {off_deg:.1f} deg{plan_note}"
             return commanded
-        self.state_note = f"measured; ALLBACK, off {off_mm:.1f} mm {off_deg:.1f} deg{plan_note}"
+        self.state_note = f"measured; FALLBACK, off {off_mm:.1f} mm {off_deg:.1f} deg{plan_note}"
         self.anchor_fallback = True
         print(f"WARNING: arm is {off_mm:.0f} mm / {off_deg:.0f} deg from its commanded pose; "
               "sending the measured pose to the predictor", flush=True)
@@ -633,6 +698,7 @@ class OakCamera:
             raise RuntimeError(f"Could not open wrist video writer: {path}")
 
         def record():
+            frames = []
             try:
                 while not self.record_stop.is_set():
                     packet = self.queue.tryGet()
@@ -644,11 +710,19 @@ class OakCamera:
                         continue
                     bgr = self.flip_frame(self.cv2, bgr, self.flip)
                     self.latest_frame = (bgr, time.time(), time.monotonic())
+                    received_ns = int(self.latest_frame[2] * 1e9)
                     writer.write(bgr)
+                    frames.append({"frame_index": len(frames), "received_monotonic_ns": received_ns,
+                                   "received_wall_time_s": self.latest_frame[1]})
             except Exception as exc:
                 self.record_error = exc
             finally:
                 writer.release()
+                try:
+                    write_log_csv(path.with_name(path.stem + "_timestamps.csv"),
+                                  ("frame_index", "received_monotonic_ns", "received_wall_time_s"), frames)
+                except Exception as exc:
+                    self.record_error = self.record_error or exc
 
         self.record_thread = threading.Thread(target=record, name="wrist-video", daemon=True)
         self.record_thread.start()
@@ -666,6 +740,7 @@ class OakCamera:
         if self.latest_frame is None:
             return None
         bgr, capture_time, received_at = self.latest_frame
+        self.last_policy_frame_received_ns = int(received_at * 1e9)
         if time.monotonic() - received_at > self.timeout:
             raise TimeoutError("No OAK camera image within camera timeout")
         return self.cv2.cvtColor(bgr, self.cv2.COLOR_BGR2RGB), capture_time
@@ -684,6 +759,9 @@ class OakCamera:
                 continue
             if self.window:
                 self.show(bgr)
+            latest = self.delivered_frame if getattr(self, "record_thread", None) is not None else self.latest_frame
+            if latest is not None:
+                self.last_policy_frame_received_ns = int(latest[2] * 1e9)
             return self.cv2.cvtColor(bgr, self.cv2.COLOR_BGR2RGB)
         raise TimeoutError("No OAK camera image within camera timeout")
 
@@ -778,7 +856,50 @@ class RunLog:
         self.commands = []
         self.events = []
         self.chunks = []
+        self.chunk_lookup = {}
+        self.hand_commands = []
+        self.observations = []
+        self.hand_writes = []
+        self.hand_telemetry = []
+        self.hand_limits = None
+        self.hand_configuration = None
+        self.source_sha256 = {}
+        self.named_start_preset = None
+        self.created_wall_time_s = time.time()
+        self.settings = {"arm_action_ema_alpha": ARM_ACTION_EMA_ALPHA,
+                         "hand_action_ema_alpha": HAND_ACTION_EMA_ALPHA,
+                         "hand_action_scale": HAND_ACTION_SCALE,
+                         "hand_joint_action_scales": dict(HAND_JOINT_ACTION_SCALES),
+                         "effective_hand_action_scales": hand_action_scales().tolist()}
         self.policy = None  # the predictor's checkpoint provenance, from its reply header
+
+    def configure(self, args, robot=None):
+        """Snapshot local source/calibration; never read hardware registers."""
+        if not self.source_sha256:
+            for path in (Path(__file__), Path(defaults.__file__), Path(args.hand_config).expanduser()):
+                if path.is_file():
+                    self.source_sha256[str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.named_start_preset = {
+                "name": args.start_home,
+                "arm_joints_deg": list(defaults.PIPER_START_JOINTS_DEG[args.start_home]),
+                "hand_position_rad": list(defaults.HAND_START_POSITIONS_RAD[args.start_home]),
+            }
+        if robot is not None and getattr(robot, "hand", None) is not None:
+            config = robot.hand.config
+            lower = np.asarray(config.joint_lower_limits_array, dtype=float)
+            upper = np.asarray(config.joint_upper_limits_array, dtype=float)
+            self.hand_limits = (lower.copy(), upper.copy())
+            self.hand_configuration = {
+                "motor_ids": list(robot.hand.motor_ids),
+                "home_offsets_rad": np.asarray(config.home_offsets_array).tolist(),
+                "joint_signs": np.asarray(config.joint_signs_array).tolist(),
+                "lower_limits_rad": lower.tolist(), "upper_limits_rad": upper.tolist(),
+            }
+            writer = getattr(robot, "hand_writer", None)
+            if writer is not None:
+                with writer.lock:
+                    writer.run_log = self
+                    writer.telemetry_period = 1 / args.hand_telemetry_hz if args.hand_telemetry_hz else 0.0
 
     def note_header(self, header):
         if header.get("policy") is not None:
@@ -788,7 +909,21 @@ class RunLog:
         self.events.append({"monotonic_ns": time.monotonic_ns(), "cycle": cycle, "event": event, "detail": detail})
 
     def chunk(self, cycle, state, chunk):
-        self.chunks.append((cycle, time.monotonic_ns(), np.asarray(state, np.float64), np.asarray(chunk, np.float64)))
+        state, chunk = np.array(state, np.float64, copy=True), np.array(chunk, np.float64, copy=True)
+        self.chunks.append((cycle, time.monotonic_ns(), state, chunk))
+        self.chunk_lookup[cycle] = (state, chunk)
+
+    def observation(self, cycle, state, robot, camera):
+        now = time.monotonic_ns()
+        row = {"monotonic_ns": now, "cycle": cycle,
+               "anchor_source": getattr(robot, "state_note", "measured"),
+               **getattr(robot, "last_state_read", {}),
+               **{f"anchor_{name}": float(v) for name, v in zip(EULER_FIELDS, pose_to_piper(state[:6]))},
+               **{f"hand_{i}_rad": float(v) for i, v in zip(MOTOR_IDS, state[6:])}}
+        received = getattr(camera, "last_policy_frame_received_ns", None)
+        if received is not None:
+            row.update(frame_received_monotonic_ns=received, frame_age_ms=(now - received) / 1e6)
+        self.observations.append(row)
 
     def command(self, cycle, index, raw, filtered, info=None):
         row = {"monotonic_ns": time.monotonic_ns(), "cycle": cycle, "index": index}
@@ -798,6 +933,18 @@ class RunLog:
         row.update({f"raw_{name}": f"{v:.9f}" for name, v in zip(EULER_FIELDS, pose_to_piper(raw[:6]))})
         row.update({name: f"{v:.9f}" for name, v in zip(EULER_FIELDS, pose_to_piper(filtered[:6]))})
         self.commands.append(row)
+        hand = {"monotonic_ns": row["monotonic_ns"], "cycle": cycle, "index": index}
+        stages = {"scaled": raw[6:], "filtered": filtered[6:]}
+        if cycle in self.chunk_lookup:
+            state, chunk = self.chunk_lookup[cycle]
+            stages.update(policy=chunk[index, 6:], reference=state[6:])
+        if self.hand_limits is not None:
+            clipped = np.clip(filtered[6:], *self.hand_limits)
+            stages["clipped"] = clipped
+            hand["clipped_motor_ids"] = " ".join(str(i) for i in np.flatnonzero(clipped != filtered[6:]))
+        for stage, values in stages.items():
+            hand.update({f"{stage}_{i}_rad": float(v) for i, v in zip(MOTOR_IDS, values)})
+        self.hand_commands.append(hand)
 
     def save(self, args, piper_rows=None):
         if not self.commands and not self.events:
@@ -805,16 +952,22 @@ class RunLog:
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / "meta.json").write_text(json.dumps(
             {"args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-             "arm_action_ema_alpha": ARM_ACTION_EMA_ALPHA, "piper_log_hz": PIPER_LOG_HZ}, indent=2) + "\n")
+             **self.settings, "piper_log_hz": PIPER_LOG_HZ, "log_schema_version": 2,
+             "created_wall_time_s": self.created_wall_time_s,
+             "policy": self.policy, "source_sha256": self.source_sha256,
+             "hand_configuration": self.hand_configuration, "named_start_preset": self.named_start_preset,
+             "timing": {"csv_clock": "host monotonic_ns", "video_timestamps": "host frame receive, not sensor exposure",
+                        "hand_telemetry": "extra serial reads only when --hand-telemetry-hz > 0"}}, indent=2) + "\n")
         for name, fields, rows in (("commands.csv", COMMAND_LOG_FIELDS, self.commands),
                                    ("events.csv", EVENT_LOG_FIELDS, self.events),
-                                   ("piper.csv", PIPER_LOG_FIELDS, piper_rows)):
+                                   ("piper.csv", PIPER_LOG_FIELDS, piper_rows),
+                                   ("hand_commands.csv", HAND_COMMAND_LOG_FIELDS, self.hand_commands),
+                                   ("observations.csv", OBSERVATION_LOG_FIELDS, self.observations),
+                                   ("hand_writes.csv", HAND_WRITE_LOG_FIELDS, list(self.hand_writes)),
+                                   ("hand_telemetry.csv", HAND_TELEMETRY_LOG_FIELDS, list(self.hand_telemetry))):
             if rows is None:
                 continue
-            with (self.directory / name).open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, fieldnames=fields)
-                writer.writeheader()
-                writer.writerows(rows)
+            write_log_csv(self.directory / name, fields, rows)
         if self.chunks:
             # Ragged chunks are stored flat; chunk_cycle maps each row to its cycle.
             np.savez(self.directory / "chunks.npz",
@@ -928,10 +1081,28 @@ def ema_alphas():
     return np.r_[np.full(6, ARM_ACTION_EMA_ALPHA), np.full(13, HAND_ACTION_EMA_ALPHA)]
 
 
-def filter_action(action, filtered, alpha):
-    """(hand-scaled action, its EMA with the previous filtered action)."""
+def hand_action_scales():
+    """Effective motor 0..12 gains: numeric override or the global fallback."""
+    unknown = set(HAND_JOINT_ACTION_SCALES) - set(MOTOR_IDS)
+    if unknown:
+        raise ValueError(f"HAND_JOINT_ACTION_SCALES contains unknown motor IDs: {unknown}")
+    if not np.isfinite(HAND_ACTION_SCALE) or HAND_ACTION_SCALE < 0:
+        raise ValueError("HAND_ACTION_SCALE must be finite and nonnegative")
+    scales = np.array([HAND_ACTION_SCALE if HAND_JOINT_ACTION_SCALES.get(i) is None
+                       else HAND_JOINT_ACTION_SCALES[i] for i in MOTOR_IDS], dtype=float)
+    if not np.isfinite(scales).all() or np.any(scales < 0):
+        raise ValueError("HAND_JOINT_ACTION_SCALES values must be None or finite nonnegative numbers")
+    return scales
+
+
+def filter_action(action, filtered, alpha, hand_reference):
+    """Scale hand deltas from a fixed chunk reference, then apply EMA.
+
+    hand_reference is the hand state sent with this chunk's prediction request,
+    including when async/RTC playback skips the chunk's elapsed prefix.
+    """
     action = np.array(action, dtype=np.float64, copy=True)
-    action[6:] *= HAND_ACTION_SCALE
+    action[6:] = hand_reference + hand_action_scales() * (action[6:] - hand_reference)
     return action, alpha * action + (1 - alpha) * filtered
 
 
@@ -945,6 +1116,7 @@ def capture(robot, camera, seq, log=None, anchor=None):
     state = vector(robot.read_state() if anchor is None else robot.read_state(anchor), 19, "robot state")
     if log is not None:
         log.event(seq, "state", getattr(robot, "state_note", "measured"))
+        log.observation(seq, state, robot, camera)
     return image, capture_time, state, (time.perf_counter() - start) * 1000
 
 
@@ -1031,7 +1203,7 @@ def run(args, robot, camera, sock, pedal=None, view=None, log=None):
             if pedal_pressed(pedal):
                 interrupted = True
                 break
-            action, filtered_action = filter_action(action, filtered_action, action_alpha)
+            action, filtered_action = filter_action(action, filtered_action, action_alpha, state[6:])
             info = robot.apply_action(filtered_action)
             first_sent = time.perf_counter()  # after IK: later substeps keep even spacing from here
             if log is not None:
@@ -1155,6 +1327,8 @@ def run_async(args, robot, camera, sock, action_alpha, pedal=None, view=None, lo
             observed_at = time.perf_counter()  # state anchor time; includes state-read/encode/send delays
             state = vector(robot.read_state(), 19, "robot state")
             event(seq, "state", getattr(robot, "state_note", "measured"))
+            if log is not None:
+                log.observation(seq, state, robot, camera)
             pending = (seq, state, (time.perf_counter() - now) * 1000,
                        observed_at, filtered_action is not None)
             predictor.submit(seq, image, state, capture_time)
@@ -1229,6 +1403,7 @@ def run_async(args, robot, camera, sock, action_alpha, pedal=None, view=None, lo
                         event(new_cycle, "wait_end")
                         waiting = False
                     cycle, chunk, index = new_cycle, new_chunk, new_start
+                    hand_reference = state[6:].copy()
                     start_index = new_start
                     execute_steps = new_end
                     header, rtt_ms, observe_ms = reply[2], new_rtt_ms, new_observe_ms
@@ -1250,7 +1425,7 @@ def run_async(args, robot, camera, sock, action_alpha, pedal=None, view=None, lo
                     time.sleep(0.002)
                     continue
 
-                action, filtered_action = filter_action(chunk[index], filtered_action, action_alpha)
+                action, filtered_action = filter_action(chunk[index], filtered_action, action_alpha, hand_reference)
                 info = robot.apply_action(filtered_action)
                 first_sent = time.perf_counter()
                 if log is not None:
@@ -1338,6 +1513,7 @@ def run_rtc(args, robot, camera, sock, pedal=None, view=None, log=None):
         delays = deque([math.ceil(rtt / dt)], maxlen=RTC_DELAY_HISTORY)
         chunk_seq, index, seq = seq, 1, seq + 1
         filtered_action = state.copy()
+        hand_reference = state[6:].copy()
         pending = None
         overruns = starved = 0
         interrupted = False
@@ -1377,13 +1553,14 @@ def run_rtc(args, robot, camera, sock, pedal=None, view=None, log=None):
                               f"delay={m} expected={pending['delay']} step_mm={step_mm:.2f} "
                               f"old_step_mm={old_step_mm:.2f} off_executed_mm={ran_mm:.2f}")
                 chunk, chunk_seq, index = new, pending["seq"], m + 1
+                hand_reference = pending["state"][6:].copy()
                 pending = None
                 overruns = starved = 0
                 if view is not None:
                     view.set_chunk(chunk[:, :3])
             first_sent = None
             if index < len(chunk):
-                action, filtered_action = filter_action(chunk[index], filtered_action, action_alpha)
+                action, filtered_action = filter_action(chunk[index], filtered_action, action_alpha, hand_reference)
                 info = robot.apply_action(filtered_action)
                 first_sent = time.perf_counter()  # after IK: later substeps keep even spacing from here
                 if log is not None:
@@ -1462,6 +1639,9 @@ def parse_args(argv=None):
     p.add_argument("--hand-acceleration", type=float, default=defaults.FOLLOWER_PROFILE_ACCELERATION_RAD_S2)
     p.add_argument("--hand-command-hz", type=float, default=100.0,
                    help="Send the latest hand target at this rate, independently of --hz (default: %(default)s)")
+    p.add_argument("--hand-telemetry-hz", type=float, default=0.0,
+                   help="Optional position/velocity/current log rate, 0..50 Hz (default: 0, no extra serial reads). "
+                        "Shares the hand writer and may reduce its achieved write rate")
     for name, default in (
         ("interface", defaults.DEFAULT_PIPER_INTERFACE), ("channel", defaults.DEFAULT_PIPER_CHANNEL),
         ("firmware", defaults.DEFAULT_PIPER_FIRMWARE), ("installation-pos", defaults.DEFAULT_PIPER_INSTALLATION_POS),
@@ -1567,6 +1747,10 @@ def parse_args(argv=None):
     dagger_mode.check_arguments(p, args)
     if args.record_video and args.fake:
         p.error("--record-video requires the real wrist camera; remove --fake")
+    if not np.isfinite(args.hand_telemetry_hz) or not 0 <= args.hand_telemetry_hz <= 50:
+        p.error("--hand-telemetry-hz must be finite and in [0, 50]")
+    if args.hand_telemetry_hz and (args.no_log or args.fake):
+        p.error("--hand-telemetry-hz requires logging and real hardware mode")
     if args.execute_steps < 0:
         p.error("--execute-steps must be nonnegative (0 uses the whole chunk)")
     if not np.isfinite(args.inference_latency_ms) or args.inference_latency_ms < 0:
@@ -1616,6 +1800,7 @@ def parse_args(argv=None):
         p.error("Require cam-fps > 0 and cam-exposure-us within one frame")
     if not 100 <= args.cam_iso <= 1600 or not 1000 <= args.cam_white_balance_k <= 12000:
         p.error("Require cam-iso 100..1600 and cam-white-balance-k 1000..12000")
+    hand_action_scales()  # Reject invalid configured gains before any hardware connection.
     return args
 
 
@@ -1623,6 +1808,8 @@ def main():
     args = parse_args()
     robot = camera = sock = pedal = view = session = None
     log = None if args.no_log else RunLog(args.log_root)
+    if log is not None:
+        log.configure(args)
     try:
         # Establish predictor connectivity before enabling any actuators.
         sock = socket.create_connection((args.predictor, args.port), timeout=args.timeout)
@@ -1645,6 +1832,8 @@ def main():
             view.update()
         camera = FakeCamera() if args.fake else OakCamera(args)
         robot = FakeRobot() if args.fake else RobotIO(args)
+        if log is not None:
+            log.configure(args, robot)
         if args.dagger is not None:
             session = pedal = dagger_mode.create_session(args, prepared, robot, camera, pedal, log)
         if pedal is not None:
@@ -1668,6 +1857,9 @@ def main():
         # Save before closing hardware, with Ctrl-C ignored: a second Ctrl-C or a
         # stuck close must not lose the log.
         if log is not None:
+            hand_writer = getattr(robot, "hand_writer", None)
+            if hand_writer is not None:
+                hand_writer.close()  # Freeze write/telemetry rows before saving.
             piper_log = getattr(robot, "piper_log", None)
             if piper_log is not None:
                 piper_log.stop()

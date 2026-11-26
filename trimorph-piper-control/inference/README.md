@@ -140,6 +140,48 @@ arrival; one action period after issue for interpolated joint commands), and
 per-band velocity RMS: measured well above commanded means the arm adds the
 shake; equal means it is in the commands. Replot or zoom with
 `python inference/executor/plot_run.py RUN_DIR --start 10 --end 16`.
+
+Executor logs also include these diagnostics in the same run folder:
+
+- `hand_commands.csv`: per executed action, the original absolute policy hand
+  target, the chunk's measured hand reference, scaled target, EMA target, and
+  target clipped to the connected hand's configured limits. `clipped_motor_ids`
+  identifies affected motors. Cycle/index link to `chunks.npz` and `commands.csv`.
+- `hand_writes.csv`: start/end timestamps of each successful hand API write and
+  its clipped calibrated target. This records host writes, not acknowledgement
+  that the motors reached their targets. Repeat writes and delays are visible.
+- `observations.csv`: existing measured hand reads, measured flange XYZ/Euler,
+  the arm reference sent to the predictor, read timing, camera frame receive
+  timestamp/age, and anchor selection/fallback. It covers sync, async, and RTC.
+- `wrist_timestamps.csv`, with `--record-video`: zero-based video frame indices
+  and host monotonic receive timestamps to align video with the other logs.
+  These are host receive times, not camera exposure timestamps. The sidecar is
+  finalized when recording closes, including when `--no-log` saves video only.
+- `meta.json`: both EMA values, hand action gain, start preset values, hand
+  calibration/limits, source hashes, and the predictor's checkpoint provenance.
+  Updated predictors also report their actual observation schema and whether
+  the neural network conditions on hand positions. Restart the predictor to
+  receive these extra provenance fields; older predictors still work.
+
+Default logging reuses existing hand observation reads and adds no serial reads.
+Per-motor hand gains are configured in `HAND_JOINT_ACTION_SCALES` in
+`executor.py`: `None` (or an omitted motor) uses `HAND_ACTION_SCALE`, while a
+number replaces the global gain for that motor. For example, `7: 0.8` applies
+a gain of 0.8 to middle motor 7 even if the global gain is 1.15. Scaling applies
+to displacement from the chunk's measured hand reference before EMA; zero
+removes that motor's predicted displacement and targets the chunk reference.
+The override map and effective gains are saved in `meta.json`.
+
+For denser hand position, velocity, and current samples, add
+`--hand-telemetry-hz 10` (allowed range 0–50; default 0). This creates rows in
+`hand_telemetry.csv` while hand targets are active. Sampling uses the same serial
+lock as writes and observations; it can reduce the achieved hand write rate.
+Read start/end times are host transaction times, and values retain the hand
+API's caching behavior. Exceptions are logged with blank unavailable readings;
+diagnostic read exceptions do not stop playback. All motor positions are
+calibrated radians, velocities rad/s, and currents mA in motor order 0–12.
+CSV rows remain in memory until shutdown, like the existing arm logs.
+
 `--traj-view [DATASET]` opens a 3D window with every demonstrated flange
 trajectory of `DATASET` (default `data_trimorph_hand_mocap_quest_4`), the live
 EEF pose and trail, the chunk being executed, and the distance to the nearest

@@ -23,7 +23,8 @@ TASK_CAMERA_FLIP = "both"
 # Fixed exposure, sensitivity and white balance (auto-exposure and auto white
 # balance are off). Measured from the auto values under the lab lighting on
 # 2026-11-01; no frame-to-frame flicker at this exposure.
-TASK_CAMERA_EXPOSURE_US = 5829
+# TASK_CAMERA_EXPOSURE_US = 5829
+TASK_CAMERA_EXPOSURE_US = 7000
 TASK_CAMERA_ISO = 100
 TASK_CAMERA_WHITE_BALANCE_K = 2634
 TASK_VIEW_WINDOW_NAME = "trimorph_task_view"
@@ -91,6 +92,14 @@ DAGGER_GRAVITY_FORCE = True
 # data_trimorph_unscrew_cap_0 (Vicon poses, one start group), median flange
 # (229, -249, 130) mm, mean Euler xyz (163, -1, 84) deg; starts spread ~20 mm / ~6 deg.
 PIPER_START_JOINTS_DEG = {
+    # Captured from receive-only can0 joint feedback, 2026-11-25 11:03:39 PST.
+    # Median of 599 coherent snapshots over 1 s; J5 range 0.262 deg, others stationary.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    # "home_multi_color": (21.311, 97.730, -28.593, 7.549, -51.241, 97.278),
+    # Captured from receive-only can0 joint feedback, 2026-11-25 11:17:19 PST.
+    # Median of 899 coherent snapshots over 1.5 s; all six joints stationary.
+    # J1..J6 degrees (CAN millidegrees divided by 1000).
+    "home_multi_color": (23.956, 96.956, -26.080, 12.320, -54.012, 97.292),
     # Captured from passive can0 joint feedback, 2026-11-24 11:38:22 PST.
     # J1..J6 degrees (CAN millidegrees divided by 1000).
     # close to first obj
@@ -142,6 +151,13 @@ PIPER_START_JOINTS_DEG = {
 }
 # Median first processed_encoder_t row (motors 0..12, leader radians) of the same episodes.
 HAND_START_POSITIONS_RAD = {
+    # Thumb motors 0..3: read-only capture, 2026-11-25 11:03:39 PST.
+    # Motors 4..12: median first synchronized sample of the 151 color-task episodes.
+    # Motors 0..12, calibrated radians; xl330_new_hand_transparent.yaml.
+    # Motors 4/7/10 clipped to the YAML upper limit of zero (<=0.021 rad change).
+    "home_multi_color": (-0.207329, -0.376980, -3.143243, -8.612971, 0.0,
+                         -0.054311, -0.336679, 0.0, -0.356505, -0.309864,
+                         0.0, -0.092660, 1.465689),
     # Captured from read-only present-position registers, 2026-11-24 11:05:01 PST.
     # Motors 0..12; calibration: xl330_new_hand_transparent.yaml.
     "home_multi": (0.015097795053919505, -0.23125204192653737, -3.1570487071569704,

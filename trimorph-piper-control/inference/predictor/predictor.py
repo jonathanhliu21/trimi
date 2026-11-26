@@ -82,7 +82,10 @@ def policy_provenance(args, policy):
             digest.update(block)
     return {"checkpoint": str(path), "sha256": digest.hexdigest(), "size_bytes": path.stat().st_size,
             "num_inference_steps": int(policy.policy.num_inference_steps), "ema": not args.no_ema,
-            "action_mode": args.action_mode}
+            "action_mode": args.action_mode, "num_obs_steps": int(policy.num_obs_steps),
+            "observations": {key: {"shape": list(value["shape"]), "type": value.get("type", "low_dim")}
+                             for key, value in policy.shape_meta["obs"].items()},
+            "hand_conditioned": policy.hand_pose_key is not None}
 
 
 def make_chunker(policy):

@@ -1,5 +1,6 @@
 """Hardware-free coverage of the deployment coordinate and wire contracts."""
 import contextlib
+import csv
 from dataclasses import dataclass
 import io
 import json
@@ -18,7 +19,7 @@ from data_collection.collection import config
 from inference import protocol
 from inference.executor.executor import (
     FakeCamera, FakeRobot, MAX_EEF_JUMP_M, OakCamera, RobotIO, jitter_start_joints,
-    main, parse_args, pose_to_piper, pose_to_policy, run, run_rtc,
+    filter_action, hand_action_scales, main, parse_args, pose_to_piper, pose_to_policy, run, run_rtc,
 )
 
 
@@ -28,6 +29,46 @@ class SimpleConfig:
 
 
 class InferenceTests(unittest.TestCase):
+    def test_per_motor_scale_overrides_global_and_none_inherits(self):
+        reference = np.linspace(-8, 2, 13)
+        previous = np.r_[np.zeros(6), reference]
+        delta = np.linspace(-.3, .3, 13)
+        predicted = np.r_[np.full(6, .1), reference + delta]
+        original = predicted.copy()
+        overrides = {0: None, 1: 0.0, 7: .5, 8: 1.0, 11: 2.0}
+        expected = np.full(13, 1.15)
+        expected[[1, 7, 8, 11]] = [0, .5, 1, 2]
+        with patch('inference.executor.executor.HAND_ACTION_SCALE', 1.15), \
+             patch('inference.executor.executor.HAND_JOINT_ACTION_SCALES', overrides):
+            target, filtered = filter_action(predicted, previous, np.full(19, .4), reference)
+        np.testing.assert_allclose(target[:6], predicted[:6])
+        np.testing.assert_allclose(target[6:], reference + expected * delta)
+        np.testing.assert_allclose(filtered, .4 * target + .6 * previous)
+        np.testing.assert_array_equal(predicted, original)
+
+    def test_per_motor_scales_reject_invalid_configuration_before_connecting(self):
+        for overrides in ({13: 1.0}, {7: -.1}, {8: np.nan}, {9: np.inf}):
+            with self.subTest(overrides=overrides), \
+                 patch('inference.executor.executor.HAND_JOINT_ACTION_SCALES', overrides), \
+                 self.assertRaises(ValueError):
+                parse_args(['--predictor', 'localhost'])
+
+    def test_hand_scale_uses_chunk_reference_before_ema(self):
+        reference = np.linspace(-2, 2, 13)
+        previous = np.r_[np.zeros(6), reference]
+        alpha = np.full(19, .4)
+        for scale in (0, 1, 2):
+            for delta in (0, -.2, .3):
+                predicted = np.r_[np.full(6, .1), reference + delta]
+                original = predicted.copy()
+                with self.subTest(scale=scale, delta=delta), \
+                     patch('inference.executor.executor.HAND_ACTION_SCALE', scale):
+                    target, filtered = filter_action(predicted, previous, alpha, reference)
+                np.testing.assert_allclose(target[:6], .1)
+                np.testing.assert_allclose(target[6:], reference + scale * delta, atol=1e-15)
+                np.testing.assert_allclose(filtered, .4 * target + .6 * previous)
+                np.testing.assert_array_equal(predicted, original)
+
     def setUp(self):
         # Start moves append to the start log; never touch the real one.
         directory = tempfile.TemporaryDirectory()
@@ -121,6 +162,11 @@ class InferenceTests(unittest.TestCase):
                 self.assertIsNone(camera.newest_bgr())
             finally:
                 camera.close()
+            with (Path(directory) / 'wrist_timestamps.csv').open() as stream:
+                frames = list(csv.DictReader(stream))
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(frames[0]['frame_index'], '0')
+            self.assertGreater(int(frames[0]['received_monotonic_ns']), 0)
         writer.write.assert_called_once_with(flipped)
         writer.release.assert_called_once()
         camera.pipeline.stop.assert_called_once()
@@ -435,6 +481,7 @@ class InferenceTests(unittest.TestCase):
         args = SimpleNamespace(hz=1000, max_cycles=1, jpeg_quality=85, execute_steps=2)
         with patch.object(protocol, 'send_obs'), \
              patch.object(protocol, 'recv_action', return_value=(0, chunk, {})), \
+             patch('inference.executor.executor.HAND_ACTION_EMA_ALPHA', 1.0), \
              contextlib.redirect_stdout(io.StringIO()):
             run(args, robot, FakeCamera(), Mock(), view=view)
         self.assertEqual(robot.apply_action.call_count, 2)
@@ -453,13 +500,16 @@ class InferenceTests(unittest.TestCase):
         scaled_target = target.astype(np.float64)
         scaled_target[6:] *= 1.1
         action_alpha = np.r_[np.full(6, 0.2), np.full(13, 0.8)]
+        boundary_state = scaled_target * (1 - (1 - action_alpha) ** 2)
+        second_target = target.astype(np.float64)
+        second_target[6:] = boundary_state[6:] + 1.1 * (target[6:] - boundary_state[6:])
         def predict():
             try:
                 for seq in range(2):
                     received_seq, image, state, _ = protocol.recv_obs(server)
                     self.assertEqual(received_seq, seq)
                     self.assertEqual(image.shape, (240, 320, 3))
-                    expected_state = scaled_target * (1 - (1 - action_alpha) ** (2 * seq))
+                    expected_state = np.zeros(19) if seq == 0 else boundary_state
                     np.testing.assert_allclose(state, expected_state, atol=1e-7)
                     protocol.send_action(server, seq, np.tile(target, (2, 1)), infer_ms=1.5)
             except BaseException as exc:
@@ -484,8 +534,10 @@ class InferenceTests(unittest.TestCase):
         # Start from feedback, smooth every coordinate, and retain EMA history
         # across the boundary between the two chunks.
         self.assertEqual(robot.apply_action.call_count, 4)
+        expected = np.zeros(19)
         for step, call in enumerate(robot.apply_action.call_args_list, start=1):
-            expected = scaled_target * (1 - (1 - action_alpha) ** step)
+            current_target = scaled_target if step <= 2 else second_target
+            expected = action_alpha * current_target + (1 - action_alpha) * expected
             np.testing.assert_allclose(call.args[0], expected, atol=1e-7)
         np.testing.assert_allclose(robot.read_state(), expected, atol=1e-7)
 
@@ -725,6 +777,23 @@ class InferenceTests(unittest.TestCase):
         state = send_obs.call_args_list[1].args[3]
         np.testing.assert_allclose(state[:6], chunks[0][2, :6], atol=1e-7)  # EMA disabled in this test
         self.assertIn('rtc delay=2 (expected 1)', output)
+
+    def test_rtc_hand_scale_keeps_each_chunks_observation_reference(self):
+        chunks = [self.rtc_chunk(c, 6) for c in range(2)]
+        chunks[0][:, 6:] = 2 + np.arange(6)[:, None] * .1
+        chunks[1][:, 6:] = 2.4 - np.arange(6)[:, None] * .1
+        robot = FakeRobot()
+        robot.state[6:] = 2
+        with patch('inference.executor.executor.HAND_ACTION_SCALE', 2), \
+             patch('inference.executor.executor.HAND_ACTION_EMA_ALPHA', 1.0):
+            _, send_obs, _, _ = self.run_rtc_with(chunks, [False, True], horizon=2, robot=robot)
+        # Old actions 1, 2, 3 run; new action 2 takes over after one old tick.
+        commands = [call.args[0][6:] for call in robot.apply_action.call_args_list]
+        for index in range(1, 4):
+            np.testing.assert_allclose(commands[index - 1], 2 + 2 * (chunks[0][index, 6:] - 2))
+        reference = send_obs.call_args_list[1].args[3][6:]
+        for offset, index in enumerate(range(2, 6), start=3):
+            np.testing.assert_allclose(commands[offset], reference + 2 * (chunks[1][index, 6:] - reference))
 
     def test_rtc_uses_filtered_reference_and_retains_absolute_overlap(self):
         robot = FakeRobot()

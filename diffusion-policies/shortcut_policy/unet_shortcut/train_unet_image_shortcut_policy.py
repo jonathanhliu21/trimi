@@ -10,6 +10,7 @@ if __name__ == "__main__":
 
 import os
 import pathlib
+import json
 import hydra
 import copy
 import dill
@@ -442,6 +443,28 @@ class TrainDiffusionUnetImageWorkspace:
         # Configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+
+        if cfg.training.get("verify_experiment", False):
+            # Record the actual loader split, including the reduced-data subset.
+            expected = {"camera_0"}
+            if "hand_pose_abs" in cfg.tasks.shape_meta.obs:
+                expected.add("hand_pose_abs")
+            example = dataset[0]
+            if set(example["obs"]) != expected:
+                raise RuntimeError("Loaded observations differ from the requested task")
+            if "hand_pose_abs" in expected and example["obs"]["hand_pose_abs"].shape[-1] != 13:
+                raise RuntimeError("hand_pose_abs must contain 13 joints")
+            split = {
+                "train": np.flatnonzero(dataset.train_mask).tolist(),
+                "validation": np.flatnonzero(dataset.val_mask).tolist(),
+                "observations": {key: list(value.shape) for key, value in example["obs"].items()},
+                "episodes": int(dataset.replay_buffer.n_episodes),
+            }
+            if set(split["train"]) & set(split["validation"]):
+                raise RuntimeError("Training and validation episodes overlap")
+            pathlib.Path(self.output_dir, "split_verification.json").write_text(json.dumps(split, indent=2))
+            OmegaConf.save(cfg, pathlib.Path(self.output_dir, "resolved_config.yaml"), resolve=True)
+            print("OBSERVATIONS_AND_SPLIT_VERIFIED: " + json.dumps(split), flush=True)
 
         # Set normalizer. The deployed predictor un-normalizes with the
         # checkpoint's normalizer, so a warm start that keeps it trains the
