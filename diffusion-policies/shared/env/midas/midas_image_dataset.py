@@ -108,6 +108,28 @@ def _per_source_val_mask(
     return val_mask
 
 
+# Per-step flag in the replay buffer: False where the sync's optional train_mask
+# excludes the row (DAgger exports: a kinesthetic takeover's handoff frames).
+# Windows touching such a row are never sampled.
+TRAIN_ROW_KEY = "train_row"
+# Cache contents version; 2 added TRAIN_ROW_KEY.
+REPLAY_BUFFER_FORMAT = 2
+
+
+def _drop_untrainable_windows(
+    sampler: SequenceSampler, replay_buffer: ReplayBuffer
+) -> SequenceSampler:
+    """Remove the sampler's windows whose buffer rows include an excluded row."""
+    if len(sampler.indices) == 0 or TRAIN_ROW_KEY not in replay_buffer.keys():
+        return sampler
+    excluded = np.concatenate(
+        [[0], np.cumsum(~replay_buffer[TRAIN_ROW_KEY][:].astype(bool))]
+    )
+    starts, ends = sampler.indices[:, 0], sampler.indices[:, 1]
+    sampler.indices = sampler.indices[excluded[ends] == excluded[starts]]
+    return sampler
+
+
 def _window_sources(
     sampler: SequenceSampler, episode_ends: np.ndarray, episode_source: np.ndarray
 ) -> np.ndarray:
@@ -201,6 +223,7 @@ def _load_root_replay_buffer(
         "first_cut": int(first_cut),
         "encoder_window": int(encoder_window),
         "sync_downsample_stride": sync_downsample_stride,
+        "buffer_format": REPLAY_BUFFER_FORMAT,
     }
     cache_hash = hashlib.md5(
         json.dumps(cache_key, sort_keys=True).encode("utf-8")
@@ -261,6 +284,10 @@ class MidasImageDataset(Dataset):
     ``source`` id when there is more than one root. ``source_weights`` (one per
     root, or {name: weight}) sets each root's share of the training draws
     through ``sample_weights``; None keeps uniform sampling over windows.
+
+    A sync file may carry ``train_mask`` (one bool per sync row; DAgger full
+    rollouts set it False on kinesthetic handoff frames). Training and validation
+    windows that touch a False row are dropped; without it every row trains.
     """
 
     def __init__(
@@ -340,16 +367,22 @@ class MidasImageDataset(Dataset):
             max_n=max_train_episodes,
             seed=seed,
         )
-        sampler = SequenceSampler(
-            replay_buffer=replay_buffer,
-            sequence_length=horizon + num_latency_steps,
-            pad_before=pad_before,
-            pad_after=pad_after,
-            episode_mask=train_mask,
-            key_first_k=key_first_k,
+        sample_keys = [*rgb_keys, *lowdim_keys, "action"]
+        sampler = _drop_untrainable_windows(
+            SequenceSampler(
+                replay_buffer=replay_buffer,
+                sequence_length=horizon + num_latency_steps,
+                pad_before=pad_before,
+                pad_after=pad_after,
+                keys=sample_keys,
+                episode_mask=train_mask,
+                key_first_k=key_first_k,
+            ),
+            replay_buffer,
         )
 
         self.replay_buffer = replay_buffer
+        self.sample_keys = sample_keys
         self.sampler = sampler
         self.shape_meta = shape_meta
         self.rgb_keys = rgb_keys
@@ -396,12 +429,16 @@ class MidasImageDataset(Dataset):
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
-        val_set.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer,
-            sequence_length=self.horizon + self.num_latency_steps,
-            pad_before=self.pad_before,
-            pad_after=self.pad_after,
-            episode_mask=self.val_mask,
+        val_set.sampler = _drop_untrainable_windows(
+            SequenceSampler(
+                replay_buffer=self.replay_buffer,
+                sequence_length=self.horizon + self.num_latency_steps,
+                pad_before=self.pad_before,
+                pad_after=self.pad_after,
+                keys=self.sample_keys,
+                episode_mask=self.val_mask,
+            ),
+            self.replay_buffer,
         )
         val_set.val_mask = ~self.val_mask
         val_set.window_source = _window_sources(
@@ -418,13 +455,16 @@ class MidasImageDataset(Dataset):
         Reads only the action array (no video frames) for the training windows,
         or a seeded random subset of at most ``max_windows`` of them.
         """
-        sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer,
-            sequence_length=self.horizon + self.num_latency_steps,
-            pad_before=self.pad_before,
-            pad_after=self.pad_after,
-            keys=["action"],
-            episode_mask=self.train_mask,
+        sampler = _drop_untrainable_windows(
+            SequenceSampler(
+                replay_buffer=self.replay_buffer,
+                sequence_length=self.horizon + self.num_latency_steps,
+                pad_before=self.pad_before,
+                pad_after=self.pad_after,
+                keys=["action"],
+                episode_mask=self.train_mask,
+            ),
+            self.replay_buffer,
         )
         indices = np.arange(len(sampler))
         if max_windows is not None and len(indices) > max_windows:
@@ -666,8 +706,14 @@ def _build_replay_buffer(
         frame_idx = sync_data["frame_idx"].astype(np.int64)
         encoder_idx = sync_data["encoder_idx"].astype(np.int64)
         pose_idx = sync_data["pose_idx"].astype(np.int64)
+        # Optional: DAgger exports mark kinesthetic handoff frames False; every row trains otherwise.
+        train_row = (
+            sync_data["train_mask"].astype(bool)
+            if "train_mask" in sync_data
+            else np.ones(len(frame_idx), dtype=bool)
+        )
 
-        if not (len(frame_idx) == len(encoder_idx) == len(pose_idx)):
+        if not (len(frame_idx) == len(encoder_idx) == len(pose_idx) == len(train_row)):
             print(
                 f"[MidasImageDataset] Dropping episode {i}: sync array length mismatch"
             )
@@ -681,10 +727,12 @@ def _build_replay_buffer(
         frame_idx = frame_idx[first_cut:]
         encoder_idx = encoder_idx[first_cut:]
         pose_idx = pose_idx[first_cut:]
+        train_row = train_row[first_cut:]
         if sync_downsample_stride > 1:
             frame_idx = frame_idx[::sync_downsample_stride]
             encoder_idx = encoder_idx[::sync_downsample_stride]
             pose_idx = pose_idx[::sync_downsample_stride]
+            train_row = train_row[::sync_downsample_stride]
 
         if len(frame_idx) == 0:
             dropped_episodes += 1
@@ -721,6 +769,8 @@ def _build_replay_buffer(
         episode = {
             rgb_key: episode_images.astype(np.uint8),
             "action": episode_state,
+            # Every episode has it, so roots with and without train_mask share one buffer.
+            TRAIN_ROW_KEY: train_row,
         }
         if "hand_pose_abs" in lowdim_keys:
             episode["hand_pose_abs"] = episode_hand.astype(np.float32)

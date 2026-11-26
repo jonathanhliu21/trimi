@@ -261,6 +261,12 @@ Use zero-based indices. Keep indices in range. The current loader clips indices
 to valid ranges, but the collection pipeline should treat out-of-range indices
 as a bug and fail validation rather than relying on clipping.
 
+Optional `train_mask` (bool, length `N`): the trainer skips every window that
+touches a `False` row; without it every row trains. DAgger full-rollout exports
+(`scripts/dagger/export_dataset.py`) set it `False` on a kinesthetic takeover's
+`handoff` frames (unless `--train-handoff`) and also store `control` (`policy` /
+`human` / `handoff` per row) and `intervention` (`control == "human"`).
+
 The postprocessor builds one sync row per camera frame, dropping one frame at
 each end (`--trim-camera-frames`), and picks the hand and pose samples nearest
 in time to that frame. All streams share the host `monotonic_ns` clock. Camera

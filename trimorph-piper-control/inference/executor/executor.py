@@ -86,11 +86,13 @@ DEFAULT_HAND_API_REPO = CONTROL_ROOT.parent / "trimorph_hand_api"
 DEFAULT_HAND_CONFIG = CONTROL_ROOT / "config" / "xl330_test_config.yaml"
 # Every start the executor reaches, one JSON object per line; --start-id repeats one.
 DEFAULT_START_LOG = CONTROL_ROOT / "output" / "executor_starts.jsonl"
-# One folder per run: piper.csv (200 Hz feedback), commands.csv, events.csv, chunks.npz.
+# One folder per run: piper.csv (one row per joint feedback frame), commands.csv, events.csv, chunks.npz.
 DEFAULT_RUN_LOG_ROOT = CONTROL_ROOT / "output" / "executor_runs"
-PIPER_LOG_HZ = 200.0
+# Poll rate of the Piper log: data collection's, above the arm's joint feedback rate,
+# so that deduplication on the CAN receive time keeps every frame.
+PIPER_LOG_HZ = defaults.DEFAULT_PIPER_RATE_HZ
 EULER_FIELDS = ("x", "y", "z", "roll", "pitch", "yaw")
-PIPER_LOG_FIELDS = ("monotonic_ns", "joint_timestamp_s", *(f"joint_{i}" for i in range(1, 7)),
+PIPER_LOG_FIELDS = ("monotonic_ns", "joint_timestamp_s", "joint_rx_monotonic_ns", *(f"joint_{i}" for i in range(1, 7)),
                     *(f"vel_{i}" for i in range(1, 7)), *(f"current_{i}" for i in range(1, 7)),
                     "fw_timestamp_s", *(f"fw_{name}" for name in EULER_FIELDS),
                     "arm_status", "motion_status")
@@ -784,18 +786,44 @@ class OakCamera:
         self.pipeline.stop()
 
 
+def clock_pair(attempts=3, tight_ns=100_000):
+    """(monotonic_ns, wall_s) for one instant: the wall read bracketed by two monotonic reads.
+
+    Another thread taking the GIL between two plain reads would shift a CAN receive
+    time converted with them by milliseconds; the tightest of a few brackets is kept.
+    """
+    best = None
+    for _ in range(attempts):
+        before = time.monotonic_ns()
+        wall_s = time.time()
+        after = time.monotonic_ns()
+        if best is None or after - before < best[0]:
+            best = (after - before, (before + after) // 2, wall_s)
+        if after - before <= tight_ns:
+            break
+    return best[1], best[2]
+
+
 class PiperFeedbackLogger:
     """Poll the SDK's cached Piper feedback at PIPER_LOG_HZ on a background thread.
 
-    Joint angles, motor velocity/current, firmware flange pose, and the
-    controller's motion status (whether MOVE P reports its target reached) per row.
+    As data collection's Piper logger does (piper_worker.run_gravity_comp_listener),
+    a row is kept per new joint feedback frame, deduplicated on that frame's CAN
+    receive time, which joint_rx_monotonic_ns puts on the host monotonic clock;
+    monotonic_ns is when the poll saw the frame. Each row also has the motor
+    velocity/current, the firmware flange pose, and the controller's motion status
+    (whether MOVE P reports its target reached).
     """
 
     def __init__(self, api, rate_hz=PIPER_LOG_HZ):
+        from data_collection.collection.piper_worker import joint_rx_monotonic_ns
         from scripts.piper_api.robot_helpers import _status_value
 
         self.api = api
         self.status_value = _status_value
+        self.rx_monotonic_ns = joint_rx_monotonic_ns
+        self.last_stamp = None
+        self.last_rx_ns = None
         self.period_s = 1.0 / rate_hz
         self.rows = []
         self.errors = 0
@@ -818,8 +846,16 @@ class PiperFeedbackLogger:
 
     def sample(self):
         joints = self.api.get_joint_state()
-        if joints is not None:
-            row = {"monotonic_ns": time.monotonic_ns(), "joint_timestamp_s": f"{joints.timestamp:.6f}"}
+        if joints is not None and joints.timestamp != self.last_stamp:
+            self.last_stamp = joints.timestamp
+            now_ns, wall_s = clock_pair()
+            rx_ns = self.rx_monotonic_ns(float(joints.timestamp), now_ns=now_ns, wall_s=wall_s)
+            if rx_ns is not None:
+                if self.last_rx_ns is not None and rx_ns <= self.last_rx_ns:
+                    return  # a wall-clock step; piper_fk needs strictly increasing receive times
+                self.last_rx_ns = rx_ns
+            row = {"monotonic_ns": now_ns, "joint_timestamp_s": f"{joints.timestamp:.6f}",
+                   "joint_rx_monotonic_ns": "" if rx_ns is None else rx_ns}
             row.update({f"joint_{i}": f"{v:.9f}" for i, v in enumerate(joints.joints, start=1)})
             motors = self.api.get_motor_state()
             if motors is not None:

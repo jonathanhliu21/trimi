@@ -247,8 +247,12 @@ raw episode in the collection layout and lets the operator take over:
 Export directly from raw recordings with
 `python scripts/dagger/export_dataset.py DATASET_ROOT --out OUTPUT_ROOT`.
 It selects successful rollouts with human corrections, invokes shared Piper
-postprocessing and validates sync alignment. By default, videos and syncs include
-the full retained rollout, including autonomous policy execution. Add `--trim`
+postprocessing (`--pose-source piper_fk`: FK of the joints on their CAN receive
+clock, as kinesthetic collection) and validates sync alignment. By default, videos
+and syncs include the full retained rollout, including autonomous policy execution,
+and label every frame `policy`, `human` or `handoff`. Every frame trains except a
+kinesthetic takeover's ~1 s handoff, whose windows the trainer skips (syncs
+`train_mask`; `--train-handoff` keeps them). Add `--trim`
 to export only human corrections with compact videos/arrays and remapped syncs.
 Timing differences above `--max-sync-error-ms` (default 10) warn and retain
 nearest samples, matching shared postprocessing. Invalid indices, non-increasing
