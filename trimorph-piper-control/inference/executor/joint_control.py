@@ -11,7 +11,9 @@ to DAMPING_SIGMA as it approaches zero: exact IK in well-conditioned poses; near
 the singularity a small pose error is accepted instead of a large J2/J3 jump.
 The joint change is then scaled down, as a whole, so no joint exceeds its speed
 cap, and joints stay inside the SDK limits minus replay's 3-degree margin, with
-J5 kept on its side of the wrist singularity (|J5| >= 10 deg).
+J5 kept on its side of the wrist singularity (|J5| >= 10 deg) unless
+cross_wrist=True, which lets J5 pass through zero as the demonstrations do
+(the speed caps and the near-singularity damping still bound each step).
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ def damping(sigma, sigma_start=DAMPING_SIGMA):
 
 class JointController:
     def __init__(self, max_speed_deg_s=DEFAULT_MAX_JOINT_SPEED_DEG_S, *, sigma_start=DAMPING_SIGMA,
-                 limits=Limits()):
+                 limits=Limits(), cross_wrist=False):
         self.fk, bounds = piper_model()
         margin = np.radians(limits.joint_margin_deg)
         self.lower, self.upper = bounds[:, 0] + margin, bounds[:, 1] - margin
@@ -44,6 +46,7 @@ class JointController:
         if self.max_speed.shape != (6,) or not np.all(self.max_speed > 0):
             raise ValueError("max_speed_deg_s must be six positive values")
         self.sigma_start = sigma_start
+        self.cross_wrist = cross_wrist
         self.q = None
 
     def reset(self, joints):
@@ -52,6 +55,8 @@ class JointController:
 
     def bounds(self):
         lower, upper = self.lower.copy(), self.upper.copy()
+        if self.cross_wrist:
+            return lower, upper
         # Keep J5 on its current side of zero, at least the wrist margin away.
         if self.q[4] >= 0:
             lower[4] = max(lower[4], self.wrist_margin)

@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import subprocess
@@ -147,14 +148,18 @@ m['terminate']()
         raise RuntimeError(f'Less than {minimum_free_gib:g} GiB free on checkpoint volume')
     status('extracting')
     LOCAL.mkdir(parents=True, exist_ok=True)
-    for archive, destination in [('source.tar.gz', LOCAL / 'code'),
-                                 ('dataset.tar', LOCAL / 'datasets'),
-                                 ('dinov3.tar.gz', LOCAL)]:
+    # A dataset may be staged as one dataset.tar or as dataset.partNN.tar pieces.
+    for pattern, destination in [(r'source\.tar\.gz', LOCAL / 'code'),
+                                 (r'dataset(\.part\d+)?\.tar', LOCAL / 'datasets'),
+                                 (r'dinov3\.tar\.gz', LOCAL)]:
         destination.mkdir(parents=True, exist_ok=True)
-        archive_path = Path('/workspace') / next(
-            a['key'] for a in manifest['artifacts'] if a['key'].endswith('/' + archive))
-        with tarfile.open(archive_path) as stream:
-            stream.extractall(destination, filter='data')
+        paths = [Path('/workspace') / a['key'] for a in manifest['artifacts']
+                 if re.fullmatch(pattern, Path(a['key']).name)]
+        if not paths:
+            raise RuntimeError('No staged archive matches ' + pattern)
+        for archive_path in paths:
+            with tarfile.open(archive_path) as stream:
+                stream.extractall(destination, filter='data')
     # Each pod owns its environment and caches, avoiding concurrent writes to shared code.
     os.environ.update(PYTHONUNBUFFERED='1', WANDB_ENTITY='jonathanhliu21-ucla',
                       WANDB_INIT_TIMEOUT='120', WANDB_CONSOLE='off',

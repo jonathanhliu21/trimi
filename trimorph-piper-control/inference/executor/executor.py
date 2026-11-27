@@ -54,10 +54,13 @@ from data_collection.collection import config as defaults
 MOTOR_IDS = tuple(defaults.TRIMORPH_MOTOR_IDS)
 # Euclidean XYZ distance in meters, including observation -> first action.
 MAX_EEF_JUMP_M = 0.15
+# Hand restore at each (re)start, see RobotIO.restore_hand.
+DXL_ADDR_POSITION_P_GAIN = 84  # Dynamixel X-series control table (RAM; factory value after a reboot)
+HAND_REBOOT_WAIT_S = 1.0
 # Independent per-action EMA for the arm pose and hand motor positions.
 # filtered = alpha * target + (1 - alpha) * previous; 1.0 disables smoothing.
-ARM_ACTION_EMA_ALPHA = 0.25 # action[:6]: XYZ + rotation vector
-HAND_ACTION_EMA_ALPHA = 0.8  # action[6:]: 13 hand motor positions
+ARM_ACTION_EMA_ALPHA = 0.35 # action[:6]: XYZ + rotation vector
+HAND_ACTION_EMA_ALPHA = 0.85  # action[6:]: 13 hand motor positions
 # Scale hand displacement from each chunk's observation before EMA.
 # Arm targets always retain scale 1.0.
 HAND_ACTION_SCALE = 1.1
@@ -110,7 +113,8 @@ HAND_TELEMETRY_LOG_FIELDS = ("started_monotonic_ns", "finished_monotonic_ns", "e
 OBSERVATION_LOG_FIELDS = ("monotonic_ns", "cycle", "read_started_monotonic_ns", "read_finished_monotonic_ns",
                           "frame_received_monotonic_ns", "frame_age_ms", "anchor_source",
                           *(f"measured_{name}" for name in EULER_FIELDS),
-                          *(f"anchor_{name}" for name in EULER_FIELDS), *(f"hand_{i}_rad" for i in MOTOR_IDS))
+                          *(f"anchor_{name}" for name in EULER_FIELDS), *(f"hand_{i}_rad" for i in MOTOR_IDS),
+                          *(f"measured_hand_{i}_rad" for i in MOTOR_IDS))
 EVENT_LOG_FIELDS = ("monotonic_ns", "cycle", "event", "detail")
 DEFAULT_TRAJ_DATASET = CONTROL_ROOT / "data_trimorph_hand_mocap_quest_4"
 DEFAULT_HAND_PORT = "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO9P0-if00-port0"
@@ -362,9 +366,14 @@ class RobotIO:
         self.state_note = "measured"
         self.state_anchor = args.state_anchor
         self.anchor_max_mm, self.anchor_max_deg = args.anchor_max_mm, args.anchor_max_deg
+        self.hand_state, self.hand_state_max_rad = args.hand_state, args.hand_state_max_rad
+        self.hand_velocity, self.hand_acceleration = args.hand_velocity, args.hand_acceleration
+        self.policy_hand_target = None  # unscaled policy hand target of the action just sent
+        self.hand_state_fallback = ()
         if args.arm_control == "joint":
             from inference.executor.joint_control import JointController
-            self.joint_control = JointController(args.max_joint_speed_deg_s, sigma_start=args.ik_damping_sigma)
+            self.joint_control = JointController(args.max_joint_speed_deg_s, sigma_start=args.ik_damping_sigma,
+                                                 cross_wrist=args.j5_cross_zero)
         try:
             hand_class = load_hand_class(args.hand_api_repo)
             config = load_hand_config(Path(args.hand_config).expanduser(), args.hand_port, MOTOR_IDS)
@@ -432,6 +441,7 @@ class RobotIO:
         if release_hand:
             with writer.lock if writer is not None else nullcontext():
                 self.hand.disable_torque()
+                self.restore_hand()
             print("Hand torque off while the arm returns to start.", flush=True)
         self.piper.set_position_mode()
         time.sleep(POSITION_MODE_SETTLE_S)
@@ -470,6 +480,44 @@ class RobotIO:
         print(f"Start #{start_id} logged in {args.start_log}; repeat it with --start-id {start_id} "
               f"(or --start-joints-deg {' '.join(f'{v:.2f}' for v in target_deg)}).", flush=True)
 
+    def restore_hand(self):
+        """With hand torque off at a (re)start: give the next attempt the hand configured at startup.
+
+        A motor with a hardware error (e.g. overload) stays limp until it reboots, and a rebooted or
+        power-cycled motor comes back with factory RAM settings (XL330: position P gain 400, no motion
+        profile) that nothing else re-applies. Reboot errored motors; if any motor rebooted or lost its
+        P gain, re-apply the hand configuration and motion profile.
+        """
+        client = self.hand._client()
+        handler, port = client.packet_handler, client.port_handler
+        errors = {int(i): int(code) for i, code in self.hand.read_hardware_error_status().items() if code}
+        for motor_id, code in errors.items():
+            handler.reboot(port, motor_id)
+            print(f"Hand: motor {motor_id} had hardware error {code}"
+                  f"{' (overload)' if code & 32 else ''}; rebooted it.", flush=True)
+        if errors:
+            time.sleep(HAND_REBOOT_WAIT_S)
+            missing = [i for i in errors if i not in self.hand.ping()]
+            if missing:
+                raise RuntimeError(f"Hand motors {missing} did not answer after a reboot; power-cycle the hand")
+        expected = int(self.hand.config.position_p_gain)
+        lost = {}
+        for motor_id in self.hand.motor_ids:
+            value, comm_result, _ = handler.read2ByteTxRx(port, int(motor_id), DXL_ADDR_POSITION_P_GAIN)
+            if comm_result == client.dxl.COMM_SUCCESS and int(value) != expected:
+                lost[int(motor_id)] = int(value)
+        if not errors and not lost:
+            return
+        unexplained = {i: v for i, v in lost.items() if i not in errors}
+        if unexplained:
+            print(f"WARNING: hand motors {' '.join(map(str, unexplained))} had position P gain "
+                  f"{' '.join(map(str, sorted(set(unexplained.values()))))} (configured {expected}): they restarted "
+                  "since startup (power cycle?).", flush=True)
+        self.hand.configure(enable_torque=False)
+        self.hand.set_motion_profile(profile_velocity_rad_s=self.hand_velocity,
+                                     profile_acceleration_rad_s2=self.hand_acceleration)
+        print("Hand: re-applied the hand configuration (gains, operating mode, motion profile).", flush=True)
+
     def move_hand_to_start(self, name, tolerance_rad=0.05, timeout_s=5.0, enable_torque=False):
         # DAgger's sampler keeps reading between episodes. Serialize the entire
         # goal/torque/settle transaction with it and the background command writer.
@@ -507,13 +555,14 @@ class RobotIO:
         if self.joint_control is not None:
             self.joint_control.q = None  # restart joint targets from the measured start
         self.commanded_pose = None  # the next observation uses the measured start
+        self.policy_hand_target = None  # likewise for --hand-state command
 
     def eef_pose(self):
         """Measured flange pose (XYZ m + Euler xyz rad), or None if feedback is missing."""
         return self.piper.get_eef_pose()
 
     def read_state(self, anchor=None):
-        """Observation state: arm pose (see anchored_pose) + measured hand positions."""
+        """Observation state: arm pose (see anchored_pose) + hand positions (see hand_observation)."""
         started = time.monotonic_ns()
         pose = self.piper.get_eef_pose()
         if pose is None:
@@ -525,8 +574,39 @@ class RobotIO:
             hand = vector(self.hand.read_pos(), 13, "hand state")
         self.last_state_read = {"read_started_monotonic_ns": started,
                                 "read_finished_monotonic_ns": time.monotonic_ns(),
-                                **{f"measured_{name}": float(v) for name, v in zip(EULER_FIELDS, pose)}}
-        return np.concatenate((pose_to_policy(self.anchored_pose(pose, anchor)), hand)).astype(np.float32)
+                                **{f"measured_{name}": float(v) for name, v in zip(EULER_FIELDS, pose)},
+                                **{f"measured_hand_{i}_rad": float(v) for i, v in zip(MOTOR_IDS, hand)}}
+        arm = pose_to_policy(self.anchored_pose(pose, anchor))  # sets state_note
+        return np.concatenate((arm, self.hand_observation(hand))).astype(np.float32)
+
+    def hand_observation(self, measured):
+        """Hand positions sent as the observation state; the predictor also adds each chunk's
+        hand deltas to them.
+
+        --hand-state measured (default) sends the measured hand. --hand-state command sends the
+        unscaled policy target of the action just sent, clipped to the joint limits: the demos'
+        hand state is the leader, i.e. what the follower was commanded, not where it ended up.
+        The first observation after a start, and any motor farther than --hand-state-max-rad
+        from its command (stalled or faulted), use the measured position.
+        """
+        if getattr(self, "hand_state", "measured") != "command":
+            return measured
+        if self.policy_hand_target is None:
+            self.state_note += "; hand measured (no command yet)"
+            return measured
+        config = self.hand.config
+        target = np.clip(vector(self.policy_hand_target, 13, "hand target"),
+                         config.joint_lower_limits_array, config.joint_upper_limits_array)
+        far = np.abs(target - measured) > self.hand_state_max_rad
+        fallback = tuple(MOTOR_IDS[i] for i in np.flatnonzero(far))
+        if fallback and fallback != self.hand_state_fallback:
+            off = ", ".join(f"motor {MOTOR_IDS[i]} {abs(target[i] - measured[i]):.2f} rad" for i in np.flatnonzero(far))
+            print(f"WARNING: hand far from its command ({off}); sending the measured position for "
+                  f"{'that motor' if len(fallback) == 1 else 'those motors'}", flush=True)
+        self.hand_state_fallback = fallback
+        self.state_note += "; hand command" + (f", measured for motors {' '.join(map(str, fallback))}"
+                                               if fallback else "")
+        return np.where(far, measured, target)
 
     def anchored_pose(self, measured, anchor=None):
         """The pose the predictor anchors the next chunk to.
@@ -1463,6 +1543,7 @@ def run_async(args, robot, camera, sock, action_alpha, pedal=None, view=None, lo
 
                 action, filtered_action = filter_action(chunk[index], filtered_action, action_alpha, hand_reference)
                 info = robot.apply_action(filtered_action)
+                robot.policy_hand_target = np.array(chunk[index][6:], dtype=float)  # for --hand-state command
                 first_sent = time.perf_counter()
                 if log is not None:
                     log.command(cycle, index, action, filtered_action, info)
@@ -1598,6 +1679,7 @@ def run_rtc(args, robot, camera, sock, pedal=None, view=None, log=None):
             if index < len(chunk):
                 action, filtered_action = filter_action(chunk[index], filtered_action, action_alpha, hand_reference)
                 info = robot.apply_action(filtered_action)
+                robot.policy_hand_target = np.array(chunk[index][6:], dtype=float)  # for --hand-state command
                 first_sent = time.perf_counter()  # after IK: later substeps keep even spacing from here
                 if log is not None:
                     log.command(chunk_seq, index, action, filtered_action, info)
@@ -1712,9 +1794,20 @@ def parse_args(argv=None):
                         "farther than this from the commanded pose")
     p.add_argument("--anchor-max-deg", type=float, default=20.0,
                    help="Same fallback for orientation")
+    p.add_argument("--hand-state", choices=("measured", "command"), default="measured",
+                   help="Hand positions sent as the observation state, which the predictor also adds each "
+                        "chunk's hand deltas to: the measured hand (default, previous behavior) or the unscaled "
+                        "policy target of the action just sent, like the leader hand recorded in the demos")
+    p.add_argument("--hand-state-max-rad", type=float, default=1.5,
+                   help="With --hand-state command, send the measured position for any motor farther than "
+                        "this from its command (a stalled or faulted motor)")
     p.add_argument("--ik-damping-sigma", type=float, default=None,
                    help="IK damping starts when the Jacobian's smallest singular value is below this "
                         "(default: inference/executor/joint_control.py; 0 = exact IK)")
+    p.add_argument("--j5-cross-zero", action="store_true",
+                   help="With --arm-control joint, let the IK move J5 through zero (the wrist singularity), "
+                        "as the demonstrations do, instead of keeping it on its starting side at least "
+                        "10 deg from zero; the joint speed caps and IK damping still bound each step")
     p.add_argument("--start-home", choices=sorted(defaults.PIPER_START_JOINTS_DEG),
                    default=defaults.DEFAULT_EXECUTOR_START,
                    help="Named joint-space start before the first observation (default: %(default)s)")
@@ -1811,6 +1904,12 @@ def parse_args(argv=None):
         p.error("--rtc continues the commanded plan from the action just sent; use --state-anchor command")
     if not args.anchor_max_mm > 0 or not args.anchor_max_deg > 0:
         p.error("Require positive --anchor-max-mm and --anchor-max-deg")
+    if not args.hand_state_max_rad > 0:
+        p.error("Require positive --hand-state-max-rad")
+    if args.hand_state == "command" and (getattr(args, "dagger", None) is not None
+                                         or getattr(args, "takeover", None) is not None):
+        p.error("--hand-state command is for policy-only rollouts: DAgger takeovers move the hand "
+                "outside the policy, so its last command would be stale")
     if args.start_speed_deg_s > 30:
         p.error("--start-speed-deg-s above 30 is not allowed")
     if not 0 <= args.start_jitter_mm <= 100 or not 0 <= args.start_jitter_deg <= 30:

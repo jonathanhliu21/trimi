@@ -12,6 +12,7 @@ enforce a 24-hour ceiling. Nothing here deletes the network volume or any checkp
 """
 import argparse
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -58,11 +59,16 @@ SHARED_ARTIFACTS = [
 OLD_ARCHIVE = {'key': 'experiments/color_palm_dinov3_20261124_01/staging/dataset.tar', 'size': 5681879040,
                'sha256': '4b8b8f9db3800604c20199cc2f55832550a464bf58b7a4ee3d6e4c26b2156807',
                'local': ROOT / 'data/color_palm_dinov3_20261124_01/dataset.tar'}
+# User-approved removal (2026-11-25) after Runpod returned QuotaExceeded: first-campaign scratch
+# with no checkpoints (an extracted dataset whose source is still local, an unused venv, caches,
+# and an old extracted source tree).
+FIRST_CAMPAIGN_SCRATCH = ('datasets/data_trimorph_m3_screw_pick_place/', 'venv/', 'cache/', 'code/')
 MAX_RUNTIME = 86400
 STARTUP_GRACE = 2700
-# Each run peaks at two checkpoints (old latest + atomic temp file) of ~1.5 GB.
-MIN_FREE_GIB = 4.5
-KEEP_ARCHIVE_FREE_GIB = 7.0
+# Smaller pieces keep the multipart-upload assembly overhead (~1x the object) small.
+DATASET_PARTS = 4
+# Each pod's smoke test writes one ~1.5 GB checkpoint before the staged dataset is removed.
+MIN_FREE_GIB = 3.0
 NAME = re.compile(r'^[A-Za-z0-9_-]+$')
 
 
@@ -132,16 +138,33 @@ def dataset_report(dataset):
             'train_all_indices': np.flatnonzero(~val).tolist(), 'seed': seed, 'val_ratio': val_ratio}
 
 
-def build_dataset_tar(dataset, target):
-    with tarfile.open(target, 'w') as archive:
-        for directory, ext in LOADER_DIRS:
-            archive.add(dataset / directory.split('/')[0], arcname=f'{dataset.name}/{directory.split("/")[0]}',
-                        recursive=False)
-            if '/' in directory:
-                archive.add(dataset / directory, arcname=f'{dataset.name}/{directory}', recursive=False)
-            for name in sorted(os.listdir(dataset / directory)):
-                if name.endswith(ext):
-                    archive.add(dataset / directory / name, arcname=f'{dataset.name}/{directory}/{name}')
+def build_dataset_parts(dataset, local):
+    """Split the loader's files into DATASET_PARTS tar pieces of similar size."""
+    entries = []
+    for directory, ext in LOADER_DIRS:
+        for name in sorted(os.listdir(dataset / directory)):
+            if name.endswith(ext):
+                path = dataset / directory / name
+                entries.append((f'{dataset.name}/{directory}/{name}', path, path.stat().st_size))
+    target = sum(size for _, _, size in entries) / DATASET_PARTS
+    groups, current, size = [], [], 0
+    for entry in entries:
+        if current and size + entry[2] > target and len(groups) < DATASET_PARTS - 1:
+            groups.append(current)
+            current, size = [], 0
+        current.append(entry)
+        size += entry[2]
+    groups.append(current)
+    paths = []
+    for index, group in enumerate(groups):
+        path = local / f'dataset.part{index:02d}.tar'
+        partial = local / (path.name + '.partial')
+        with tarfile.open(partial, 'w') as archive:
+            for arcname, source, _ in group:
+                archive.add(source, arcname=arcname)
+        partial.replace(path)
+        paths.append(path)
+    return paths
 
 
 def build_source_tar(target):
@@ -200,6 +223,49 @@ def delete_old_archive(credentials, local):
     print('Old staged archive:', record['result'], flush=True)
 
 
+def delete_scratch(credentials, local):
+    client = s3(credentials, DC)
+    path = local / 'cleanup_first_campaign_scratch.json'
+    record = json.loads(path.read_text()) if path.exists() else {'prefixes': {}}
+    for prefix in FIRST_CAMPAIGN_SCRATCH:
+        objects = [o for page in client.get_paginator('list_objects_v2').paginate(Bucket=VOLUME_ID, Prefix=prefix)
+                   for o in page.get('Contents', [])]
+        # Runpod's S3 API rejects batch DeleteObjects (307), so delete one key at a time. Keys can
+        # be directories, which refuse deletion until empty: delete deepest keys first, in passes.
+        def remove(key):
+            try:
+                client.delete_object(Bucket=VOLUME_ID, Key=key)
+                return None
+            except ClientError as error:
+                if 'directory not empty' in str(error):
+                    return key
+                raise
+        pending = sorted((o['Key'] for o in objects), key=lambda k: -k.rstrip('/').count('/'))
+        for _ in range(64):
+            if not pending:
+                break
+            depth = max(k.rstrip('/').count('/') for k in pending)
+            level = [k for k in pending if k.rstrip('/').count('/') == depth]
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                refused = [k for k in pool.map(remove, level) if k]
+            pending = [k for k in pending if k not in set(level)] + refused
+            if refused and len(refused) == len(level) and all(k.rstrip('/').count('/') == depth for k in pending):
+                break
+        # The gateway cannot remove symlinks (it follows them) or keys whose '+' it lists as a space;
+        # tolerate only such negligible leftovers.
+        left = [o for page in client.get_paginator('list_objects_v2').paginate(Bucket=VOLUME_ID, Prefix=prefix)
+                for o in page.get('Contents', [])]
+        if sum(o['Size'] for o in left) > 1024**2:
+            raise RuntimeError(f'{len(left)} objects remain under {prefix}')
+        if objects or prefix not in record['prefixes']:
+            record['prefixes'][prefix] = {'files': len(objects), 'bytes': sum(o['Size'] for o in objects),
+                                          'absence_verified': True, 'timestamp': time.time(),
+                                          'undeletable_leftovers': [[o['Key'], o['Size']] for o in left]}
+        save(path, record)
+        print(f"Deleted {prefix}: {len(objects)} files, {sum(o['Size'] for o in objects) / 1024**3:.2f} GiB;"
+              f" read-back leftovers: {len(left)} ({sum(o['Size'] for o in left)} bytes)", flush=True)
+
+
 def stage(args):
     if not args.dataset:
         sys.exit('ABORTED: no dataset path supplied. Re-run with --dataset /path/to/dataset_dir.')
@@ -226,10 +292,12 @@ def stage(args):
     if report['n_episodes'] != report['file_counts']['syncs']:
         raise RuntimeError('Loader would drop episodes; inspect before training')
 
-    archives = {'dataset.tar': local / 'dataset.tar', 'source.tar.gz': local / 'source.tar.gz'}
-    if not archives['dataset.tar'].exists():
-        build_dataset_tar(dataset, archives['dataset.tar'].with_suffix('.partial'))
-        archives['dataset.tar'].with_suffix('.partial').replace(archives['dataset.tar'])
+    parts = sorted(local.glob('dataset.part*.tar'))
+    if len(parts) != DATASET_PARTS:
+        parts = build_dataset_parts(dataset, local)
+    archives = {path.name: path for path in parts}
+    archives['source.tar.gz'] = local / 'source.tar.gz'
+    print('Dataset pieces:', {n: f'{p.stat().st_size / 1024**3:.2f} GiB' for n, p in archives.items()}, flush=True)
     print('Source files archived:', build_source_tar(archives['source.tar.gz']), flush=True)
     artifacts = [{'key': prefix + 'staging/' + name, 'size': path.stat().st_size, 'sha256': digest(path)}
                  for name, path in archives.items()] + SHARED_ARTIFACTS
@@ -241,8 +309,10 @@ def stage(args):
 
     if args.delete_old_archive:
         delete_old_archive(credentials, local)
+    if args.delete_first_campaign_scratch:
+        delete_scratch(credentials, local)
     for name, path in archives.items():
-        upload(client, path, prefix + 'staging/' + name, reuse=name == 'dataset.tar')
+        upload(client, path, prefix + 'staging/' + name, reuse=name.startswith('dataset.'))
     for name in ('manifest.json', 'dataset_report.json'):
         client.upload_file(str(local / name), VOLUME_ID, prefix + 'staging/' + name)
     bootstrap = ROOT / 'scripts/runpod/color_palm_bootstrap.py'
@@ -430,7 +500,10 @@ def verify(args):
     expected = json.loads((local / 'dataset_report.json').read_text())
     client = s3(credentials, DC)
     pods = {p['variant']: p for p in deployment['pods']}
-    archive_key = f'experiments/{args.campaign}/staging/dataset.tar'
+    manifest = json.loads((local / 'manifest.json').read_text())
+    archive_keys = [a['key'] for a in manifest['artifacts']
+                    if re.fullmatch(r'dataset(\.part\d+)?\.tar', Path(a['key']).name)
+                    and a['key'].startswith(f'experiments/{args.campaign}/')]
     stop = time.time() + args.minutes * 60
 
     def read(pod, name):
@@ -492,22 +565,16 @@ def verify(args):
                                                       and math.isfinite(float(summary.get('train_loss', 'nan'))))
             except Exception as error:
                 run.setdefault('pending', type(error).__name__ + (': ' + str(error)[:160] if isinstance(error, (AssertionError, KeyError)) else ''))
-        # Free the staged dataset archive only when space is tight and both pods have extracted it.
-        if all(states.get(v, {}).get('phase') not in (None, 'verifying', 'extracting') for v in pods) \
-                and exists(client, archive_key) is not None:
-            free = []
-            for pod in pods.values():
-                try:
-                    found = re.findall(r'Checkpoint volume free space: ([0-9.]+) GiB', read(pod, 'bootstrap.log'))
-                    free += [float(x) for x in found[-1:]]
-                except Exception:
-                    free = []
-                    break
-            if len(free) == len(pods) and min(free) < KEEP_ARCHIVE_FREE_GIB:
-                client.delete_object(Bucket=VOLUME_ID, Key=archive_key)
-                result['staged_dataset_archive'] = ('deleted after both pods extracted it (free space '
-                                                    f'{min(free):.2f} GiB); local copy kept')
-                print(result['staged_dataset_archive'], flush=True)
+        # The volume is nearly full: once both pods have extracted the staged dataset pieces to
+        # their container disks, remove them so checkpoints have room. Local copies are kept.
+        if all(states.get(v, {}).get('phase') not in (None, 'verifying', 'extracting') for v in pods):
+            for key in archive_keys:
+                if exists(client, key) is not None:
+                    client.delete_object(Bucket=VOLUME_ID, Key=key)
+                    if exists(client, key) is not None:
+                        raise RuntimeError('Staged dataset piece still present: ' + key)
+                    print('Removed staged dataset piece after extraction:', key, flush=True)
+            result['staged_dataset_pieces'] = 'removed after both pods extracted them; local copies kept'
         if len(configs) == len(pods):
             a, b = (strip_hand(configs[v]) for v in pods)
             diff = [d for d in differences(a, b) if d not in PER_RUN]
@@ -539,6 +606,7 @@ def main():
     parser.add_argument('--campaign', required=True)
     parser.add_argument('--dataset')
     parser.add_argument('--delete-old-archive', action='store_true')
+    parser.add_argument('--delete-first-campaign-scratch', action='store_true')
     parser.add_argument('--minutes', type=float, default=120)
     args = parser.parse_args()
     if not NAME.match(args.campaign):

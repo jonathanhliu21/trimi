@@ -62,6 +62,25 @@ class JointControlTests(unittest.TestCase):
         self.assertTrue(np.all(q >= control.lower - 1e-9) and np.all(q <= control.upper + 1e-9))
         self.assertGreater(info['pos_err_mm'], 100)
 
+    def test_cross_wrist_lets_j5_pass_through_zero(self):
+        start = np.radians(config.PIPER_START_JOINTS_DEG['home_cocovita_palm'])  # J5 = 9.4 deg
+        goal = start + np.radians([0, 0, 0, 5, -40, 10])  # J5 = -30.6 deg, like the demos' second grasp
+        results = {}
+        for cross in (False, True):
+            control = JointController(cross_wrist=cross)
+            control.reset(start)
+            for _ in range(60):  # 4 s at 15 Hz: enough for the speed caps
+                q, info = control.command(control.fk(goal), 1 / 15)
+            results[cross] = (q, info)
+        q, info = results[True]
+        self.assertLess(q[4], np.radians(-25))
+        self.assertLess(info['pos_err_mm'], 1.0)
+        self.assertLess(info['rot_err_deg'], 0.5)
+        self.assertLess(abs(q[3] - start[3]), np.radians(15))  # J4 does not swing to the flipped wrist
+        q, info = results[False]
+        self.assertGreaterEqual(q[4], np.radians(10) - 1e-9)  # default keeps J5 on its side
+        self.assertTrue(abs(q[3] - start[3]) > np.radians(45) or info['rot_err_deg'] > 5)
+
 
 if __name__ == '__main__':
     unittest.main()

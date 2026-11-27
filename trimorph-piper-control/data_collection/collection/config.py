@@ -92,6 +92,13 @@ DAGGER_GRAVITY_FORCE = True
 # data_trimorph_unscrew_cap_0 (Vicon poses, one start group), median flange
 # (229, -249, 130) mm, mean Euler xyz (163, -1, 84) deg; starts spread ~20 mm / ~6 deg.
 PIPER_START_JOINTS_DEG = {
+    # data_trimorph_cocovita_palm: first piper.csv joint sample of episode_000147
+    # (2026-11-26 03:03:39 UTC, training split), the start closest on average to
+    # the 150 trained episodes' start flange poses (mean 38 mm / 10 deg; starts
+    # spread ~49 mm / ~12 deg). Flange (125, 48, 291) mm, Euler xyz (131, 66, 150) deg.
+    # J5 sits near the wrist singularity in this dataset, so J4/J6 vary between
+    # episodes; a per-joint median is not used.
+    "home_cocovita_palm": (21.334, 36.224, -24.940, -2.551, 9.395, 21.350),
     # Captured from receive-only can0 joint feedback, 2026-11-25 11:03:39 PST.
     # Median of 599 coherent snapshots over 1 s; J5 range 0.262 deg, others stationary.
     # J1..J6 degrees (CAN millidegrees divided by 1000).
@@ -151,6 +158,12 @@ PIPER_START_JOINTS_DEG = {
 }
 # Median first processed_encoder_t row (motors 0..12, leader radians) of the same episodes.
 HAND_START_POSITIONS_RAD = {
+    # Median first processed_encoder_t row of the 150 trained
+    # data_trimorph_cocovita_palm episodes; xl330_new_hand_transparent.yaml.
+    # Motors 0/4/7/10 clipped to the YAML upper limit of zero (<=0.023 rad change).
+    "home_cocovita_palm": (0.0, 0.079379, -3.427796, -7.742437, 0.0,
+                           -0.721592, -0.051359, 0.0, -0.390252, 0.032214,
+                           0.0, -0.070417, 1.703456),
     # Thumb motors 0..3: read-only capture, 2026-11-25 11:03:39 PST.
     # Motors 4..12: median first synchronized sample of the 151 color-task episodes.
     # Motors 0..12, calibrated radians; xl330_new_hand_transparent.yaml.
